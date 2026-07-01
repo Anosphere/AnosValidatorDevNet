@@ -1,0 +1,531 @@
+syntax = "proto3";
+package anos.v2;
+option go_package = "anos/internal/proto;pb";
+
+// --------------------
+// Core primitive types
+// --------------------
+
+message Hash32 { bytes v = 1; }   // must be exactly 32 bytes
+message Hash64 { bytes v = 1; }   // must be exactly 64 bytes (SHA-512 breakglass commitment, keys-spec §7.2)
+message Pub32  { bytes v = 1; }   // validator-id public key (33 bytes); carries validator ids in the gossip/consensus layer
+
+// Post-quantum hybrid account credentials (keys-spec §5). Both are bare
+// fixed-length concatenations, ML-DSA-87 first, no framing.
+message HybridSig    { bytes v = 1; } // 4691 bytes: mldsa87_sig(4627) ‖ p256_raw_lowS(64)   (keys-spec §5.3)
+message HybridPubKey { bytes v = 1; } // 2625 bytes: mldsa87_pub(2592) ‖ p256_compressed(33)  (keys-spec §5.2)
+
+// AccountId is the 32-byte hash-derived account-id (keys-spec §6); for the Fund
+// and the bootstrap genesis account it is a reserved manifest constant.
+message AccountId { bytes v = 1; } // 32 bytes
+
+// --------------------
+// Core protocol objects
+// --------------------
+
+enum TxType {
+  TX_TYPE_UNSPECIFIED        = 0;
+  TX_TYPE_SEND               = 1;
+  TX_TYPE_RECEIVE            = 2;
+  // 3 = ADD_ATTESTOR, 4 = REMOVE_ATTESTOR: the legacy attestor chain was deleted in P3.1
+  // (spec-19 §2). Attestor membership is now the Fund `attestor` tag; these values are
+  // retired (no migration — pre-launch clean cutover). `reserved` hard-blocks accidental reuse.
+  reserved 3, 4;
+}
+
+enum AccountClass {
+  ACCOUNT_CLASS_UNSPECIFIED = 0;
+  ACCOUNT_CLASS_SPENDING    = 1;
+  ACCOUNT_CLASS_TIMELOCKED  = 2;
+  ACCOUNT_CLASS_GUARDED     = 3;
+  ACCOUNT_CLASS_VAULT       = 4;
+  ACCOUNT_CLASS_TRANSFER    = 5; // a special-purpose transfer chain (created by its first RECEIVE)
+  ACCOUNT_CLASS_ESCROW      = 6; // a two-party 2-of-2 escrow (created by its funder-signed first RECEIVE).
+                                 // Keyless of a single key: outflow is a HybridMultiSig 2-of-2 of the two
+                                 // stored parties (1-of-2 → Fund after a delay, attested-escrow only).
+                                 // spec-18 §5.6, spec-19 §6.3.
+  ACCOUNT_CLASS_FUND        = 7; // the singleton stake/fee pool: keyless, reserved manifest-constant
+                                 // id (FUND_ACCOUNT_HEX), seeded at genesis, never created by a tx.
+                                 // Inflow = Alt A direct balance credit (to == Fund id); outflow =
+                                 // weighted-Guardian SEND (P2.3). spec-18 §7, keys-spec §6.5.
+}
+
+// StakeTimeDelay is a stake's lock tier (staking only — unrelated to account-class
+// transfer/breakglass delays). Exactly two tiers (working notes §3.6): a 1-year lock is
+// what confers Guardian signature weight (floor(Σ 1-yr stake / 2000 anos)) and a 2× DAO
+// vote multiplier; a 1-month lock is the minimum (e.g. a plain Banker stake). A stake
+// deposit MUST carry ONE_MONTH or ONE_YEAR; UNSPECIFIED is rejected on a deposit.
+enum StakeTimeDelay {
+  STAKE_TIME_DELAY_UNSPECIFIED = 0;
+  STAKE_TIME_DELAY_ONE_MONTH   = 1;
+  STAKE_TIME_DELAY_ONE_YEAR    = 2;
+}
+
+message TxBodySend {
+  AccountId to = 1;
+  uint64 amount = 2;
+  uint64 fee = 3;
+  Hash32 receivable_id = 4; // deterministically derived from txid
+  AccountClass account_class = 5;
+
+  // Stake-deposit metadata (P2.2, spec-18 §7 / spec-19 §5 / build-plan §P2.2).
+  // Meaningful ONLY when to == Fund id AND staked_for is non-empty — that combination is a
+  // "stake deposit" and is appended to the derived reference table (keyed by this SEND's
+  // txid). For any other SEND these fields are ignored. All three are folded into
+  // SignBytesACTE so they are bound to the txid/signature (tamper-evident), exactly like
+  // the RECEIVE transfer/key fields.
+  //
+  // staked_for is an OPEN, free-form role namespace: Anos interprets only "banker"/"attestor"
+  // (+ the derived Guardian/voting weights); every other tag (moderator, masterpod, unknown)
+  // is recorded verbatim and exposed, NEVER rejected. Anos-side floors (Banker 50k / Attestor
+  // 5k) gate role MEMBERSHIP in the table, not deposit acceptance — a sub-floor or unknown
+  // stake is stored, just not role-eligible.
+  string         staked_for    = 6;
+  StakeTimeDelay time_delay     = 7;
+  bytes          proof_pointer  = 8; // DEFERRED admission-proof pointer (v1: stored verbatim, never interpreted)
+
+  // Fund-SEND activation epoch (P2.3, spec-19 §6.2). Meaningful ONLY on a Fund SEND (a SEND
+  // whose account == Fund id, authorized by the HybridMultiSig). It names the epoch the
+  // Guardian signers co-sign for: on apply, each signer's `lastActive` is set to this value,
+  // so the trailing-window "active Guardian set" (the quorum denominator M) rebuilds
+  // deterministically from chain replay — ApplyTx stays epoch-independent (it reads the epoch
+  // off the signed tx instead of the live clock), exactly like TRANSFER's signed unlock_epoch.
+  // Validators enforce it is <= the current epoch (cannot claim future activeness). Folded into
+  // SignBytesACTE unconditionally (0 on a non-Fund send), so the Guardians sign it.
+  uint64         fund_send_epoch = 9;
+
+  // Return/kick target (P2.3b, spec-19 §6.2). Meaningful ONLY on a Fund SEND. When set, this
+  // Fund SEND acts on the stake reference-table row keyed by this deposit_txid:
+  //   - to == Fund id   → KICK: forfeit the stake (status → Kicked); amount MUST be 0.
+  //   - to != Fund id   → RETURN-STAKE: `to` MUST equal the derived return-transfer-chain id
+  //     DerivedAccountID(TRANSFER, staker_auth_pub, Fund_id, this SEND's seq) and `amount` MUST
+  //     equal the stake's recorded amount; the Fund mints a TRANSFER-restricted receivable that
+  //     opens a chain COPYING THE STAKER's keys (status → Returned). Folded into SignBytesACTE so
+  //     the Guardians sign which stake is acted on.
+  Hash32         return_deposit_txid = 10;
+
+  // Banker validator descriptor (P4.1, spec-18 §3.7 / build-plan §P4.1). Meaningful ONLY on a Banker
+  // stake/rotation deposit — a SEND whose to == Fund id AND staked_for == "banker". They carry the
+  // validator's CONSENSUS identity attributes, resolved per-identity LAST-WRITE-WINS in Fund order
+  // (the latest banker deposit by send-seq wins), so a banker rotates its key/IP with a fresh signed
+  // additive deposit (P4.2) rather than .env coordination. Folded into SignBytesACTE unconditionally
+  // (length-framed; empty on a non-banker send) so they are bound to the txid/signature (self-attributed
+  // — a banker can only ever update its OWN descriptor). For any other SEND these fields are ignored.
+  //
+  // consensus_pubkey is the 33-byte compressed P-256 validator id (the same classical key the consensus/
+  // candidate/finalization layer uses; validator-sig PQ is deferred). It is consensus-load-bearing: at
+  // the list→Fund flip (P4.3) the Fund-derived set must match the manifest list's keys byte-for-byte.
+  // A banker deposit whose key is absent/malformed is still RECORDED as a stake but is NOT set-eligible
+  // (membership-not-rejection, like the role floors). endpoint is the validator's reachability hint
+  // (host:port / URL) — liveness-only / loose (rediscovered via Fund replay), NOT consensus-load-bearing.
+  bytes  consensus_pubkey = 11;
+  string endpoint         = 12;
+
+  // In-Fund stake recovery (P5.4, spec-18 §7.4, working notes §3.4 "Recovery — FINALIZED").
+  // Meaningful ONLY on a Fund SEND that references a stake row (return_deposit_txid set). All three
+  // are folded into SignBytesACTE unconditionally + length-framed (empty / 0 on any other SEND) so
+  // they are bound to the txid/signature, and a non-return SEND that carries any of them is rejected
+  // (they would only serve to grind a txid — crypto.TxID folds the whole SEND preimage).
+  //
+  // recovery_beneficiary is the new owner B of the referenced stake:
+  //   - to != Fund id  → C2 GENERALIZED RETURN: the opening TRANSFER chain copies B's keys (not the
+  //     staker's) and releases to B. Unset ⇒ the ordinary P2.3b return to the staker.
+  //   - to == Fund id, amount 0 → C1 RE-ATTRIBUTION: flip the stake row's StakerID A→B in place
+  //     (keeps Active/amount/tier/staked_for). Unset ⇒ a KICK.
+  // B must be a base-owner-class, key-registered account (SPENDING/TIMELOCKED/GUARDED/VAULT).
+  AccountId recovery_beneficiary = 13;
+  // return_delay_epochs is the Guardian-chosen unlock floor (in epochs) for a returned stake's
+  // TRANSFER chain (replaces the P2.3b forced tier-lock; "up to them every time" — user). REQUIRED
+  // (> 0) on every return-stake Fund SEND (normal or C2); 0 on a kick / re-attribution / any other
+  // SEND. The opening RECEIVE enforces unlock >= creation + this (via Receivable.return_delay_epochs).
+  uint64    return_delay_epochs = 14;
+  // owner_auth is the current stake owner's authorization to REDIRECT ownership — required whenever
+  // recovery_beneficiary is set AND differs from the current StakerID (a C1 re-attribution, or a C2
+  // return to an account that is not the staker). It preserves "a Guardian quorum can ENACT but never
+  // REDIRECT a stake": the quorum authorizes the Fund SEND, but only the real owner's key can name a
+  // new beneficiary. A return to the staker's own account needs no owner_auth (existing behavior).
+  StakeOwnerAuth owner_auth = 15;
+}
+
+// StakeOwnerAuth carries the current stake owner's signature over the recovery binding (P5.4):
+//   m_owner = SHA256( "ANOSv2-StakeOwnerAuth\0" ‖ op_byte ‖ deposit_txid(32) ‖ beneficiary(32) )
+// where op_byte = 1 for a generalized RETURN (to != Fund) and 2 for a RE-ATTRIBUTION (to == Fund).
+// It is verified against the CURRENT StakerID's registered auth key, OR — for a recoverer who lost the
+// auth key — against a revealed breakglass key whose BreakglassCommitment(·) equals the staker's stored
+// commitment (class-independent since P5.2). The whole StakeOwnerAuth is folded into SignBytesACTE
+// (length-framed), so it is bound to the txid and a stripped/swapped owner_auth yields a different txid.
+// It is validate-only (ApplyTx never re-verifies it), like Tx.sig and the Guardian multisig.
+message StakeOwnerAuth {
+  HybridSig    sig                        = 1; // 4691 B; the owner's hybrid signature over m_owner
+  HybridPubKey revealed_breakglass_pubkey = 2; // 2625 B; optional — set only for a breakglass-key owner_auth
+}
+
+message TxBodyReceive {
+  Hash32 receivable_id = 1;
+  AccountClass account_class = 2;
+
+  // Transfer-chain creation fields. Only meaningful when account_class == TRANSFER
+  // (i.e. this RECEIVE is the first block of a new transfer chain). Both are part of
+  // the signed bytes for a TRANSFER receive (see SignBytesACTE), so they are committed
+  // to consensus via the chain head. Ignored for all other classes.
+  AccountId transfer_destination = 3;   // where the transfer releases to after unlock
+  uint64    transfer_unlock_epoch = 4;  // epoch at/after which release is allowed
+
+  // First-block key registration (keys-spec §8.3). Present ONLY on an account-opening
+  // RECEIVE (the first block of a new account chain). The validator (a) recomputes the
+  // account-id from auth_pubkey and rejects a mismatch (keys-spec §6.4), (b) caches
+  // auth_pubkey in the account record so per-tx sends carry only the signature, and
+  // (c) stores breakglass_commitment immutably. Both are folded into the signed
+  // preimage on the opening block (see SignBytesACTE) so they cannot be tampered.
+  HybridPubKey auth_pubkey = 5;          // 2625 B; the account's hybrid auth public key
+  Hash64       breakglass_commitment = 6; // 64 B; SHA-512 commitment to the breakglass pubkey
+
+  // Escrow opening fields (P3.3, spec-18 §5.6.2/§5.6.3). Present ONLY when account_class == ESCROW
+  // (the first/opening RECEIVE of a two-party escrow). The escrow is keyless of a single owner key:
+  // these carry BOTH parties' material by value. On the opening block the funder (creator) signs
+  // alone — auth_pubkey above is the funder's OWN signing key (must equal one of the two party
+  // pubkeys AND the funding source's registered key); breakglass_commitment above is NOT used for an
+  // escrow opening (each party's commitment lives inside escrow_open). All escrow_open fields are
+  // folded into SignBytesACTE on the opening block so they cannot be tampered. Ignored for any other
+  // class. spec-19 §6.3 governs the 2-of-2 outflow + the 1-of-2 → Fund attestation trigger.
+  EscrowOpen escrow_open = 7;
+}
+
+// EscrowOpen carries the two-party material registered on an escrow's opening RECEIVE (spec-18
+// §5.6.2). The two parties are given in CANONICAL ORDER — party_lo's HybridPubKey is
+// lexicographically less than party_hi's — the same ordering crypto.EscrowKeyblob uses to derive
+// the escrow id (keys-spec §6.2), so both parties compute the identical id and record. Each party's
+// breakglass commitment is stored (spec-18 §5.6.2) so the breakglass-as-alternate-key verify (P5.1)
+// needs no record migration; v1 verifies each 2-of-2 slot against the NORMAL party pubkey only.
+message EscrowOpen {
+  HybridPubKey party_lo_pubkey            = 1; // 2625 B; lexicographically-smaller party's hybrid pubkey
+  Hash64       party_lo_breakglass_commit = 2; // 64 B; that party's breakglass commitment
+  HybridPubKey party_hi_pubkey            = 3; // 2625 B; lexicographically-larger party's hybrid pubkey
+  Hash64       party_hi_breakglass_commit = 4; // 64 B; that party's breakglass commitment
+  uint64       attestation_trigger_epoch  = 5; // epoch at/after which a 1-of-2 → Fund trigger is allowed
+                                               // (attested escrows only). >= creation + ESCROW_ATTESTATION_DELAY_EPOCHS.
+  bool         attested                   = 6; // attested-escrow flag: charges ATTESTED_ESCROW_FEE at
+                                               // funding and gates the 1-of-2 → Fund trigger.
+}
+
+// HybridMultiSig is the post-quantum verify-only multisig (spec-19 §4). It carries each
+// signer's account-ID (not the bulky 2.6 KB pubkey — the verifier looks that up in the
+// account record / reference table by id) and that identity's hybrid signature over the
+// tx digest m = SHA-256(SignBytesACTE(tx)). Used to authorize a Fund SEND (weighted
+// Guardian quorum, §6.2); later also GUARDED/VAULT/breakglass releases (§6.1) and escrow
+// 2-of-2 (§6.3). It is the ENTIRE authorization for a keyless Fund (no Tx.sig). Duplicate
+// signer_ids count once; a signer not qualifying for the required role is ignored, not fatal.
+message HybridSigEntry {
+  AccountId signer_id = 1; // 32-byte account-id of the signing identity
+  HybridSig sig       = 2; // 4691-byte HybridSig (keys-spec §5.3) over the tx digest m
+
+  // Revealed breakglass pubkey for an escrow 2-of-2 slot satisfied by a party's BREAKGLASS key
+  // instead of its normal auth key (P5.1, spec-18 §5.6.1, keys-spec §7.3). When set (2625 B), this
+  // entry's `sig` is verified against THIS pubkey (not a looked-up auth key), and the validator
+  // re-derives BreakglassCommitment(revealed) and requires it to equal one of the escrow's two stored
+  // party breakglass commitments (class-independent since P5.2 — no type byte; a party's escrow
+  // commitment now equals its normal-account commitment, the option-B collapse). Empty for a
+  // normal-key entry and for every non-escrow multisig (Fund SEND / attestor release). It is folded
+  // into crypto.FundMultiSigDigest (length-framed), so the keyless-multisig txid binds the EXACT
+  // revealed key — a swap yields a different txid (the P1.2/P3.3 fork-closure rule).
+  HybridPubKey revealed_breakglass_pubkey = 3;
+}
+message HybridMultiSig {
+  repeated HybridSigEntry entries = 1;
+}
+
+// Canonical bytes-to-sign for a transaction.
+// Rule: signature = Ed25519( SHA256( serialize(TxSignable) ) )
+message TxSignable {
+  TxType type = 1;
+
+  AccountId account = 2;  // the account chain being extended
+  Hash32 prev = 3;        // previous tx hash (zero/empty means genesis head)
+  uint64 seq = 4;         // monotonic per-account sequence
+
+  oneof body {
+    TxBodySend             send              = 10;
+    TxBodyReceive          receive           = 11;
+    // 12 = add_attestor, 13 = remove_attestor: retired with the legacy attestor chain (P3.1).
+  }
+  reserved 12, 13;
+}
+
+message Tx {
+  TxType type = 1;
+
+  AccountId account = 2;  // the account chain being extended
+  Hash32 prev = 3;        // previous tx hash (zero/empty means genesis head)
+  uint64 seq = 4;         // monotonic per-account sequence
+
+  oneof body {
+    TxBodySend             send              = 10;
+    TxBodyReceive          receive           = 11;
+    // 12 = add_attestor, 13 = remove_attestor: retired with the legacy attestor chain (P3.1).
+  }
+
+  HybridSig sig = 20;     // hybrid AND-signature (ML-DSA-87 + low-S P-256) over MsgHash (keys-spec §5)
+  // multi_sig is the post-quantum verify-only multisig (P2.3, spec-19 §4). It is the entire
+  // authorization for a keyless Fund SEND (which carries no Tx.sig).
+  HybridMultiSig multi_sig = 21;
+
+  // Revealed breakglass pubkey for a BREAKGLASS move (P5.1, spec-19 §6.4, keys-spec §7.3). When set
+  // (2625 B), this single-sig tx is authorized by the account's dormant breakglass key instead of its
+  // normal auth key: `sig` is verified against THIS revealed pubkey, and the validator re-derives
+  // BreakglassCommitment(revealed) and requires it to equal the relevant stored commitment (the source
+  // account's own, or — for a transfer chain — the copied source commitment; class-independent since
+  // P5.2, so the transfer chain no longer looks back to the source's class). It rides on
+  // all three single-sig breakglass txs: the hop-1 source-drain SEND (opens a forced TRANSFER-restricted
+  // chain), the chain's opening RECEIVE, and the hop-2 release-to-dest SEND (which still needs the
+  // attestor quorum + unlock). Empty on every normal tx. Folded into SignBytesACTE (length-framed,
+  // unconditional) so it is bound to BOTH the signature and the txid — a swapped/stripped reveal yields
+  // a different preimage (the P1.2 lesson: binding-into-txid alone is insufficient). A keyless Fund SEND
+  // / escrow outflow must NOT carry it (those are multisig-authorized; the escrow breakglass key rides
+  // on HybridSigEntry instead).
+  HybridPubKey revealed_breakglass_pubkey = 23;
+  // 12/13 = add_attestor/remove_attestor, 22 = attestor_multi_sig: the legacy ed25519 attestor
+  // path, deleted with the attestor chain in P3.1 (spec-19 §2). `reserved` hard-blocks reuse so a
+  // future field can never silently re-decode against an old field number on the consensus wire.
+  reserved 12, 13, 22;
+}
+
+message Receivable {
+  Hash32 id = 1;
+  AccountId from = 2;
+  AccountId to = 3;
+  uint64 amount = 4;
+  uint64 fee = 5;
+  Hash32 created_by_tx = 6;
+  bool claimed = 7;
+  Hash32 claimed_by_tx = 8;
+
+  // Source-side routing restriction, DERIVED by the validator from the sender's account
+  // class at apply time (not signed by the sender). UNSPECIFIED = no restriction (normal
+  // SPENDING send). TRANSFER = this receivable may only be claimed by a first RECEIVE that
+  // declares class == TRANSFER (set when the sender is TIMELOCKED/GUARDED/VAULT). This is
+  // how a timelocked holder is forced to route outbound funds through a transfer chain.
+  AccountClass required_dest_class = 9;
+
+  // The seq of the SEND that minted this receivable (the source's send seq), set by
+  // the validator at mint time (NOT signed by the sender). It is the creation nonce
+  // (creator_seq) when this receivable funds a TRANSFER chain: the chain's id =
+  // DerivedAccountID(TRANSFER, source_auth_pubkey, source_id, from_seq), so each
+  // funding SEND uniquely names the one chain it can open (keys-spec §6.2). Ignored
+  // for receivables that are never claimed as a TRANSFER opening.
+  uint64 from_seq = 10;
+
+  // Return-stake fields (P2.3b), set by the validator (NOT signed by anyone) when a Guardian-
+  // authorized Fund SEND returns a stake. Empty/UNSPECIFIED for every ordinary receivable.
+  //
+  // key_source_id is the account whose auth+breakglass keys the opening TRANSFER chain must COPY
+  // — the original STAKER (looked up from the stake row's StakerID), which differs from `from`
+  // (the Fund, the chain's creator + return target). When set, the chain id is derived as
+  // DerivedAccountID(TRANSFER, key_source's auth pubkey, from, from_seq): keys from the staker,
+  // creator from the Fund (so it cannot collide with a staker-originated transfer at the same nonce).
+  AccountId key_source_id = 11;
+  // return_tier is the stake's lock tier; the opening TRANSFER chain's unlock must be at least
+  // creation_epoch + STAKE_LOCK_{tier}_EPOCHS (instead of the source-class delay, since the source
+  // is the keyless Fund). UNSPECIFIED for ordinary (non-return) receivables.
+  StakeTimeDelay return_tier = 12;
+
+  // from_breakglass marks a receivable minted by a BREAKGLASS move (P5.1, spec-19 §6.4): a SEND whose
+  // revealed_breakglass_pubkey verified against the source's stored commitment. Set by the validator at
+  // mint time (NOT signed). It FORCES routing through a transfer chain even from an unrestricted SPENDING
+  // source (required_dest_class is also stamped TRANSFER), and the TRANSFER chain that claims it gets
+  // breakglass_origin + release_requires_attestor set and an EXTENDED unlock floor (creation + class
+  // delay + BREAKGLASS_EXTRA_EPOCHS — the +1-week fraud-challenge window). It is derived deterministically
+  // from the (signed) presence of the reveal on the minting SEND, so a resync replay reproduces it.
+  // false for every ordinary receivable.
+  bool from_breakglass = 13;
+
+  // return_delay_epochs is the Guardian-chosen unlock floor (in epochs) for a returned stake's TRANSFER
+  // chain (P5.4). Set by the validator (NOT signed) from the authorizing Fund SEND's return_delay_epochs
+  // when this receivable is a return-stake mint (KeySourceID set). The opening RECEIVE enforces
+  // unlock >= creation_epoch + this (replacing the P2.3b tier-lock). 0 for every ordinary receivable.
+  uint64 return_delay_epochs = 14;
+
+  // return_deposit_txid threads the ORIGINAL stake row's deposit_txid onto a return-stake receivable
+  // (P5.5, en-route recovery). Set by the validator (NOT signed) — echoed from the authorizing Fund
+  // SEND's signed return_deposit_txid (field 10, already folded into SignBytesACTE, so this derived echo
+  // needs no fold of its own), exactly like key_source_id / return_delay_epochs. Meaningful only when
+  // KeySourceID is set (a return-stake mint); empty for every ordinary receivable. On the opening RECEIVE
+  // it is stored IMMUTABLY on the transfer chain's TRANSFER_META so a later breakglass-RETURN of the
+  // chain to the (keyless) Fund can find + mark the BFundStakes row Reverted (the missing audit LINK).
+  Hash32 return_deposit_txid = 15;
+}
+
+message EpochRecord {
+  uint64 epoch = 1;
+  repeated Hash32 accepted_txs = 2;
+  Hash32 state_root = 3;
+  Hash32 prev_epoch_hash = 4; // hash-chain epochs for audit
+}
+
+// --------------------
+// API Envelope messages
+// (for /submit, /account, /receivables)
+// --------------------
+
+// Generic error for API responses.
+message ApiError {
+  uint32 code = 1;        // HTTP-ish or app-specific code (e.g., 400, 403, 500)
+  string message = 2;     // human-readable summary
+  string detail = 3;      // optional extra info (stack, debug, etc.)
+}
+
+// /submit
+message SubmitTxRequest {
+  Tx tx = 1;
+}
+
+message SubmitTxResponse {
+  bool ok = 1;
+
+  // Optional: txid as computed by validators (or client) for display/debug.
+  Hash32 txid = 2;
+
+  // If ok=false, error is set.
+  ApiError error = 3;
+}
+
+// /account
+message AccountState {
+  AccountId account = 1;
+
+  // Current head tx hash (zero/empty means genesis head)
+  Hash32 head = 2;
+
+  uint64 balance = 3;
+  uint64 seq = 4;
+
+  AccountClass account_class = 5;
+
+  // Transfer-chain metadata; populated only when account_class == TRANSFER.
+  // These mirror the immutable fields stored on a transfer chain's account record.
+  AccountId transfer_source = 6;       // the funder / return target
+  AccountId transfer_destination = 7;  // the release target (allowed at/after unlock)
+  uint64    transfer_unlock_epoch = 8; // epoch at/after which release is allowed
+}
+
+message GetAccountRequest {
+  AccountId account = 1;
+}
+
+message GetAccountResponse {
+  bool ok = 1;
+  AccountState state = 2;
+  ApiError error = 3;
+}
+
+// /receivables
+message ListReceivablesRequest {
+  AccountId account = 1;     // list receivables destined to this account
+  bool include_claimed = 2;  // default false
+}
+
+message ListReceivablesResponse {
+  bool ok = 1;
+  repeated Receivable receivables = 2;
+  ApiError error = 3;
+}
+
+
+// ------------------------------------------------------------
+// Validator-only protocol (safe to change; not used by wallets)
+// ------------------------------------------------------------
+
+// SigDER carries a DER-encoded ECDSA (P-256) signature (variable length) in the
+// validator/consensus layer (candidate lists, epoch finalizations).
+message SigDER { bytes v = 1; } // DER-encoded ECDSA signature (variable length)
+
+// --- Tx gossip (INV -> WANT -> PUSH) ---
+
+message TxInv {
+  uint64 epoch = 1;        // sender's current epoch (informational)
+  Pub32  from = 2;         // validator_id (your code uses Pub32 but expects 33 bytes)
+  repeated Hash32 txid = 3;
+}
+
+message TxWant {
+  uint64 epoch = 1;
+  Pub32  from = 2;
+  repeated Hash32 txid = 3; // which txids receiver wants bytes for
+}
+
+message TxPush {
+  uint64 epoch = 1;
+  Pub32  from = 2;
+  repeated Tx tx = 3;       // full Tx objects (protobuf)
+  // (Alternative is repeated bytes tx_bytes, but using Tx avoids extra marshal steps.)
+}
+
+// --- Candidate list v2 (txids only; votes) ---
+// list_hash = SHA256(concat(sorted txid bytes))
+message CandidateListV2 {
+  uint64 epoch = 1;
+  Pub32 proposer = 2;            // validator_id
+  repeated Hash32 txid = 3;      // txids only (sorted by sender)
+
+  Hash32 list_hash = 4;
+  SigDER sig = 5;                // signature over digest(epoch, proposer, list_hash)
+}
+
+// --- Epoch finalization (checkpoint anchor for resync) ---
+// accepted_txids_hash = SHA256(concat(sorted accepted txid bytes))
+// frontiers_root      = SHA256(concat(sorted (account_id||head_hash) bytes)) for this epoch snapshot
+message EpochFinalization {
+  uint64 epoch = 1;
+
+  Hash32 accepted_txids_hash = 2;
+  Hash32 frontiers_root = 3;
+
+  Pub32 signer = 4;   // validator_id
+  SigDER sig = 5;     // signature over digest(epoch, accepted_txids_hash, frontiers_root)
+
+  repeated bytes accepted_txids = 6;  // actual winner txid list (32 bytes each) so peers can apply quorum's set on mismatch
+}
+
+// --- Resync / bootstrap (Nano-style) ---
+
+message SyncLatestRequest {}
+
+message SyncLatestResponse {
+  uint64 latest_epoch = 1;
+}
+
+message SyncFinalizationRequest {
+  uint64 epoch = 1;
+}
+
+message SyncFinalizationResponse {
+  repeated EpochFinalization finalizations = 1;
+}
+
+message FrontierEntry {
+  AccountId account = 1; // 32 bytes
+  Hash32 head = 2;       // 32 bytes
+}
+
+message SyncFrontiersRequest {
+  uint64 epoch = 1;
+  AccountId cursor = 2;  // optional; empty means start
+  uint32 limit = 3;
+}
+
+message SyncFrontiersResponse {
+  uint64 epoch = 1;
+  repeated FrontierEntry entries = 2;
+  AccountId next_cursor = 3; // empty when done
+}
+
+message SyncChainRequest {
+  AccountId account = 1;
+  Hash32 target_head = 2;
+  Hash32 have = 3;        // optional; empty means "no have"
+  uint32 max_blocks = 4;
+}
+
+message SyncChainResponse {
+  repeated Tx tx = 1;     // from target head backwards (head-first order)
+  bool reached_have = 2;
+}

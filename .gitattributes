@@ -1,0 +1,6 @@
+# Normalize line endings: store text as LF in the repo, check out LF everywhere.
+# Keeps diffs clean across the macOS dev box and the Linux validator VMs.
+* text=auto eol=lf
+
+# Generated protobuf Go — omit from GitHub language stats and collapse in diffs.
+internal/proto/anos.pb.go linguist-generated=true
