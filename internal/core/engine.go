@@ -730,6 +730,134 @@ func (e *Engine) bestEffortBreakglassCheck(tx *pb.Tx) error {
 	return jerr
 }
 
+// isZeroOpeningPrev reports whether prev is the canonical opening-slot predecessor: nil, empty, or
+// an all-zero 32-byte hash. validate coerces nil/empty prev to zeros (ErrBadPrev otherwise), and an
+// opening block carries a 32-zero prev; a non-zero-length-!=32 prev is malformed and never produces
+// a conflict key (conflictKeyHash requires 32 bytes), so it is not the opening slot.
+func isZeroOpeningPrev(prev *pb.Hash32) bool {
+	if prev == nil || len(prev.V) == 0 {
+		return true
+	}
+	if len(prev.V) != 32 {
+		return false
+	}
+	for _, b := range prev.V {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// judgeAbsentOpening decides whether a tx contesting the opening slot (prev=0, seq=1) of a
+// GENUINELY-ABSENT account can never finalize. It is a pure function of the tx bytes (no state), so
+// a lagging node and a fully-synced node reach the identical verdict — a reject here can never be a
+// false-reject caused by local sync lag. It returns an error ONLY for a provably-never-finalizable
+// shape; anything ambiguous (a well-formed opening of the holder's OWN derived id, or a
+// TRANSFER/ESCROW opening whose id-derivation needs the unsynced funding receivable + key source)
+// returns nil (defer) — the authoritative validate at epoch close makes the final call.
+//
+// The one legitimate "an account chain begins with a SEND" case is the Fund and the genesis
+// distributor, both SEEDED at genesis (always present in the DB, first real block at seq>=2 with a
+// non-zero prev), so they never reach this function — the caller's account-present + seq==1 guards
+// exclude them twice over. For any genuinely-absent account, no SEND is a valid first block (its
+// balance is 0, so the normal-send branch fails ErrInsufficientBal, and no other SEND branch admits
+// an absent account), so a SEND — with or without a HybridMultiSig — at the opening slot is junk.
+func judgeAbsentOpening(tx *pb.Tx, acct [32]byte) error {
+	if tx.Type != pb.TxType_TX_TYPE_RECEIVE {
+		// SEND / UNSPECIFIED / reserved type: the only finalizable first block is an opening
+		// RECEIVE, so none of these can ever create the account. Reject so a txid-ground variant
+		// (a bare junk SEND, or one carrying a junk multisig to grind the txid) cannot occupy the
+		// opening conflict slot and stall the real opening.
+		return errors.New("opening slot: only an opening RECEIVE can create an account")
+	}
+	rb := tx.GetReceive()
+	class := rb.GetAccountClass()
+	switch class {
+	case pb.AccountClass_ACCOUNT_CLASS_TRANSFER, pb.AccountClass_ACCOUNT_CLASS_ESCROW:
+		// The id derives from the funding receivable (rs.From / rs.FromSeq) and the key source's
+		// stored keys, which may not be synced here → defer (ambiguous). This residual (a junk opening
+		// relabelled TRANSFER/ESCROW still occupies the conflict slot) is closed downstream by the
+		// validity-aware candidate proposal (buildCandidateList proposes the lowest VALID txid per
+		// contested slot), NOT at this stateless front-door gate.
+		return nil
+	case pb.AccountClass_ACCOUNT_CLASS_FUND:
+		// FUND is a reserved keyless singleton, seeded at genesis and never opened by a RECEIVE.
+		return errors.New("opening RECEIVE: FUND is never opened by a RECEIVE")
+	case pb.AccountClass_ACCOUNT_CLASS_UNSPECIFIED:
+		// validate requires a concrete account_class on an opening.
+		return errors.New("opening RECEIVE: account_class is required")
+	default:
+		// SPENDING/TIMELOCKED/GUARDED/VAULT and ANY unknown enum value (proto3 open enums preserve an
+		// undefined number like 99). The authoritative validate derives a non-TRANSFER/non-ESCROW id as
+		// BaseAccountID(AccountTypeByteForClass(class), auth_pubkey) — a PURE function of the carried key
+		// (AccountTypeByteForClass returns 0 for an unknown class, exactly what validate uses). If the
+		// carried key does not derive to acct, no signature/receivable/future state can make this an
+		// opening of acct — the core forge (attacker self-signs a RECEIVE with its OWN key over the
+		// VICTIM's id), incl. the one-byte-relabel-to-unknown-class variant. A key that DOES derive
+		// means the tx opens the holder's own account (SHA-512 preimage resistance rules out hitting a
+		// victim's id), so defer.
+		ap := rb.GetAuthPubkey().GetV()
+		if len(ap) != crypto.HybridPubKeySize {
+			return errors.New("opening RECEIVE: auth_pubkey must be 2625 bytes")
+		}
+		if crypto.BaseAccountID(crypto.AccountTypeByteForClass(class), ap) != acct {
+			return errors.New("opening RECEIVE: account-id does not derive from the carried auth_pubkey")
+		}
+		return nil
+	}
+}
+
+// bestEffortOpeningCheck closes the opening-slot DoS (P7.1): a junk SEND/RECEIVE on a not-yet-created
+// account grabs that account's opening conflict slot (sha256(account||prev||seq) with prev=0, seq=1)
+// so the real opening can never be proposed. Two shapes enter the pool unguarded today: a SEND on a
+// locally-absent account (resolveAuthPubKeyDB defers it with NO sig check), and a RECEIVE whose
+// carried auth_pubkey the attacker self-signs (verified against the attacker's OWN key). Either can
+// be txid-ground to the lowest txid, which alone becomes the approved candidate proposed every epoch;
+// it fails the epoch-close validate, so that slot commits nothing while the higher-txid real opening
+// is never even proposed = liveness DoS sustained by cheap re-injection each epoch.
+//
+// It mirrors the established bestEffort* gates: own locking (never called under e.mu), defer while
+// resyncing, and reject ONLY a provably-never-finalizable shape at the exact position — everything
+// ambiguous is deferred to the authoritative epoch-close validate, which no winner can skip. It fires
+// its reject arm ONLY on a GENUINELY-ABSENT account at prev=0/seq=1, so it can never touch the Fund,
+// the genesis account (both seeded → always present, first real block seq>=2), or any legit keyless
+// / multisig SEND (all seq>=2 on an existing account) — those are excluded by the account-present and
+// seq==1 guards before any judgement. ApplyTx is untouched → resync-safe.
+func (e *Engine) bestEffortOpeningCheck(tx *pb.Tx) error {
+	if tx.Account == nil || len(tx.Account.V) != 32 {
+		return nil // no 32-byte account → conflictKeyHash produces no key → no DoS; defer
+	}
+	if tx.Seq != 1 || !isZeroOpeningPrev(tx.Prev) {
+		return nil // only the true opening slot can contest a legitimate opening; anything else defers
+	}
+	// NOTE: a breakglass reveal is NOT blanket-deferred here. A reveal-carrying SEND at the opening
+	// slot is still junk (no SEND is a valid first block) and judgeAbsentOpening must reject it — else
+	// attaching a reveal is a one-field bypass of the SEND-reject arm. A legit breakglass/return-stake
+	// opening is a TRANSFER-class RECEIVE, which judgeAbsentOpening defers; bestEffortBreakglassCheck
+	// (which runs first) still owns the reveal-commitment verdict for those.
+	var acct [32]byte
+	copy(acct[:], tx.Account.V)
+	e.mu.Lock()
+	resyncing := e.resync.IsActive()
+	e.mu.Unlock()
+	if resyncing {
+		return nil // catching up — don't judge
+	}
+	var jerr error
+	_ = e.cfg.DB.View(func(dbtx *bbolt.Tx) error {
+		if _, ok := getAccountRecord(dbtx, acct); ok {
+			// Account already exists locally (this includes the always-seeded Fund + genesis). It is
+			// NOT an opening: a seq=1/prev=0 tx here can never finalize (validate: prev!=head,
+			// seq!=head+1) and is already sig-checked against the cached key upstream. Defer.
+			return nil
+		}
+		jerr = judgeAbsentOpening(tx, acct)
+		return nil
+	})
+	return jerr
+}
+
 func (e *Engine) SubmitTx(raw []byte) error {
 	tx, err := ParseTx(raw)
 	if err != nil {
@@ -754,6 +882,12 @@ func (e *Engine) SubmitTx(raw []byte) error {
 	// A non-Fund SEND carrying a multisig is an attestor-gated release (or junk); judge it at the
 	// gate so a txid-ground variant can't occupy the chain's conflict slot. No-op without a multisig.
 	if err := e.bestEffortReleaseCheck(tx); err != nil {
+		return err
+	}
+	// A junk SEND/RECEIVE contesting an absent account's opening slot (prev=0, seq=1) is rejected
+	// here so it can't grind the opening conflict slot and stall the real opening (P7.1). No-op for
+	// any tx that isn't at an opening slot on a locally-absent account.
+	if err := e.bestEffortOpeningCheck(tx); err != nil {
 		return err
 	}
 	txid, err := crypto.TxID(tx)
@@ -1119,6 +1253,11 @@ func (e *Engine) ReceiveGossipedTx(raw []byte) error {
 	}
 	// Attestor-gated release (or a junk-multisig variant): judge at the gate (no-op without a multisig).
 	if err := e.bestEffortReleaseCheck(tx); err != nil {
+		return err
+	}
+	// Opening-slot DoS gate (P7.1): reject a junk SEND/RECEIVE grinding an absent account's opening
+	// conflict slot on the gossip path too (junk propagates via /peer/tx/push + the inv/get fetch).
+	if err := e.bestEffortOpeningCheck(tx); err != nil {
 		return err
 	}
 	txid, err := crypto.TxID(tx)
@@ -2183,15 +2322,67 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 
 // buildCandidateListV2 builds a txid-only candidate list ("votes").
 // It ignores raws and uses e.approved (one tx per conflict key).
-func (e *Engine) buildCandidateList(epoch uint64, snap *Snapshot) (*CandidateList, [][32]byte) {
-	_ = snap
+// maxCandidateScanPerSlot bounds how many txids buildCandidateList validates per conflict slot when
+// searching for the lowest VALID candidate. It caps the CPU an attacker can force by flooding a slot
+// with ground-low invalid txids; the residual (a flood past the cap that buries the real block) is
+// bounded by mempool admission limits (P7.3), which cap how many txids a slot can accumulate. A cap
+// hit is logged (never silent). Generous vs any honest slot (1-2 txids).
+const maxCandidateScanPerSlot = 64
 
+func (e *Engine) buildCandidateList(epoch uint64, snap *Snapshot) (*CandidateList, [][32]byte) {
+	// Snapshot the conflict pool + the raw bytes it references under the lock; validate OUTSIDE the lock
+	// (ValidateTxAgainstSnapshot is a pure function of snap and holds no engine state).
 	e.mu.Lock()
-	ids := make([][32]byte, 0, len(e.approved))
-	for _, txid := range e.approved {
-		ids = append(ids, txid)
+	slots := make([][][32]byte, 0, len(e.conflictPool))
+	rawByID := make(map[[32]byte][]byte)
+	for _, txids := range e.conflictPool {
+		slots = append(slots, append([][32]byte(nil), txids...))
+		for _, id := range txids {
+			if raw, ok := e.txPool[id]; ok {
+				rawByID[id] = raw
+			}
+		}
 	}
 	e.mu.Unlock()
+
+	// Per conflict slot, propose the LOWEST-txid candidate that VALIDATES against snap — NOT the
+	// blindly-lowest txid. A validity-blind pick lets a ground-low junk block (in particular a junk
+	// opening relabelled TRANSFER/ESCROW, which the stateless front-door gate must defer) starve a slot:
+	// it is proposed alone, fails the epoch-close validate, and the real (higher-txid) block for the
+	// same slot — which is never proposed — can never win. Skipping invalid candidates so the lowest
+	// VALID one is proposed closes that opening-slot DoS regardless of how the junk is labelled. This is
+	// deterministic given snap (all synced nodes hold the same finalized snapshot → same verdict, even
+	// if they hold different junk); a node too far behind to validate the real block yet simply proposes
+	// nothing for that slot and relies on the synced quorum (pre-existing lagging-node behaviour). It is
+	// LIVENESS-only: ApplyTx and the authoritative dry-run validate (which re-checks the union) are
+	// unchanged, so it cannot fork or affect resync. (It supersedes the raw lowest-txid e.approved cache
+	// for proposal; e.approved is still maintained as the incremental per-slot lowest-txid tracker.)
+	ids := make([][32]byte, 0, len(slots))
+	for _, txids := range slots {
+		sort.Slice(txids, func(i, j int) bool { return bytes.Compare(txids[i][:], txids[j][:]) < 0 })
+		scanned := 0
+		for _, id := range txids {
+			if scanned >= maxCandidateScanPerSlot {
+				log.Printf("[epoch=%d] candidate scan cap (%d) hit for a conflict slot; deferring it (mempool bounding is P7.3)", epoch, maxCandidateScanPerSlot)
+				break
+			}
+			raw, ok := rawByID[id]
+			if !ok {
+				continue // bytes not held locally (shouldn't happen for a pooled txid) — skip
+			}
+			scanned++
+			tx, err := ParseTx(raw)
+			if err != nil {
+				continue
+			}
+			cid, verr := ValidateTxAgainstSnapshot(tx, snap)
+			if verr != nil || cid != id {
+				continue // invalid (or txid mismatch) → skip; try the next-lowest txid for this slot
+			}
+			ids = append(ids, id)
+			break
+		}
+	}
 
 	// stable order for list_hash/signature
 	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
