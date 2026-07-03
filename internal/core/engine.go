@@ -111,8 +111,17 @@ type EngineConfig struct {
 
 	// MaxCandidateScanPerSlot bounds how many txids buildCandidateList validates per conflict slot
 	// (P7.1). Manifest-pinned so candidate proposal is deterministic network-wide under a flood;
-	// NewEngine fails closed if 0.
+	// NewEngine fails closed if 0. P7.3 ALSO uses it as the per-conflict-slot mempool admission cap
+	// (FIFO reject-when-full), so a slot can never accumulate more txids than buildCandidateList
+	// scans — closing the P7.1 ">64-junk buries the real opening" residual.
 	MaxCandidateScanPerSlot uint64
+
+	// MaxMempoolTxs bounds the unsolicited transaction pool (reject-when-full). A LOCAL operational
+	// knob (memory bound), NOT consensus-critical and deliberately NOT manifest-pinned: divergent
+	// caps cannot fork — solicited consensus fetches (fetchMissingTxs) bypass it, and a tx dropped by
+	// one full pool is still held/proposed by other nodes and fetched on demand by any node that needs
+	// it for the union. 0 => NewEngine substitutes defaultMaxMempoolTxs. (P7.3)
+	MaxMempoolTxs int
 
 	// NetworkID / ProtocolVersion are this node's network identity (config.Manifest.NetworkID = the
 	// content hash + SupportedProtocolVersion). The engine stamps them as X-Anos-* headers on every
@@ -162,6 +171,15 @@ type Engine struct {
 	resync            ResyncState
 	resyncNextAttempt time.Time
 	resyncFailCount   int
+
+	// --- P7.3 peer-source IP allowlist (the /peer/* front door) ---
+	// rosterIPs is the static set of source IPs the manifest roster reaches us from (derived once
+	// from cfg.Peers at NewEngine). It is the pre-flip set AND a permanent fallback so a node can
+	// never strand itself. dynPeerIPs is refreshed each epoch by the loop from the finalized Fund
+	// banker endpoints (post-flip), so connectivity gating follows the Fund (Q3/Q4). Both are read by
+	// PeerSourceAllowed; dynPeerIPs is guarded by e.mu. Loopback is always allowed (operator/self).
+	rosterIPs  map[string]struct{}
+	dynPeerIPs map[string]struct{}
 
 	startOnce sync.Once
 }
@@ -214,6 +232,11 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if cfg.MaxCandidateScanPerSlot == 0 {
 		return nil, errors.New("missing consensus.max_candidate_scan_per_slot (set from the manifest)")
 	}
+	// MaxMempoolTxs is a LOCAL liveness bound (not manifest-pinned); substitute the default when unset
+	// so tests / direct engine construction get a sane cap without having to specify one.
+	if cfg.MaxMempoolTxs == 0 {
+		cfg.MaxMempoolTxs = defaultMaxMempoolTxs
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 2 * time.Second}
 	}
@@ -232,6 +255,8 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		peerLists:    make(map[uint64]map[[33]byte]*CandidateList),
 		manifestKeys: manifestKeys,
 		epochSets:    make(map[uint64]map[[33]byte]*ecdsa.PublicKey),
+		rosterIPs:    ipSetFromURLs(cfg.Peers),
+		dynPeerIPs:   make(map[string]struct{}),
 	}
 
 	if err := cfg.DB.Update(func(tx *bbolt.Tx) error { return ensureBuckets(tx) }); err != nil {
@@ -887,6 +912,31 @@ func (e *Engine) bestEffortOpeningCheck(tx *pb.Tx) error {
 	return jerr
 }
 
+// P7.3 mempool admission bounds. These are LOCAL liveness knobs (see EngineConfig.MaxMempoolTxs), NOT
+// consensus-critical: a node that rejects a tx here does not fork — the tx is still held/proposed by
+// other nodes, and any node that needs it for the epoch union fetches it via the SOLICITED path
+// (fetchMissingTxs), which bypasses these bounds. Two caps compose:
+//   - global: MaxMempoolTxs total unsolicited txs (a memory bound).
+//   - per conflict slot: MaxCandidateScanPerSlot txids, FIFO reject-when-full, so a slot can never hold
+//     more candidates than buildCandidateList scans — an already-admitted opening cannot be evicted by
+//     later ground-lower junk. This closes the P7.1 ">64-junk buries the real opening" residual.
+const defaultMaxMempoolTxs = 200_000
+
+// admissionRejectLocked returns a non-empty reason to reject an UNSOLICITED tx (submit / gossip-push)
+// under the mempool bounds, or "" to admit. The caller holds e.mu and has confirmed txid is not
+// already pooled. It reads but does not mutate the pool.
+func (e *Engine) admissionRejectLocked(tx *pb.Tx, txid [32]byte) string {
+	if e.cfg.MaxMempoolTxs > 0 && len(e.txPool) >= e.cfg.MaxMempoolTxs {
+		return "global mempool cap"
+	}
+	if key, ok := conflictKeyHash(tx); ok {
+		if uint64(len(e.conflictPool[key])) >= e.cfg.MaxCandidateScanPerSlot {
+			return "conflict-slot cap" // slot full; keep incumbents (FIFO) so junk can't evict a real block
+		}
+	}
+	return ""
+}
+
 func (e *Engine) SubmitTx(raw []byte) error {
 	tx, err := ParseTx(raw)
 	if err != nil {
@@ -946,6 +996,13 @@ func (e *Engine) SubmitTx(raw []byte) error {
 	if _, ok := e.txPool[txid]; ok {
 		dup = true
 	} else {
+		// Bounded mempool admission (P7.3). A submitted tx is UNSOLICITED, so it is subject to the
+		// global + per-conflict-slot caps; reject-when-full rather than evict.
+		if reason := e.admissionRejectLocked(tx, txid); reason != "" {
+			e.mu.Unlock()
+			log.Printf("[tx] submit reject (%s) txid=%x", reason, txid[:4])
+			return fmt.Errorf("mempool full: %s", reason)
+		}
 		e.txPool[txid] = append([]byte(nil), raw...)
 	}
 
@@ -1033,8 +1090,32 @@ func (e *Engine) ListReceivables(toAcct [32]byte) ([]*pb.Receivable, error) {
 }
 
 // ReceiveCandidateList stores a peer candidate list for an epoch after verifying signature and list hash.
+// P7.3 epoch-window intake bounds. A live candidate list / finalization for an epoch far from the
+// current wall-clock epoch is rejected up front so a member cannot grow peerLists / peerFinals (both
+// keyed by epoch and pruned only for the epoch that just closed) or the on-disk finalization store
+// without bound. LOCAL liveness consts, not consensus: a message outside the window could never be
+// counted for the current epoch anyway, and differing windows across nodes cannot fork (the message
+// is simply re-sendable once its epoch is current). Generous vs any real clock skew / processing lag
+// — epochNow is wall-clock, so even a GC-stalled node computes the current epoch.
+const (
+	maxIntakeEpochLag   = 8 // buffer messages up to this many epochs behind wall-clock now
+	maxIntakeEpochAhead = 2 // ...and this many ahead (clock-skew tolerance)
+)
+
+// epochWithinIntakeWindow reports whether ep is close enough to the current wall-clock epoch to
+// buffer a live candidate list / finalization for it (guards against uint underflow).
+func (e *Engine) epochWithinIntakeWindow(ep uint64) bool {
+	now := e.epochNow()
+	return ep+maxIntakeEpochLag >= now && ep <= now+maxIntakeEpochAhead
+}
+
 func (e *Engine) ReceiveCandidateList(fromURL string, cl *CandidateList) error {
 	_ = fromURL // identity is the pubkey, not URL
+
+	// 0) reject a candidate list for an epoch far from now so a member can't grow peerLists unbounded.
+	if !e.epochWithinIntakeWindow(cl.Epoch) {
+		return errors.New("reject: epoch outside intake window")
+	}
 
 	// 1) membership check against the validator set for THIS epoch (manifest list pre-flip, the
 	// Fund-derived set post-flip). The loop re-checks membership against the authoritative cached
@@ -1256,7 +1337,15 @@ func (e *Engine) LatestFinalizedEpoch() uint64 {
 	return latest
 }
 
-func (e *Engine) ReceiveGossipedTx(raw []byte) error {
+// ReceiveGossipedTx admits an UNSOLICITED gossiped tx (the /peer/tx/push path): it is subject to the
+// bounded-mempool admission caps (P7.3). Solicited consensus fetches use receiveGossipedTx(raw, true).
+func (e *Engine) ReceiveGossipedTx(raw []byte) error { return e.receiveGossipedTx(raw, false) }
+
+// receiveGossipedTx is the shared gossip-intake path. solicited=true (fetchMissingTxs pulling txs the
+// epoch union NEEDS) BYPASSES the mempool admission caps so finalization can always complete; the caps
+// gate only unsolicited push/submit intake, so a full pool can never starve a node of a tx it must
+// validate — it fetches that tx on demand regardless.
+func (e *Engine) receiveGossipedTx(raw []byte, solicited bool) error {
 	tx, err := ParseTx(raw)
 	if err != nil {
 		return err
@@ -1308,21 +1397,26 @@ func (e *Engine) ReceiveGossipedTx(raw []byte) error {
 	seen := e.epochNow()
 
 	e.mu.Lock()
+	if e.txPool == nil {
+		e.txPool = make(map[[32]byte][]byte)
+	}
+	_, gdup := e.txPool[txid]
+	if !gdup && !solicited {
+		// Bounded mempool admission (P7.3): unsolicited gossip is subject to the caps. Reject BEFORE
+		// stamping txSeenEpoch so a rejected tx leaves no bookkeeping behind.
+		if reason := e.admissionRejectLocked(tx, txid); reason != "" {
+			e.mu.Unlock()
+			log.Printf("[tx] gossip reject (%s) txid=%x", reason, txid[:4])
+			return fmt.Errorf("mempool full: %s", reason)
+		}
+	}
 	if e.txSeenEpoch == nil {
 		e.txSeenEpoch = make(map[[32]byte]uint64)
 	}
 	if _, exists := e.txSeenEpoch[txid]; !exists {
 		e.txSeenEpoch[txid] = seen
 	}
-
-	gdup := false
-
-	if e.txPool == nil {
-		e.txPool = make(map[[32]byte][]byte)
-	}
-	if _, ok := e.txPool[txid]; ok {
-		gdup = true
-	} else {
+	if !gdup {
 		e.txPool[txid] = append([]byte(nil), raw...)
 	}
 	if e.gossipPending == nil {
@@ -1366,7 +1460,20 @@ func (e *Engine) ReceiveGossipedTx(raw []byte) error {
 	return nil
 }
 
+// ReceiveFinalization ingests a finalization received from a PEER (the /peer/finalization handler): it
+// is subject to the epoch-intake window. The epoch loop stores its OWN finalization via
+// storeSelfFinalization, which bypasses the window (self-produced authoritative data — the node's own
+// quorum vote must never be dropped just because a slow loop iteration drifted past the window).
 func (e *Engine) ReceiveFinalization(fin *pb.EpochFinalization) error {
+	return e.receiveFinalization(fin, false)
+}
+
+// storeSelfFinalization records THIS node's own finalization (loop path), bypassing the intake window.
+func (e *Engine) storeSelfFinalization(fin *pb.EpochFinalization) error {
+	return e.receiveFinalization(fin, true)
+}
+
+func (e *Engine) receiveFinalization(fin *pb.EpochFinalization, selfStore bool) error {
 	if fin == nil {
 		return errors.New("nil finalization")
 	}
@@ -1381,6 +1488,16 @@ func (e *Engine) ReceiveFinalization(fin *pb.EpochFinalization) error {
 	}
 	if fin.Sig == nil || len(fin.Sig.V) < 64 || len(fin.Sig.V) > 80 {
 		return errors.New("bad sig")
+	}
+
+	// Reject a PEER finalization for an epoch far from now so a member can't grow peerFinals / the
+	// on-disk finalization store unbounded (P7.3). The node's OWN finalization (selfStore) bypasses this
+	// — finalizationQuorum counts votes only from peerFinals[epoch] with no separate self-count, so
+	// dropping the self-store would silently discard the node's own vote. Resync persists past-epoch
+	// finalizations via a different path (persistFinalizations), so this live-intake bound never impedes
+	// catch-up.
+	if !selfStore && !e.epochWithinIntakeWindow(fin.Epoch) {
+		return errors.New("epoch outside intake window")
 	}
 
 	var signerID [33]byte
@@ -1452,7 +1569,6 @@ func (e *Engine) ReceiveFinalization(fin *pb.EpochFinalization) error {
 // accountID is used only for diagnostics / special synthetic-anchor handling;
 // tx bytes themselves are always read from BTxs.
 func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byte, max int) ([][]byte, bool) {
-	log.Printf("SYNCCHAIN ENGINE CALLED acct=%x target=%x have=%x max=%d", accountID[:4], targetHead[:4], have[:4], max)
 	if max <= 0 {
 		max = 2000
 	}
@@ -1478,7 +1594,6 @@ func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byt
 				if have != ([32]byte{}) && cur == have {
 					reachedHave = true
 				}
-				log.Printf("SYNCCHAIN head missing acct=%x cur=%x have=%x reached=%v", accountID[:4], cur[:4], have[:4], reachedHave)
 				break
 			}
 
@@ -1513,7 +1628,6 @@ func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byt
 			if have == ([32]byte{}) {
 				// Normal account-chain heuristic: missing prev means synthetic base.
 				if _, err := getTxRaw(tx, prev); err != nil {
-					log.Printf("SYNCCHAIN acct=%x stopping at synthetic base prev=%x", accountID[:4], prev[:4])
 					reachedHave = true
 					break
 				}
@@ -1526,7 +1640,6 @@ func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byt
 		log.Printf("SYNCCHAIN DB.View error: %v", err)
 	}
 
-	log.Printf("SYNCCHAIN DONE acct=%x target=%x out=%d reached=%v", accountID[:4], targetHead[:4], len(out), reachedHave)
 	return out, reachedHave
 }
 
@@ -1605,6 +1718,10 @@ func (e *Engine) loop(ctx context.Context) {
 		if epochSetIsFund {
 			log.Printf("[epoch=%d] phase:validator-set source=fund size=%d", epoch, len(epochSet))
 		}
+		// P7.3: refresh the dynamic /peer/* source-IP allowlist from the finalized Fund banker
+		// endpoints so connectivity gating follows the Fund post-flip (roster stays a permanent
+		// fallback). Once per epoch; liveness-only (never a fork).
+		e.refreshDynPeerIPs(epoch)
 
 		// Sleep until the epoch boundary (end of this epoch).
 		sleepMs := epochEndMs - nowMs
@@ -1864,8 +1981,8 @@ func (e *Engine) loop(ctx context.Context) {
 			AcceptedTxids:     acceptedTxidBytes,
 		}
 
-		// store our own finalization (and memory map)
-		if err := e.ReceiveFinalization(fin); err != nil {
+		// store our own finalization (and memory map); bypasses the intake window (self-vote must count)
+		if err := e.storeSelfFinalization(fin); err != nil {
 			e.elog(epoch, "finalization: store self error: %v", err)
 		}
 
@@ -2739,7 +2856,8 @@ func (e *Engine) fetchMissingTxs(epoch uint64, missing [][32]byte) {
 				if err != nil {
 					continue
 				}
-				if err := e.ReceiveGossipedTx(raw); err == nil {
+				// SOLICITED: these are txs the epoch union needs, so bypass the mempool admission caps.
+				if err := e.receiveGossipedTx(raw, true); err == nil {
 					txid, _ := crypto.TxID(tx)
 					resolved[txid] = struct{}{}
 					got++

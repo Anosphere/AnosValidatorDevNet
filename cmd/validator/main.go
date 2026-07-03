@@ -416,8 +416,6 @@ func main() {
 	})
 
 	mux.HandleFunc("/peer/tx/inv", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("INV CALLED")
-
 		if r.Method != "POST" {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
@@ -434,8 +432,10 @@ func main() {
 		var fromID [33]byte
 		copy(fromID[:], inv.From.V)
 
-		// membership check (same as candidates)
-		if engine.ValidatorPub(fromID) == nil {
+		// membership against the PER-EPOCH set (manifest list pre-flip / Fund-derived post-flip), the
+		// same set /peer/candidates + /peer/finalization use (P7.3 unification; was the static env set,
+		// which wrongly refused a newly-admitted banker and accepted a kicked one post-flip).
+		if !engine.PeerMemberForEpoch(inv.Epoch, fromID) {
 			http.Error(w, "unknown validator", 400)
 			return
 		}
@@ -476,7 +476,8 @@ func main() {
 		}
 		var fromID [33]byte
 		copy(fromID[:], push.From.V)
-		if engine.ValidatorPub(fromID) == nil {
+		// Per-epoch membership (P7.3 unification), matching /peer/tx/inv + /peer/candidates.
+		if !engine.PeerMemberForEpoch(push.Epoch, fromID) {
 			http.Error(w, "unknown validator", 400)
 			return
 		}
@@ -504,6 +505,20 @@ func main() {
 		var want pb.TxWant
 		if err := readProtoDelim(r.Body, &want); err != nil {
 			http.Error(w, "bad proto", 400)
+			return
+		}
+		// P7.3: gate /peer/tx/get on the per-epoch set too (it had NO membership check before, so any
+		// client could bulk-fetch raw tx bytes). The requester's From is self-asserted — this is a
+		// DoS/spam filter, not auth (the IP firewall + consensus sigs are the real boundary) — but it
+		// closes the open bulk-read hole and unifies with the other /peer/* handlers.
+		if want.From == nil || len(want.From.V) != 33 {
+			http.Error(w, "bad from", 400)
+			return
+		}
+		var getFrom [33]byte
+		copy(getFrom[:], want.From.V)
+		if !engine.PeerMemberForEpoch(want.Epoch, getFrom) {
+			http.Error(w, "unknown validator", 400)
 			return
 		}
 		log.Printf("[net] rx /peer/tx/get epoch=%d want=%d", want.Epoch, len(want.Txid))
@@ -572,6 +587,9 @@ func main() {
 		if limit <= 0 {
 			limit = 1000
 		}
+		if limit > maxFrontiersLimit {
+			limit = maxFrontiersLimit // P7.3: ceiling the caller-controlled pagination (resync uses 1000)
+		}
 		var cursor [32]byte
 		if curHex := r.URL.Query().Get("cursor"); curHex != "" {
 			b, err := hex.DecodeString(curHex)
@@ -623,7 +641,13 @@ func main() {
 			copy(have[:], req.Have.V)
 		}
 
-		txs, reached := engine.SyncChain(acct, head, have, int(req.MaxBlocks))
+		// P7.3: ceiling the caller-controlled block count (resync asks for 200000, which passes; this
+		// only bounds an absurd value). Zero/negative still defaults inside SyncChain.
+		maxBlocks := int(req.MaxBlocks)
+		if maxBlocks > maxSyncChainBlocks {
+			maxBlocks = maxSyncChainBlocks
+		}
+		txs, reached := engine.SyncChain(acct, head, have, maxBlocks)
 		resp := &pb.SyncChainResponse{ReachedHave: reached}
 		for _, raw := range txs {
 			tx, err := core.ParseTx(raw)
@@ -644,6 +668,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPublicBodyBytes) // P7.3: bound the io.ReadAll body
 		var req pb.SubmitTxRequest
 		if err := readProtoRaw(r.Body, &req); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -694,10 +719,10 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPublicBodyBytes) // P7.3: bound the io.ReadAll body
 		var req pb.GetAccountRequest
 		if err := readProtoRaw(r.Body, &req); err != nil {
 			http.Error(w, "bad proto", 400)
-			log.Printf("BAD PROTO /account")
 			return
 		}
 		if req.Account == nil || len(req.Account.V) != 32 {
@@ -735,12 +760,11 @@ func main() {
 
 	// POST /receivables : ListReceivablesRequest -> ListReceivablesResponse
 	mux.HandleFunc("/receivables", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("RECEIVABLES")
-
 		if r.Method != "POST" {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPublicBodyBytes) // P7.3: bound the io.ReadAll body
 		var req pb.ListReceivablesRequest
 		if err := readProtoRaw(r.Body, &req); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -1033,7 +1057,38 @@ func main() {
 		_ = json.NewEncoder(w).Encode(out)
 	})
 
-	srv := &http.Server{Addr: ":" + port, Handler: anosNetworkMiddleware(mux, manifest.NetworkID, manifest.ProtocolVersion)}
+	// GET /health : ungated liveness probe (no network header, no IP gate, no rate limit) for uptime
+	// checks / load balancers. Returns 200 + a tiny JSON with the node's network id + latest epoch.
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Status      string `json:"status"`
+			NetworkID   string `json:"network_id"`
+			LatestEpoch uint64 `json:"latest_epoch"`
+		}{"ok", manifest.NetworkID, engine.LatestFinalizedEpoch()})
+	})
+
+	// P7.3 edge middlewares, composed OUTSIDE the P7.2 network-id middleware (outer→inner):
+	//   debugLoopbackGate → peerIPFirewall → rateLimitGate → anosNetworkMiddleware → mux
+	// Each acts only on its own path prefix; the ordering sheds unauthorized / metered traffic as
+	// cheaply and early as possible. The http.Server timeouts below are the Slowloris / slow-client
+	// defenses (none were set before, so a single slow client could hold a connection open forever).
+	submitLimiter := newIPRateLimiter(submitRatePerSec, submitBurst)
+	syncLimiter := newIPRateLimiter(syncRatePerSec, syncBurst)
+	var handler http.Handler = anosNetworkMiddleware(mux, manifest.NetworkID, manifest.ProtocolVersion)
+	handler = rateLimitGate(handler, submitLimiter, syncLimiter, engine.PeerSourceAllowed)
+	handler = peerIPFirewall(handler, engine.PeerSourceAllowed)
+	handler = debugLoopbackGate(handler)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 
 	log.Printf("validator listening on :%s (peers=%d, epoch=%dms)", port, len(peers), epochMS)
 
