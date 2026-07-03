@@ -147,7 +147,7 @@ func newEscrowOpenFixture(t *testing.T, fundAmount uint64) *escrowOpenFixture {
 	escID := escrowIDFor(lo, hi, funder.id, escrowFromSeq)
 	var rid [32]byte
 	rid[0], rid[1] = 0x42, 0x99
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			funder.id: {Class: pb.AccountClass_ACCOUNT_CLASS_SPENDING, AuthPubKey: funder.pub.Encode()},
 		},
@@ -362,7 +362,7 @@ func newEscrowOutFixture(t *testing.T, attested bool, trigger uint64) *escrowOut
 	if attested {
 		flags = escrowFlagAttested
 	}
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			escID: {
 				Head: head, Balance: balance, Seq: 1,
@@ -605,7 +605,7 @@ func TestEscrowApplyOpenAndDrain(t *testing.T) {
 	openRaw, _ := proto.Marshal(opening)
 	openTxid := txidFor(escID, 1)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund)
+		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund, testEcon)
 	}); err != nil {
 		t.Fatalf("ApplyTx opening: %v", err)
 	}
@@ -655,7 +655,7 @@ func TestEscrowApplyOpenAndDrain(t *testing.T) {
 
 	// Idempotent re-apply of the opening must not double-charge the Fund.
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund)
+		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund, testEcon)
 	}); err != nil {
 		t.Fatalf("re-apply opening: %v", err)
 	}
@@ -676,7 +676,7 @@ func TestEscrowApplyOpenAndDrain(t *testing.T) {
 	drainRaw, _ := proto.Marshal(drain)
 	drainTxid := txidFor(escID, 2)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, drainRaw, drain, drainTxid, fund)
+		return ApplyTx(&bboltTxView{tx: tx}, drainRaw, drain, drainTxid, fund, testEcon)
 	}); err != nil {
 		t.Fatalf("ApplyTx drain: %v", err)
 	}

@@ -25,7 +25,7 @@ import (
 // --- pure: per-class delay table + the attestor-flag predicate ---
 
 func TestDelayForSourceClass(t *testing.T) {
-	snap := &Snapshot{DelayEpochs: 6, GuardedDelayEpochs: 8, VaultDelayEpochs: 12}
+	snap := &Snapshot{Econ: testEcon, DelayEpochs: 6, GuardedDelayEpochs: 8, VaultDelayEpochs: 12}
 	cases := []struct {
 		c    pb.AccountClass
 		want uint64
@@ -83,7 +83,7 @@ func newAttestor(seed byte) *tAttestor {
 }
 
 // attestorStake gives `a` an active Attestor-tagged stake of `whoAnos` whole anos (so
-// IsAttestor(a) iff whoAnos >= 5000).
+// testEcon.IsAttestor(a) iff whoAnos >= 5000).
 func attestorStake(a *tAttestor, depositSeed byte, whoAnos uint64) StakeRow {
 	return StakeRow{
 		DepositTxid: [32]byte{depositSeed, 0xaa},
@@ -149,7 +149,7 @@ func newReleaseFixture(t *testing.T, flagSet bool) *releaseFixture {
 		flags = transferFlagReleaseRequiresAttestor
 	}
 
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			chainID: {
 				Head: head, Balance: balance, Seq: 1,
@@ -328,7 +328,7 @@ func TestNormalSendRejectsMultisig(t *testing.T) {
 	var head, to [32]byte
 	head[0], to[0] = 0x61, 0x62
 	const amt = uint64(100)
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			id: {Head: head, Balance: 1_000_000, Seq: 1, Class: pb.AccountClass_ACCOUNT_CLASS_SPENDING, AuthPubKey: pub.Encode()},
 		},
@@ -492,7 +492,7 @@ func TestApplySetsReleaseAttestorFlag(t *testing.T) {
 			raw, _ := proto.Marshal(ptx)
 			txid := txidFor(chainID, 1)
 			if err := db.Update(func(tx *bbolt.Tx) error {
-				return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund)
+				return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
 			}); err != nil {
 				t.Fatalf("ApplyTx opening RECEIVE: %v", err)
 			}

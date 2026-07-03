@@ -34,7 +34,7 @@ func addrPtr(x [32]byte) *[32]byte { return &x }
 // staker's keys, TransferSource == Fund) carrying return-deposit link `link` (zero to omit), plus the
 // keyed staker (the chain's copied-key source, so return-to-source commitment binds pass).
 func fundSourcedChainSnap(chain, staker *simkit.Account, chHead, dest [32]byte, unlock, bal, epoch uint64, link [32]byte) *Snapshot {
-	return &Snapshot{
+	return &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			chain.ID: {
 				Head: chHead, Balance: bal, Seq: 1, Class: pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
@@ -123,7 +123,7 @@ func TestEnrouteBgOpenReturnStakeReceivableValidate(t *testing.T) {
 	const epoch, delay, bal = uint64(5), uint64(8), uint64(6_000)
 	unlock := epoch + delay
 
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			// chain.ID is ABSENT (this is its opening block).
 			staker.ID: {Class: pb.AccountClass_ACCOUNT_CLASS_SPENDING, AuthPubKey: staker.AuthPubKeyBytes(), BreakglassCommit: append([]byte(nil), staker.Commit...)},
@@ -450,16 +450,16 @@ func TestRevertedRecoveredInertToRoleWeight(t *testing.T) {
 	}
 	for _, st := range []StakeStatus{StakeStatusReverted, StakeStatusRecovered} {
 		rows := mk(st)
-		if IsBanker(rows, id) {
+		if testEcon.IsBanker(rows, id) {
 			t.Errorf("status %v: IsBanker must be false", st)
 		}
-		if GuardianWeight(rows, id) != 0 {
+		if testEcon.GuardianWeight(rows, id) != 0 {
 			t.Errorf("status %v: GuardianWeight must be 0", st)
 		}
 	}
 	// Control: the same stake ACTIVE does confer both.
 	active := mk(StakeStatusActive)
-	if !IsBanker(active, id) || GuardianWeight(active, id) == 0 {
+	if !testEcon.IsBanker(active, id) || testEcon.GuardianWeight(active, id) == 0 {
 		t.Fatal("Active control: IsBanker + GuardianWeight must be set")
 	}
 }

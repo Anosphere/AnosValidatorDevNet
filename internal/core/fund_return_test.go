@@ -83,7 +83,7 @@ func TestApplyKickFlipsStatusAndDropsWeight(t *testing.T) {
 	dtx[0] = 0xde
 	seedStakeRow(t, db, dtx, g.id, anosUnits(6_000), oneYear) // weight 3 while active
 
-	if w := GuardianWeight(listStakes(t, db), g.id); w != 3 {
+	if w := testEcon.GuardianWeight(listStakes(t, db), g.id); w != 3 {
 		t.Fatalf("pre-kick weight = %d, want 3", w)
 	}
 	kick := buildFundSend(testFund, fh, 2, testFund, 0, 55, []*tGuardian{g})
@@ -95,7 +95,7 @@ func TestApplyKickFlipsStatusAndDropsWeight(t *testing.T) {
 	if !ok || st != StakeStatusKicked {
 		t.Fatalf("stake status = %v (ok %v), want Kicked", st, ok)
 	}
-	if w := GuardianWeight(listStakes(t, db), g.id); w != 0 {
+	if w := testEcon.GuardianWeight(listStakes(t, db), g.id); w != 0 {
 		t.Errorf("post-kick weight = %d, want 0 (kicked stake excluded)", w)
 	}
 	// Fund balance unchanged (kick moves nothing).
@@ -661,10 +661,10 @@ func TestApplyReattributionFlipsStakerAndInheritsBanker(t *testing.T) {
 	if !ok || r.StakerID != bene.ID || r.Status != StakeStatusActive || r.Amount != amount || r.StakedFor != StakedForBanker {
 		t.Fatalf("re-attributed row = %+v, want StakerID=B Active banker %d", r, amount)
 	}
-	if IsBanker(rows, staker.ID) {
+	if testEcon.IsBanker(rows, staker.ID) {
 		t.Error("A still IsBanker after re-attribution")
 	}
-	if !IsBanker(rows, bene.ID) {
+	if !testEcon.IsBanker(rows, bene.ID) {
 		t.Error("B not IsBanker after re-attribution")
 	}
 	// Fund balance unchanged (re-attribution moves nothing).
@@ -683,7 +683,7 @@ func TestApplyReattributionFlipsStakerAndInheritsBanker(t *testing.T) {
 		t.Fatalf("B descriptor = %+v, want carried key at seq 0", bi)
 	}
 	inSet := false
-	for _, vd := range BankerValidatorSet(rows, infos) {
+	for _, vd := range testEcon.BankerValidatorSet(rows, infos) {
 		if vd.Identity == bene.ID {
 			inSet = true
 		}

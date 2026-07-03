@@ -631,7 +631,7 @@ func (e *Engine) applyEpochTxids(ids [][32]byte, txByID map[[32]byte][]byte) err
 			if cid != id {
 				return fmt.Errorf("accepted txid does not match its bytes: want %x have %x", id[:8], cid[:8])
 			}
-			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount); aerr != nil {
+			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
 				return fmt.Errorf("apply accepted tx %x: %w", id[:8], aerr)
 			}
 		}
@@ -667,6 +667,7 @@ func (e *Engine) persistFinalizations(epoch uint64, fins []*pb.EpochFinalization
 func (e *Engine) httpSyncLatest(ctx context.Context, peer string) (uint64, error) {
 	peer = strings.TrimRight(peer, "/")
 	req, _ := http.NewRequestWithContext(ctx, "GET", peer+"/sync/latest", nil)
+	e.setAnosHeaders(req)
 	resp, err := e.cfg.HTTPClient.Do(req)
 	if err != nil {
 		return 0, err
@@ -675,6 +676,9 @@ func (e *Engine) httpSyncLatest(ctx context.Context, peer string) (uint64, error
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return 0, fmt.Errorf("sync/latest %s: %s body=%q", peer, resp.Status, string(b))
+	}
+	if err := e.checkAnosResponse(resp); err != nil {
+		return 0, fmt.Errorf("sync/latest %s: %w", peer, err)
 	}
 	var out pb.SyncLatestResponse
 	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {
@@ -687,6 +691,7 @@ func (e *Engine) httpSyncFinalization(ctx context.Context, peer string, epoch ui
 	peer = strings.TrimRight(peer, "/")
 	url := fmt.Sprintf("%s/sync/finalization?epoch=%d", peer, epoch)
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	e.setAnosHeaders(req)
 	resp, err := e.cfg.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -695,6 +700,9 @@ func (e *Engine) httpSyncFinalization(ctx context.Context, peer string, epoch ui
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("sync/finalization %s: %s body=%q", peer, resp.Status, string(b))
+	}
+	if err := e.checkAnosResponse(resp); err != nil {
+		return nil, fmt.Errorf("sync/finalization %s: %w", peer, err)
 	}
 	var out pb.SyncFinalizationResponse
 	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {
@@ -710,6 +718,7 @@ func (e *Engine) httpSyncFrontiers(ctx context.Context, peer string, epoch uint6
 		url += "&cursor=" + hex.EncodeToString(cursor[:])
 	}
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	e.setAnosHeaders(req)
 	resp, err := e.cfg.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -718,6 +727,9 @@ func (e *Engine) httpSyncFrontiers(ctx context.Context, peer string, epoch uint6
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("sync/frontiers %s: %s body=%q", peer, resp.Status, string(b))
+	}
+	if err := e.checkAnosResponse(resp); err != nil {
+		return nil, fmt.Errorf("sync/frontiers %s: %w", peer, err)
 	}
 	var out pb.SyncFrontiersResponse
 	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {
@@ -741,6 +753,7 @@ func (e *Engine) httpSyncChain(ctx context.Context, peer string, acct [32]byte, 
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", peer+"/sync/chain", &buf)
 	req.Header.Set("Content-Type", "application/x-protobuf")
+	e.setAnosHeaders(req)
 	resp, err := e.cfg.HTTPClient.Do(req)
 	if err != nil {
 		return nil, false, err
@@ -749,6 +762,9 @@ func (e *Engine) httpSyncChain(ctx context.Context, peer string, acct [32]byte, 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return nil, false, fmt.Errorf("sync/chain %s: %s body=%q", peer, resp.Status, string(b))
+	}
+	if err := e.checkAnosResponse(resp); err != nil {
+		return nil, false, fmt.Errorf("sync/chain %s: %w", peer, err)
 	}
 	var out pb.SyncChainResponse
 	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {

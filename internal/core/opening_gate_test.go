@@ -329,7 +329,7 @@ func TestBuildCandidateListProposesLowestValid(t *testing.T) {
 
 	// A snapshot in which legit VALIDATES (V absent, its unrestricted receivable present) and junk does
 	// NOT (its receivable is absent). Assert the precondition so the test can't pass vacuously.
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{},
 		Receivables: map[[32]byte]ReceivableSnap{
 			rid: {From: victim.ID, To: victim.ID, Amount: 100, RequiredDestClass: pb.AccountClass_ACCOUNT_CLASS_UNSPECIFIED},

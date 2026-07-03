@@ -47,10 +47,15 @@ func main() {
 	if *portFlag != "" {
 		_ = os.Setenv("PORT", *portFlag)
 	}
-	if *manifestPath != "" {
-		if err := loadManifestIntoEnv(*manifestPath); err != nil {
-			log.Fatalf("manifest %q: %v", *manifestPath, err)
-		}
+	// -manifest is MANDATORY (P7.2): the network manifest supplies every consensus scalar and the
+	// network_id a node needs to peer. There is no env-only boot — a node with no manifest cannot
+	// content-address itself and would be a fork risk.
+	if *manifestPath == "" {
+		log.Fatal("-manifest is required: it supplies the consensus scalars + network_id (see config/testnet.json)")
+	}
+	manifest, err := loadManifest(*manifestPath)
+	if err != nil {
+		log.Fatalf("manifest %q: %v", *manifestPath, err)
 	}
 
 	port := getenv("PORT", "8080")
@@ -59,9 +64,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	epochMS, _ := strconv.Atoi(getenv("EPOCH_MS", "5000"))
-	if epochMS <= 0 {
-		epochMS = 5000
+	epochMS, perr := strconv.Atoi(mustEnv("EPOCH_MS"))
+	if perr != nil || epochMS <= 0 {
+		log.Fatal("EPOCH_MS must be a positive integer (milliseconds); it comes from the manifest")
 	}
 
 	genesisMs, _ := strconv.ParseInt(getenv("GENESIS_UNIX_MS", "0"), 10, 64)
@@ -162,7 +167,7 @@ func main() {
 	// TIMELOCKED account through a transfer chain. CONSENSUS-CRITICAL: must be byte-identical
 	// on every validator, exactly like EPOCH_MS / GENESIS_UNIX_MS. Default ~1 week (@5s epochs);
 	// local test .env files set a small value (e.g. 12 ≈ 1 minute).
-	timelockedDelayEpochs, err := strconv.ParseUint(strings.TrimSpace(getenv("TIMELOCKED_DELAY_EPOCHS", "120960")), 10, 64)
+	timelockedDelayEpochs, err := strconv.ParseUint(mustEnv("TIMELOCKED_DELAY_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("TIMELOCKED_DELAY_EPOCHS must be a uint64 (number of epochs)")
 	}
@@ -173,7 +178,7 @@ func main() {
 	// CONSENSUS-CRITICAL: must be byte-identical on every validator, exactly like EPOCH_MS /
 	// TIMELOCKED_DELAY_EPOCHS. Default ~5 weeks (@5s epochs ≈ 604800); local test .env files set
 	// a small value (e.g. 20). P7's network manifest must content-address it.
-	guardianActiveWindowEpochs, err := strconv.ParseUint(strings.TrimSpace(getenv("GUARDIAN_ACTIVE_WINDOW_EPOCHS", "604800")), 10, 64)
+	guardianActiveWindowEpochs, err := strconv.ParseUint(mustEnv("GUARDIAN_ACTIVE_WINDOW_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("GUARDIAN_ACTIVE_WINDOW_EPOCHS must be a uint64 (number of epochs)")
 	}
@@ -183,11 +188,11 @@ func main() {
 	// stake's TRANSFER chain cannot release before creation + the staked tier's lock. CONSENSUS-
 	// CRITICAL: identical on every validator. Defaults ~1mo / ~1yr @5s epochs; local test .env files
 	// set small values.
-	stakeLock1mo, err := strconv.ParseUint(strings.TrimSpace(getenv("STAKE_LOCK_1MO_EPOCHS", "518400")), 10, 64)
+	stakeLock1mo, err := strconv.ParseUint(mustEnv("STAKE_LOCK_1MO_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("STAKE_LOCK_1MO_EPOCHS must be a uint64 (number of epochs)")
 	}
-	stakeLock1yr, err := strconv.ParseUint(strings.TrimSpace(getenv("STAKE_LOCK_1YR_EPOCHS", "6307200")), 10, 64)
+	stakeLock1yr, err := strconv.ParseUint(mustEnv("STAKE_LOCK_1YR_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("STAKE_LOCK_1YR_EPOCHS must be a uint64 (number of epochs)")
 	}
@@ -197,11 +202,11 @@ func main() {
 	// VAULT sources (P3.2, spec-18 §6). CONSENSUS-CRITICAL: byte-identical on every validator,
 	// exactly like TIMELOCKED_DELAY_EPOCHS. Defaults ~2 weeks / ~4 weeks @5s epochs (VAULT >
 	// GUARDED > TIMELOCKED); local test .env files set small values. P7's manifest must pin them.
-	guardedDelayEpochs, err := strconv.ParseUint(strings.TrimSpace(getenv("GUARDED_DELAY_EPOCHS", "241920")), 10, 64)
+	guardedDelayEpochs, err := strconv.ParseUint(mustEnv("GUARDED_DELAY_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("GUARDED_DELAY_EPOCHS must be a uint64 (number of epochs)")
 	}
-	vaultDelayEpochs, err := strconv.ParseUint(strings.TrimSpace(getenv("VAULT_DELAY_EPOCHS", "483840")), 10, 64)
+	vaultDelayEpochs, err := strconv.ParseUint(mustEnv("VAULT_DELAY_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("VAULT_DELAY_EPOCHS must be a uint64 (number of epochs)")
 	}
@@ -210,7 +215,7 @@ func main() {
 	// ATTESTOR_QUORUM_M is the flat M-of-N Fund Attestor quorum threshold gating GUARDED/VAULT (and
 	// breakglass) releases (P3.2, spec-19 §6.1). CONSENSUS-CRITICAL manifest constant; MUST be >= 1
 	// (a zero would make the attestor gate a no-op). Local test .env files set a small value (e.g. 2).
-	attestorQuorumM, err := strconv.ParseUint(strings.TrimSpace(getenv("ATTESTOR_QUORUM_M", "2")), 10, 64)
+	attestorQuorumM, err := strconv.ParseUint(mustEnv("ATTESTOR_QUORUM_M"), 10, 64)
 	if err != nil {
 		log.Fatal("ATTESTOR_QUORUM_M must be a uint64 (number of attestor signatures)")
 	}
@@ -223,7 +228,7 @@ func main() {
 	// attestation_trigger_epoch (P3.3, spec-18 §5.6.3) — the earliest the 1-of-2 → Fund trigger
 	// (attested escrows only) may fire. CONSENSUS-CRITICAL: byte-identical on every validator, like
 	// the other delays. Default ~1 week @5s epochs; local test .env files set a small value.
-	escrowAttestationDelayEpochs, err := strconv.ParseUint(strings.TrimSpace(getenv("ESCROW_ATTESTATION_DELAY_EPOCHS", "120960")), 10, 64)
+	escrowAttestationDelayEpochs, err := strconv.ParseUint(mustEnv("ESCROW_ATTESTATION_DELAY_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("ESCROW_ATTESTATION_DELAY_EPOCHS must be a uint64 (number of epochs)")
 	}
@@ -234,7 +239,7 @@ func main() {
 	// transfer delay. CONSENSUS-CRITICAL: byte-identical on every validator. Must be >= 1 so a
 	// breakglass release is never immediate (a SPENDING source has zero class delay, so this window is
 	// the whole lock). Default ~1 week @5s epochs; local test .env files set a small value.
-	breakglassExtraEpochs, err := strconv.ParseUint(strings.TrimSpace(getenv("BREAKGLASS_EXTRA_EPOCHS", "120960")), 10, 64)
+	breakglassExtraEpochs, err := strconv.ParseUint(mustEnv("BREAKGLASS_EXTRA_EPOCHS"), 10, 64)
 	if err != nil {
 		log.Fatal("BREAKGLASS_EXTRA_EPOCHS must be a uint64 (number of epochs)")
 	}
@@ -249,6 +254,22 @@ func main() {
 	}
 	defer db.Close()
 
+	// Consensus economics (P7.2): read straight off the validated manifest struct so the validator
+	// enforces exactly what network_id hashed — no code-side default. The Snapshot / EngineConfig
+	// carry this and the role/fee derivations consume it (Economics.IsBanker / RequiredFee / ...).
+	econ := core.Economics{
+		MinFee:                           manifest.Economics.MinFee,
+		MaxFee:                           manifest.Economics.MaxFee,
+		AttestedEscrowFee:                manifest.Economics.AttestedEscrowFee,
+		FeeBps:                           manifest.Economics.FeeBps,
+		BankerStakeFloorAnos:             manifest.Economics.BankerStakeFloorAnos,
+		AttestorStakeFloorAnos:           manifest.Economics.AttestorStakeFloorAnos,
+		GuardianDivisorAnos:              manifest.Economics.GuardianDivisorAnos,
+		GuardianSendThresholdBps:         manifest.Economics.GuardianSendThresholdBps,
+		GuardianFundSendEpochSlackEpochs: manifest.Economics.GuardianFundSendEpochSlackEpochs,
+	}
+	fmt.Println("Network id:", manifest.NetworkID, "protocol_version:", manifest.ProtocolVersion)
+
 	engine, err := core.NewEngine(core.EngineConfig{
 		DB:                           db,
 		Signer:                       signer,
@@ -256,8 +277,8 @@ func main() {
 		Peers:                        peers,
 		GenesisUnixMs:                genesisMs,
 		EpochDuration:                time.Duration(epochMS) * time.Millisecond,
-		QuorumPercent:                80,
-		FinalizationQuorumPercent:    60,
+		QuorumPercent:                manifest.Consensus.QuorumPercent,
+		FinalizationQuorumPercent:    manifest.Consensus.FinalizationQuorumPercent,
 		FinalizationSkew:             800 * time.Millisecond,
 		CandidatesSkew:               800 * time.Millisecond,
 		FundAccount:                  fundAcct,
@@ -273,6 +294,10 @@ func main() {
 		AttestorQuorumM:              attestorQuorumM,
 		EscrowAttestationDelayEpochs: escrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        breakglassExtraEpochs,
+		Econ:                         econ,
+		MaxCandidateScanPerSlot:      manifest.Consensus.MaxCandidateScanPerSlot,
+		NetworkID:                    manifest.NetworkID,
+		ProtocolVersion:              manifest.ProtocolVersion,
 		SelfIdentity:                 selfIdentity,
 	})
 
@@ -884,9 +909,9 @@ func main() {
 			seen[s.StakerID] = struct{}{}
 			out = append(out, roleJSON{
 				Identity:       hex.EncodeToString(s.StakerID[:]),
-				IsBanker:       core.IsBanker(rows, s.StakerID),
-				IsAttestor:     core.IsAttestor(rows, s.StakerID),
-				GuardianWeight: core.GuardianWeight(rows, s.StakerID),
+				IsBanker:       econ.IsBanker(rows, s.StakerID),
+				IsAttestor:     econ.IsAttestor(rows, s.StakerID),
+				GuardianWeight: econ.GuardianWeight(rows, s.StakerID),
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -946,7 +971,7 @@ func main() {
 			http.Error(w, "db error: "+err.Error(), 500)
 			return
 		}
-		set := core.BankerValidatorSet(stakes, infos)
+		set := econ.BankerValidatorSet(stakes, infos)
 		type bJSON struct {
 			Identity     string `json:"identity"`
 			ConsensusKey string `json:"consensus_pubkey"`
@@ -986,7 +1011,7 @@ func main() {
 			http.Error(w, "db error: "+err.Error(), 500)
 			return
 		}
-		fundSet := core.BankerValidatorSet(stakes, infos)
+		fundSet := econ.BankerValidatorSet(stakes, infos)
 		out := struct {
 			FlipEpoch       uint64 `json:"flip_epoch"`
 			Flipped         bool   `json:"flipped"`
@@ -1008,7 +1033,7 @@ func main() {
 		_ = json.NewEncoder(w).Encode(out)
 	})
 
-	srv := &http.Server{Addr: ":" + port, Handler: mux}
+	srv := &http.Server{Addr: ":" + port, Handler: anosNetworkMiddleware(mux, manifest.NetworkID, manifest.ProtocolVersion)}
 
 	log.Printf("validator listening on :%s (peers=%d, epoch=%dms)", port, len(peers), epochMS)
 
@@ -1081,4 +1106,50 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// mustEnv returns a required env var or fatals. Used for the consensus-critical scalars (P7.2):
+// with -manifest mandatory the loader always sets these from the validated manifest, so a missing
+// value means a broken boot — fail loud rather than fall back to a code-side default that could
+// silently fork.
+func mustEnv(k string) string {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		log.Fatalf("%s is required (supplied by the manifest); refusing to boot", k)
+	}
+	return v
+}
+
+// anosNetworkMiddleware enforces the P7.2 network-identity handshake on the consensus wire: every
+// /peer/* (except the unauthenticated /peer/id liveness probe) and /sync/* request must carry our
+// X-Anos-Network-Id + X-Anos-Protocol-Version, and every such response is stamped with them so the
+// resync client can verify the peer it pulled from (bidirectional). It is a misconfiguration guard
+// (magic-bytes / chainId), NOT a security boundary — consensus is sig-authed regardless. Public
+// /submit, the read API (/account, /receivables), and /debug/* pass through unchanged.
+func anosNetworkMiddleware(next http.Handler, networkID string, protocolVersion int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !gatedPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set(core.HeaderNetworkID, networkID)
+		w.Header().Set(core.HeaderProtocolVersion, strconv.Itoa(protocolVersion))
+		if err := core.CheckAnosHeaders(
+			r.Header.Get(core.HeaderNetworkID), r.Header.Get(core.HeaderProtocolVersion),
+			networkID, protocolVersion); err != nil {
+			log.Printf("[peer] rejected %s from %s: %v", r.URL.Path, r.RemoteAddr, err)
+			http.Error(w, "network mismatch: "+err.Error(), http.StatusMisdirectedRequest) // 421
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// gatedPath reports whether the network-id handshake applies: all /peer/* except the /peer/id
+// liveness probe, and all /sync/*.
+func gatedPath(p string) bool {
+	if p == "/peer/id" {
+		return false
+	}
+	return strings.HasPrefix(p, "/peer/") || strings.HasPrefix(p, "/sync/")
 }

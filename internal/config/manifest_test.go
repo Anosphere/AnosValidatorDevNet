@@ -9,8 +9,9 @@ import (
 // validManifest returns a complete, well-formed manifest for mutation in tests.
 func validManifest() Manifest {
 	return Manifest{
-		Version:        SupportedVersion,
-		FundAccountHex: strings.Repeat("ff", 32),
+		Version:         SupportedVersion,
+		ProtocolVersion: SupportedProtocolVersion,
+		FundAccountHex:  strings.Repeat("ff", 32),
 		Timing: Timing{
 			EpochMs:                      2000,
 			TimelockedDelayEpochs:        6,
@@ -22,6 +23,22 @@ func validManifest() Manifest {
 			AttestorQuorumM:              2,
 			EscrowAttestationDelayEpochs: 6,
 			BreakglassExtraEpochs:        5,
+		},
+		Economics: Economics{
+			MinFee:                           1_000,
+			MaxFee:                           3_000_000,
+			AttestedEscrowFee:                100_000,
+			FeeBps:                           50,
+			BankerStakeFloorAnos:             50_000,
+			AttestorStakeFloorAnos:           5_000,
+			GuardianDivisorAnos:              2_000,
+			GuardianSendThresholdBps:         7_000,
+			GuardianFundSendEpochSlackEpochs: 8,
+		},
+		Consensus: Consensus{
+			QuorumPercent:             80,
+			FinalizationQuorumPercent: 60,
+			MaxCandidateScanPerSlot:   64,
 		},
 		Genesis: Genesis{
 			Hex:           strings.Repeat("ab", 32),
@@ -127,5 +144,99 @@ func TestSelfAndPeers(t *testing.T) {
 	}
 	if p := PortFor(&m.Roster[0]); p != "30303" {
 		t.Errorf("PortFor = %q, want 30303", p)
+	}
+}
+
+// Every economic scalar is fork-critical: an omitted key decodes to 0 and would silently
+// change the fee/floor/threshold the validator enforces. Each is asserted individually.
+func TestValidateRejectsZeroEconomicField(t *testing.T) {
+	cases := map[string]func(*Economics){
+		"min_fee":                        func(e *Economics) { e.MinFee = 0 },
+		"max_fee":                        func(e *Economics) { e.MaxFee = 0 },
+		"attested_escrow_fee":            func(e *Economics) { e.AttestedEscrowFee = 0 },
+		"fee_bps":                        func(e *Economics) { e.FeeBps = 0 },
+		"banker_stake_floor_anos":        func(e *Economics) { e.BankerStakeFloorAnos = 0 },
+		"attestor_stake_floor_anos":      func(e *Economics) { e.AttestorStakeFloorAnos = 0 },
+		"guardian_divisor_anos":          func(e *Economics) { e.GuardianDivisorAnos = 0 },
+		"guardian_send_threshold_bps":    func(e *Economics) { e.GuardianSendThresholdBps = 0 },
+		"guardian_fund_send_epoch_slack": func(e *Economics) { e.GuardianFundSendEpochSlackEpochs = 0 },
+	}
+	for name, zero := range cases {
+		m := validManifest()
+		zero(&m.Economics)
+		if err := m.Validate(); err == nil {
+			t.Errorf("Validate accepted a manifest with economics.%s=0 (must reject)", name)
+		}
+	}
+}
+
+// The structural relations MinFee<=MaxFee, bps<=10000, and slack<window are enforced.
+func TestValidateRejectsEconomicRelations(t *testing.T) {
+	m := validManifest()
+	m.Economics.MinFee = m.Economics.MaxFee + 1
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted min_fee > max_fee")
+	}
+
+	m = validManifest()
+	m.Economics.FeeBps = 10_001
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted fee_bps > 10000")
+	}
+
+	m = validManifest()
+	m.Economics.GuardianSendThresholdBps = 10_001
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted guardian_send_threshold_bps > 10000")
+	}
+
+	m = validManifest()
+	m.Economics.GuardianFundSendEpochSlackEpochs = m.Timing.GuardianActiveWindowEpochs // not <
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted slack >= guardian_active_window_epochs")
+	}
+
+	// An anos-denominated scalar large enough to overflow scalar*UnitsPerAnos in the engine must be
+	// rejected — a Validate-passing manifest must never divide-by-zero / mis-scale a floor.
+	for _, over := range []func(*Economics){
+		func(e *Economics) { e.GuardianDivisorAnos = 288230376151711744 }, // 2^58 -> *1e6 wraps to 0
+		func(e *Economics) { e.BankerStakeFloorAnos = 1_000_000_000_001 },
+		func(e *Economics) { e.AttestorStakeFloorAnos = 2_000_000_000_000 },
+	} {
+		m = validManifest()
+		over(&m.Economics)
+		if err := m.Validate(); err == nil {
+			t.Error("Validate accepted an over-large anos scalar (overflow risk)")
+		}
+	}
+}
+
+// Both quorum percents must be a real majority (> 50) and <= 100; the scan cap >= 1.
+func TestValidateRejectsBadConsensus(t *testing.T) {
+	for _, bad := range []int{0, 50, 101} {
+		m := validManifest()
+		m.Consensus.QuorumPercent = bad
+		if err := m.Validate(); err == nil {
+			t.Errorf("Validate accepted quorum_percent=%d", bad)
+		}
+		m = validManifest()
+		m.Consensus.FinalizationQuorumPercent = bad
+		if err := m.Validate(); err == nil {
+			t.Errorf("Validate accepted finalization_quorum_percent=%d", bad)
+		}
+	}
+	m := validManifest()
+	m.Consensus.MaxCandidateScanPerSlot = 0
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted max_candidate_scan_per_slot=0")
+	}
+}
+
+// A manifest targeting a protocol_version the binary does not implement must refuse to boot.
+func TestValidateRejectsUnsupportedProtocolVersion(t *testing.T) {
+	m := validManifest()
+	m.ProtocolVersion = SupportedProtocolVersion + 1
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted an unsupported protocol_version")
 	}
 }

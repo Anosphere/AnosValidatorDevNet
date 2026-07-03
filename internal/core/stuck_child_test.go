@@ -24,7 +24,7 @@ import (
 // breakglass-origin) that copies `src`'s auth+breakglass keys, plus the keyed source account. `flags`
 // toggles release_requires_attestor (a GUARDED/VAULT chain) while staying non-breakglass-origin.
 func ordinaryChainSnap(src, chain *simkit.Account, chHead, dest [32]byte, unlock, bal, epoch uint64, flags byte) *Snapshot {
-	return &Snapshot{
+	return &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			chain.ID: {
 				Head: chHead, Balance: bal, Seq: 1, Class: pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
@@ -117,7 +117,7 @@ func TestStuckChildFundSourcedReturnRejected(t *testing.T) {
 	chHead[0] = 0xc1
 	const bal = uint64(500)
 
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			chain.ID: {
 				Head: chHead, Balance: bal, Seq: 1, Class: pb.AccountClass_ACCOUNT_CLASS_TRANSFER,

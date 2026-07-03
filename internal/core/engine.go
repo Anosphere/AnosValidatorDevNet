@@ -102,6 +102,27 @@ type EngineConfig struct {
 	// configs set a small value. P7's network manifest must content-address it.
 	BreakglassExtraEpochs uint64
 
+	// Econ carries the manifest-pinned monetary + role scalars (fee schedule, role floors, Guardian
+	// divisor/threshold, fund-send epoch slack). buildSnapshot copies it into every Snapshot, and the
+	// engine-side validator-set / Guardian derivations invoke it as e.cfg.Econ.X. CONSENSUS-CRITICAL:
+	// identical on every validator (network_id pins it); NewEngine fails closed if it is unset — P7.2
+	// removed the code-side const defaults.
+	Econ Economics
+
+	// MaxCandidateScanPerSlot bounds how many txids buildCandidateList validates per conflict slot
+	// (P7.1). Manifest-pinned so candidate proposal is deterministic network-wide under a flood;
+	// NewEngine fails closed if 0.
+	MaxCandidateScanPerSlot uint64
+
+	// NetworkID / ProtocolVersion are this node's network identity (config.Manifest.NetworkID = the
+	// content hash + SupportedProtocolVersion). The engine stamps them as X-Anos-* headers on every
+	// outbound /peer/* + /sync/* request and verifies them on resync RESPONSES; the cmd/validator
+	// mux middleware verifies them on inbound requests. A misconfiguration guard (spoofable-is-fine),
+	// NOT a security boundary — consensus is sig-authed regardless. Empty NetworkID disables the
+	// check (used only by tests that build an engine directly).
+	NetworkID       string
+	ProtocolVersion int
+
 	// SelfIdentity is this node's Banker account-id (the durable 32-byte PQ identity that staked
 	// Banker), set via VALIDATOR_IDENTITY_HEX (P4.3, working notes §3.7). Until the list→Fund flip
 	// the validator set is keyed by the P-256 consensus key (the env list); after the flip the set
@@ -180,11 +201,18 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		return nil, errors.New("missing genesis time: set GENESIS_UNIX_MS (milliseconds since unix epoch)")
 	}
 
-	if cfg.QuorumPercent == 0 {
-		cfg.QuorumPercent = 80
+	// P7.2: the consensus-critical scalars are manifest-pinned (network_id covers them) and have NO
+	// code-side default — a validator that cannot supply them fails closed rather than silently
+	// running a value different from what its network_id hashed. The liveness-only skews below keep
+	// their defaults.
+	if cfg.QuorumPercent == 0 || cfg.FinalizationQuorumPercent == 0 {
+		return nil, errors.New("missing consensus quorum percents (set from the manifest consensus block)")
 	}
-	if cfg.FinalizationQuorumPercent == 0 {
-		cfg.FinalizationQuorumPercent = 60
+	if cfg.Econ.unset() {
+		return nil, errors.New("missing economics (fees/floors/divisor/threshold): set from the manifest economics block")
+	}
+	if cfg.MaxCandidateScanPerSlot == 0 {
+		return nil, errors.New("missing consensus.max_candidate_scan_per_slot (set from the manifest)")
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 2 * time.Second}
@@ -337,7 +365,8 @@ func (e *Engine) bestEffortFundSendCheck(tx *pb.Tx) error {
 	snap := &Snapshot{
 		Accounts:             map[[32]byte]AccountSnap{},
 		FundAccount:          e.cfg.FundAccount,
-		GuardianActiveWeight: 0, // M=0 → threshold collapses to the N>=1 floor (submit-time leniency)
+		GuardianActiveWeight: 0,          // M=0 → threshold collapses to the N>=1 floor (submit-time leniency)
+		Econ:                 e.cfg.Econ, // manifest economics: the quorum/weight math needs the real divisor/threshold
 	}
 	atPosition := false
 	_ = e.cfg.DB.View(func(dbtx *bbolt.Tx) error {
@@ -504,7 +533,7 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 	if sb := tx.GetSend(); sb != nil && sb.To != nil && len(sb.To.V) == 32 {
 		copy(to[:], sb.To.V)
 	}
-	snap := &Snapshot{Accounts: map[[32]byte]AccountSnap{}}
+	snap := &Snapshot{Accounts: map[[32]byte]AccountSnap{}, Econ: e.cfg.Econ}
 	judged := false
 	var jerr error
 	_ = e.cfg.DB.View(func(dbtx *bbolt.Tx) error {
@@ -1088,7 +1117,7 @@ func (e *Engine) validatorSetForEpoch(epoch uint64) (map[[33]byte]*ecdsa.PublicK
 		if flip == 0 || epoch <= flip {
 			return nil // manifest list
 		}
-		descs := BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
+		descs := e.cfg.Econ.BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
 		m := make(map[[33]byte]*ecdsa.PublicKey, len(descs))
 		for _, vd := range descs {
 			pub, err := crypto.ParseCompressedP256(vd.ConsensusKey)
@@ -1152,7 +1181,7 @@ func (e *Engine) maybeLatchFlip(epoch uint64) {
 		if getFlipEpoch(tx) != 0 {
 			return nil
 		}
-		descs := BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
+		descs := e.cfg.Econ.BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
 		if !FundSetMatchesManifest(descs, e.manifestKeys) {
 			return nil
 		}
@@ -2136,6 +2165,7 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", peerURL+"/peer/tx/inv", &invBuf)
 	req.Header.Set("Content-Type", "application/x-protobuf")
+	e.setAnosHeaders(req)
 	resp, err := e.cfg.HTTPClient.Do(req)
 	if err != nil || resp == nil {
 		return
@@ -2188,6 +2218,7 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 
 	req2, _ := http.NewRequestWithContext(ctx, "POST", peerURL+"/peer/tx/push", &pushBuf)
 	req2.Header.Set("Content-Type", "application/x-protobuf")
+	e.setAnosHeaders(req2)
 	resp2, err := e.cfg.HTTPClient.Do(req2)
 	if err != nil || resp2 == nil {
 		return
@@ -2240,6 +2271,7 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 
 		EscrowAttestationDelayEpochs: e.cfg.EscrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        e.cfg.BreakglassExtraEpochs,
+		Econ:                         e.cfg.Econ,
 	}
 	err := e.cfg.DB.View(func(tx *bbolt.Tx) error {
 		ab := tx.Bucket(BAccounts)
@@ -2313,7 +2345,7 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 		// derives identical values — the determinism the quorum math depends on.
 		snap.FundStakeRows = listStakesInTx(tx)
 		active := listGuardianActiveInTx(tx)
-		snap.GuardianActiveWeight = ActiveGuardianWeight(snap.FundStakeRows, active, epoch, e.cfg.GuardianActiveWindowEpochs)
+		snap.GuardianActiveWeight = e.cfg.Econ.ActiveGuardianWeight(snap.FundStakeRows, active, epoch, e.cfg.GuardianActiveWindowEpochs)
 
 		return nil
 	})
@@ -2322,13 +2354,13 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 
 // buildCandidateListV2 builds a txid-only candidate list ("votes").
 // It ignores raws and uses e.approved (one tx per conflict key).
-// maxCandidateScanPerSlot bounds how many txids buildCandidateList validates per conflict slot when
-// searching for the lowest VALID candidate. It caps the CPU an attacker can force by flooding a slot
-// with ground-low invalid txids; the residual (a flood past the cap that buries the real block) is
-// bounded by mempool admission limits (P7.3), which cap how many txids a slot can accumulate. A cap
-// hit is logged (never silent). Generous vs any honest slot (1-2 txids).
-const maxCandidateScanPerSlot = 64
-
+// e.cfg.MaxCandidateScanPerSlot (manifest consensus.max_candidate_scan_per_slot) bounds how many
+// txids buildCandidateList validates per conflict slot when searching for the lowest VALID candidate.
+// It caps the CPU an attacker can force by flooding a slot with ground-low invalid txids; the
+// residual (a flood past the cap that buries the real block) is bounded by mempool admission limits
+// (P7.3), which cap how many txids a slot can accumulate. A cap hit is logged (never silent).
+// Generous vs any honest slot (1-2 txids); pinning it in the manifest keeps proposal deterministic
+// network-wide under a flood (P7.2).
 func (e *Engine) buildCandidateList(epoch uint64, snap *Snapshot) (*CandidateList, [][32]byte) {
 	// Snapshot the conflict pool + the raw bytes it references under the lock; validate OUTSIDE the lock
 	// (ValidateTxAgainstSnapshot is a pure function of snap and holds no engine state).
@@ -2362,8 +2394,8 @@ func (e *Engine) buildCandidateList(epoch uint64, snap *Snapshot) (*CandidateLis
 		sort.Slice(txids, func(i, j int) bool { return bytes.Compare(txids[i][:], txids[j][:]) < 0 })
 		scanned := 0
 		for _, id := range txids {
-			if scanned >= maxCandidateScanPerSlot {
-				log.Printf("[epoch=%d] candidate scan cap (%d) hit for a conflict slot; deferring it (mempool bounding is P7.3)", epoch, maxCandidateScanPerSlot)
+			if uint64(scanned) >= e.cfg.MaxCandidateScanPerSlot {
+				log.Printf("[epoch=%d] candidate scan cap (%d) hit for a conflict slot; deferring it (mempool bounding is P7.3)", epoch, e.cfg.MaxCandidateScanPerSlot)
 				break
 			}
 			raw, ok := rawByID[id]
@@ -2426,6 +2458,7 @@ func (e *Engine) broadcastCandidates(epoch uint64, cl *CandidateList) {
 
 			req, _ := http.NewRequest("POST", p+"/peer/candidates", &buf)
 			req.Header.Set("Content-Type", "application/x-protobuf")
+			e.setAnosHeaders(req)
 			// Optional: include your own URL if you use it for debugging
 			// req.Header.Set("X-Validator-URL", e.cfg.SelfURL)
 
@@ -2457,6 +2490,7 @@ func (e *Engine) broadcastFinalization(fin *pb.EpochFinalization) {
 
 			req, _ := http.NewRequest("POST", p+"/peer/finalization", &buf)
 			req.Header.Set("Content-Type", "application/x-protobuf")
+			e.setAnosHeaders(req)
 			resp, err := e.cfg.HTTPClient.Do(req)
 			if err != nil {
 				log.Printf("finalization POST to %s failed: %v", p, err)
@@ -2601,7 +2635,7 @@ func (e *Engine) applyWinners(winners map[[32]byte][32]byte, txBytesByID map[[32
 				continue
 			}
 
-			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount); aerr != nil {
+			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
 				failed[id] = aerr
 				continue
 			}
@@ -2679,6 +2713,7 @@ func (e *Engine) fetchMissingTxs(epoch uint64, missing [][32]byte) {
 
 		req, _ := http.NewRequest("POST", peer+"/peer/tx/get", &buf)
 		req.Header.Set("Content-Type", "application/x-protobuf")
+		e.setAnosHeaders(req)
 		resp, err := e.cfg.HTTPClient.Do(req)
 		if err != nil || resp == nil {
 			log.Printf("[fetch] peer=%s failed: %v", peer, err)

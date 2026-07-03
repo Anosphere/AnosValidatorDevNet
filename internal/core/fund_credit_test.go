@@ -96,7 +96,7 @@ func applySendThrough(t *testing.T, db *bbolt.DB, from, fromHead [32]byte, seq u
 	}
 	raw, _ := proto.Marshal(ptx)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
 	}); err != nil {
 		t.Fatalf("ApplyTx send seq=%d: %v", seq, err)
 	}
@@ -276,7 +276,7 @@ func TestApplyRejectsFundClassOpeningReceive(t *testing.T) {
 	raw, _ := proto.Marshal(ptx)
 	txid := txidFor(newAcct, 1)
 	err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, testFund)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, testFund, testEcon)
 	})
 	if err == nil || !strings.Contains(err.Error(), "FUND is a reserved keyless class") {
 		t.Fatalf("opening RECEIVE with class FUND must be rejected, got err=%v", err)
