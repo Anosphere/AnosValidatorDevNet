@@ -16,6 +16,14 @@ import (
 const (
 	HeaderNetworkID       = "X-Anos-Network-Id"
 	HeaderProtocolVersion = "X-Anos-Protocol-Version"
+
+	// HeaderFinThrough is the P7.4 ranged /sync/finalization response header: the last epoch the
+	// server actually covered in this page (it stops adding WHOLE epochs at a byte budget). It is
+	// what lets the client distinguish "epochs K+1..to had no finalizations" from "the page was cut
+	// at K" — without it a fully-empty range would be indistinguishable from an uncovered one.
+	// Proto-clean by design: the response body reuses SyncFinalizationResponse (each finalization
+	// already carries its epoch), exactly the P7.2 header pattern.
+	HeaderFinThrough = "X-Anos-Fin-Through"
 )
 
 // setAnosHeaders stamps this node's network identity on an outbound peer/sync request. Applied at
@@ -30,10 +38,16 @@ func (e *Engine) setAnosHeaders(req *http.Request) {
 // this node has no configured NetworkID (engine-level unit tests that talk to a server without the
 // production middleware); the live harness runs the real binary with NetworkID set and exercises it.
 func (e *Engine) checkAnosResponse(resp *http.Response) error {
+	return e.checkAnosResponseHeader(resp.Header)
+}
+
+// checkAnosResponseHeader is checkAnosResponse over bare headers — the P7.4 resync client reads
+// response bodies to completion before validation, so it holds headers, not a live *http.Response.
+func (e *Engine) checkAnosResponseHeader(h http.Header) error {
 	if strings.TrimSpace(e.cfg.NetworkID) == "" {
 		return nil
 	}
-	return CheckAnosHeaders(resp.Header.Get(HeaderNetworkID), resp.Header.Get(HeaderProtocolVersion), e.cfg.NetworkID, e.cfg.ProtocolVersion)
+	return CheckAnosHeaders(h.Get(HeaderNetworkID), h.Get(HeaderProtocolVersion), e.cfg.NetworkID, e.cfg.ProtocolVersion)
 }
 
 // CheckAnosHeaders compares a peer's advertised (network id, protocol version) against ours; a

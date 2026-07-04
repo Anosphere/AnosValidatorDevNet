@@ -99,7 +99,10 @@ func main() {
 		log.Fatalf("VALIDATOR_SET_PUBKEYS invalid: %v", err)
 	}
 	if _, ok := validatorSet[selfID]; !ok {
-		log.Fatal("validator set does not include this validator's public key")
+		// P7.4: no longer fatal — a NON-FOUNDER node (key outside the manifest roster) boots as an
+		// observer and becomes a voting member via the post-flip Fund banker set (loadManifest
+		// already logged the join-path notice; NewEngine repeats a warning).
+		log.Printf("[boot] consensus key not in the manifest validator set — non-founder mode")
 	}
 
 	// VALIDATOR_IDENTITY_HEX (P4.3, working notes §3.7) is this node's Banker account-id — the
@@ -329,6 +332,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPeerBodyBytes) // P7.4 body cap (defense-in-depth)
 		var cl pb.CandidateListV2
 		if err := readProtoDelim(r.Body, &cl); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -386,6 +390,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPeerBodyBytes) // P7.4 body cap (defense-in-depth)
 		var fin pb.EpochFinalization
 		if err := readProtoDelim(r.Body, &fin); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -420,6 +425,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPeerBodyBytes) // P7.4 body cap (defense-in-depth)
 		var inv pb.TxInv
 		if err := readProtoDelim(r.Body, &inv); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -465,6 +471,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPeerBodyBytes) // P7.4 body cap (defense-in-depth)
 		var push pb.TxPush
 		if err := readProtoDelim(r.Body, &push); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -502,6 +509,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPeerBodyBytes) // P7.4 body cap (defense-in-depth)
 		var want pb.TxWant
 		if err := readProtoDelim(r.Body, &want); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -554,8 +562,54 @@ func main() {
 	})
 
 	mux.HandleFunc("/sync/finalization", func(w http.ResponseWriter, r *http.Request) {
-		epStr := r.URL.Query().Get("epoch")
-		ep, err := strconv.ParseUint(strings.TrimSpace(epStr), 10, 64)
+		q := r.URL.Query()
+
+		// P7.4 RANGED form: ?from=&to= returns finalizations for WHOLE epochs [from..K] within a
+		// byte budget, stamping K in X-Anos-Fin-Through (each finalization self-describes its epoch
+		// — the response message is unchanged, no proto change). This removes the resync walk's
+		// 1-RTT-per-epoch cost, which scaled linearly with chain AGE (~17k epochs/day at 5s
+		// epochs). A pre-P7.4 client never sends ?from= and keeps the ?epoch= form below; a P7.4
+		// client hitting a pre-P7.4 server gets its 400 and falls back per-epoch.
+		if q.Get("epoch") == "" && q.Get("from") != "" {
+			from, err1 := strconv.ParseUint(strings.TrimSpace(q.Get("from")), 10, 64)
+			to, err2 := strconv.ParseUint(strings.TrimSpace(q.Get("to")), 10, 64)
+			if err1 != nil || err2 != nil || to < from {
+				http.Error(w, "need ?from=<u64>&to=<u64> with to >= from", 400)
+				return
+			}
+			to = clampFinRange(from, to, engine.LatestFinalizedEpoch())
+			resp := &pb.SyncFinalizationResponse{}
+			through := from
+			total := 0
+			for ep := from; ep <= to; ep++ {
+				fins, err := core.GetFinalizations(db, ep)
+				if err != nil && !errors.Is(err, core.ErrNotFound) {
+					http.Error(w, "db error", 500)
+					return
+				}
+				sz := 0
+				for _, raw := range fins {
+					sz += len(raw)
+				}
+				// Whole epochs only, and always at least one, so the client always advances.
+				if ep > from && total+sz > maxFinRangeRespBytes {
+					break
+				}
+				for _, raw := range fins {
+					var f pb.EpochFinalization
+					if proto.Unmarshal(raw, &f) == nil {
+						resp.Finalizations = append(resp.Finalizations, &f)
+					}
+				}
+				total += sz
+				through = ep
+			}
+			w.Header().Set(core.HeaderFinThrough, strconv.FormatUint(through, 10))
+			_ = writeProtoDelim(w, resp)
+			return
+		}
+
+		ep, err := strconv.ParseUint(strings.TrimSpace(q.Get("epoch")), 10, 64)
 		if err != nil {
 			http.Error(w, "need ?epoch=<u64>", 400)
 			return
@@ -622,6 +676,7 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxSyncBodyBytes) // P7.4: a SyncChainRequest is tiny
 		var req pb.SyncChainRequest
 		if err := readProtoDelim(r.Body, &req); err != nil {
 			http.Error(w, "bad proto", 400)
@@ -647,7 +702,9 @@ func main() {
 		if maxBlocks > maxSyncChainBlocks {
 			maxBlocks = maxSyncChainBlocks
 		}
-		txs, reached := engine.SyncChain(acct, head, have, maxBlocks)
+		// P7.4: byte-budget the PAGE — the response was otherwise built whole-chain in memory, and
+		// the paging resync client continues from the returned tail (reachedHave=false = "more").
+		txs, reached := engine.SyncChain(acct, head, have, maxBlocks, maxSyncChainRespBytes)
 		resp := &pb.SyncChainResponse{ReachedHave: reached}
 		for _, raw := range txs {
 			tx, err := core.ParseTx(raw)
@@ -1198,6 +1255,27 @@ func anosNetworkMiddleware(next http.Handler, networkID string, protocolVersion 
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// clampFinRange bounds a ranged /sync/finalization request's [from..to] (P7.4). It clamps `to` to
+// the node's real finalized tip (nothing exists beyond it) and then to a maxFinRangeSpan window.
+// The tip clamp is LOAD-BEARING against a uint64 overflow DoS: without it, from=0&to=2^64-1 makes
+// the span `to-from+1` wrap to 0, so `0 >= maxFinRangeSpan` is false, the window clamp is skipped,
+// and the handler loop `for ep:=from; ep<=to` spins toward 2^64 calling GetFinalizations each
+// iteration (an unauthenticated CPU-exhaustion — /sync is rate-limit-exempt for known peers, and
+// the response byte budget never fires on empty epochs). Clamping to a real tip makes `to` a small
+// real number so neither the span subtraction nor the loop counter can overflow. Callers guarantee
+// to >= from (validated as a 400 earlier); if the tip clamp pushes `to` below `from` (from beyond
+// our tip) the handler loop simply runs zero times. A legit client never trips any clamp (its `to`
+// <= its targetEp <= our advertised latest).
+func clampFinRange(from, to, latest uint64) uint64 {
+	if to > latest {
+		to = latest
+	}
+	if to >= from && to-from >= maxFinRangeSpan {
+		to = from + maxFinRangeSpan - 1
+	}
+	return to
 }
 
 // gatedPath reports whether the network-id handshake applies: all /peer/* except the /peer/id

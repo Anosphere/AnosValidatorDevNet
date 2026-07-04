@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -60,12 +61,26 @@ func loadManifest(path string) (*config.Manifest, error) {
 	selfID := crypto.CompressP256PublicKey(&priv.PublicKey)
 	selfHex := hex.EncodeToString(selfID[:])
 	self, ok := m.Self(selfHex)
-	if !ok {
-		return nil, fmt.Errorf("this node's consensus key (%s) is not in the manifest roster", selfHex)
-	}
 
-	// PEERS = every other roster URL. Always derived (never trust a hand-set PEERS here).
+	// PEERS = every other roster URL (all of them for a non-roster node — PeersExcluding excludes
+	// nothing then). Always derived (never trust a hand-set PEERS here).
 	setenv("PEERS", strings.Join(m.PeersExcluding(selfHex), ","))
+
+	if !ok {
+		// P7.4 NON-FOUNDER boot — the open-net join path. A key outside the roster is no longer a
+		// refusal: the node shares the identical manifest (same network_id), dials the full roster,
+		// resyncs from it, and becomes a voting member the epoch the post-flip Fund banker set
+		// includes its key (an operator stakes Banker carrying this consensus key + endpoint).
+		// Pre-flip it can only observe. The roster gives it no URL, so the port must be explicit.
+		if strings.TrimSpace(os.Getenv("PORT")) == "" {
+			return nil, fmt.Errorf("consensus key %s is not in the manifest roster: booting as a "+
+				"non-founder requires an explicit -port (the roster cannot derive one)", selfHex)
+		}
+		log.Printf("[boot] consensus key %s is NOT in the manifest roster — booting as a NON-FOUNDER "+
+			"node: dialing the full roster, resync-follows, becomes a voting member once the post-flip "+
+			"Fund banker set includes this key", selfHex)
+		return m, nil
+	}
 
 	// PORT from this node's roster URL, unless an explicit PORT/-port already set it.
 	if strings.TrimSpace(os.Getenv("PORT")) == "" {

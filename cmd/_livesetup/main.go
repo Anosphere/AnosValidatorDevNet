@@ -44,9 +44,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 3 fresh P-256 validator keys → key files + compressed-pubkey set.
+	// 3 fresh P-256 validator keys → key files + compressed-pubkey set — PLUS one EXTRA key
+	// (val3) that is deliberately NOT in the roster/manifest: the P7.4 JOIN_LIVE stage boots it as
+	// a non-founder and stakes it into the Fund, so Fund-native dialing is live-tested against a
+	// genuinely non-roster validator.
 	var pubs []string
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
 			log.Fatal(err)
@@ -60,6 +63,8 @@ func main() {
 		comp := crypto.CompressP256PublicKey(&priv.PublicKey)
 		pubs = append(pubs, hex.EncodeToString(comp[:]))
 	}
+	extraPub := pubs[3]
+	pubs = pubs[:3] // only the first 3 form the roster
 
 	// Fresh hybrid genesis keypair (seed-pinned).
 	var seed [32]byte
@@ -158,6 +163,9 @@ func main() {
 		"GENESIS_AUTH_PUBKEY_HEX":         mani.Genesis.AuthPubkeyHex,
 		"GENESIS_SEED_HEX":                hex.EncodeToString(seed[:]),
 		"VALIDATOR_URL_LIST":              strings.Join(urls, ","),
+		// P7.4 JOIN_LIVE: the extra NON-roster validator (val3.key) the harness may start + stake.
+		"EXTRA_VALIDATOR_PUBKEY_HEX": extraPub,
+		"EXTRA_VALIDATOR_URL":        "http://127.0.0.1:9093",
 	}
 
 	var b strings.Builder
@@ -169,6 +177,7 @@ func main() {
 		"ESCROW_ATTESTATION_DELAY_EPOCHS", "BREAKGLASS_EXTRA_EPOCHS",
 		"VALIDATOR_SET_PUBKEYS",
 		"GENESIS_HEX", "GENESIS_AUTH_PUBKEY_HEX", "GENESIS_SEED_HEX", "VALIDATOR_URL_LIST",
+		"EXTRA_VALIDATOR_PUBKEY_HEX", "EXTRA_VALIDATOR_URL",
 	}
 	for _, k := range order {
 		fmt.Fprintf(&b, "export %s=%s\n", k, common[k])

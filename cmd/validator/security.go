@@ -34,9 +34,26 @@ const (
 
 	// maxFrontiersLimit / maxSyncChainBlocks ceiling the caller-controlled pagination on /sync/*. The
 	// resync client asks for 1000 frontiers/page and 200000 chain blocks, so these never truncate a
-	// legitimate resync; they only bound an absurd request. (True long-chain pagination is P7.4.)
+	// legitimate resync; they only bound an absurd request.
 	maxFrontiersLimit  = 10_000
 	maxSyncChainBlocks = 200_000
+
+	// P7.4 serving-side response budgets. maxSyncChainRespBytes pages a /sync/chain response (the
+	// handler otherwise built a whole account chain in memory, and the resync client couldn't read
+	// past protodelim's 4 MiB anyway — the P7.4 client pages from the returned tail's prev).
+	// maxFinRangeRespBytes budgets the ranged /sync/finalization form (whole epochs only; the last
+	// covered epoch is stamped in X-Anos-Fin-Through); maxFinRangeSpan bounds a range request's
+	// epoch count regardless of content. All LOCAL liveness knobs — a client must tolerate any
+	// page size (chains end at arbitrary points), so divergent values interoperate.
+	maxSyncChainRespBytes = 2 << 20 // 2 MiB
+	maxFinRangeRespBytes  = 2 << 20 // 2 MiB
+	maxFinRangeSpan       = 4096
+
+	// P7.4 request-body caps on the peer/sync POST surface — defense-in-depth over protodelim's
+	// own 4 MiB read cap. A /peer/tx/push legitimately carries up to ~1.5 MiB (the P7.4 client-side
+	// push budget); a /sync/chain request is a fixed tiny message.
+	maxPeerBodyBytes = 8 << 20  // 8 MiB
+	maxSyncBodyBytes = 64 << 10 // 64 KiB
 )
 
 // ---- per-IP token-bucket rate limiter ----

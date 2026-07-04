@@ -4,8 +4,6 @@ import (
 	"net"
 	"net/url"
 	"strings"
-
-	"go.etcd.io/bbolt"
 )
 
 // P7.3 peer authorization: the /peer/* front door and the per-epoch membership resolution the
@@ -46,32 +44,40 @@ func (e *Engine) PeerSourceAllowed(remoteAddr string) bool {
 }
 
 // PeerMemberForEpoch reports whether a peer consensus id is a member of the validator set for epoch
-// (manifest list pre-flip, Fund-derived post-flip). Thin wrapper over pubForEpoch so the /peer/tx/*
-// handlers gate on the same per-epoch set the /peer/candidates + /peer/finalization handlers do.
+// (manifest list pre-flip, Fund-derived post-flip) — the /peer/tx/* DoS-gate membership check.
+//
+// P7.4 (flip-aware resolver, closing the two P7.3 residuals): the fallback for an epoch the loop
+// has NOT cached yet is the LATEST cached epoch set — which follows the Fund post-flip — rather
+// than the static manifest. Gossip is stamped with the sender's wall-clock epoch, which runs ahead
+// of the receiver's loop by its epoch-close processing tail (~1.6s), so the "uncached epoch" window
+// recurs every epoch; with the manifest fallback a post-flip newly-joined banker was rejected for
+// that whole window (and re-rejected every epoch), while a kicked FOUNDER kept passing. Against the
+// latest cached set, a joined banker is accepted from its second member-epoch on and a kicked one
+// refused once the next epoch caches. The static manifest remains only the nothing-cached-yet
+// fallback (fresh boot / mid-resync). Unlike pubForEpoch (which the sig-verifying candidate/
+// finalization intakes keep, unchanged), a CACHED set answers authoritatively — no manifest
+// fallback behind it — because this is a membership question, not a key-resolution one.
+// DoS-gate-only and liveness-only either way: the epoch-close union re-validates every tx and the
+// quorum re-checks membership, so a wrong verdict here can delay a tx, never fork.
 func (e *Engine) PeerMemberForEpoch(epoch uint64, id [33]byte) bool {
-	return e.pubForEpoch(epoch, id) != nil
+	e.mu.Lock()
+	set := e.epochSets[epoch]
+	if set == nil {
+		set = e.latestEpochSet
+	}
+	e.mu.Unlock()
+	if set != nil {
+		_, ok := set[id]
+		return ok
+	}
+	return e.cfg.ValidatorSet[id] != nil
 }
 
-// refreshDynPeerIPs recomputes the dynamic (Fund-derived) source-IP allowlist from the CURRENT
-// finalized Banker state and installs it. Called once per epoch by the loop (cheap: the same read
-// /debug/fund/bankers does). Pre-flip the Fund set may be empty or a founders' superset; either way
-// it only ADDS IPs to the permanent roster fallback, never removes one, so gating can never strand a
-// rostered node. The endpoints come from the same BankerValidatorSet the flip consumes.
-func (e *Engine) refreshDynPeerIPs(epoch uint64) {
-	ips := make(map[string]struct{})
-	_ = e.cfg.DB.View(func(tx *bbolt.Tx) error {
-		descs := e.cfg.Econ.BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
-		for _, vd := range descs {
-			if h := hostFromURL(vd.Endpoint); h != "" {
-				ips[canonicalHost(h)] = struct{}{}
-			}
-		}
-		return nil
-	})
-	e.mu.Lock()
-	e.dynPeerIPs = ips
-	e.mu.Unlock()
-}
+// The dynamic (Fund-derived) source-IP allowlist is refreshed once per epoch by refreshPeerViews
+// (peer_dial.go, P7.4) — one BankerValidatorSet read now feeds BOTH the inbound allowlist and the
+// outbound dial list, so the two connectivity views can never disagree about the set. Pre-flip the
+// Fund set may be empty or a founders' superset; either way it only ADDS IPs alongside the
+// permanent roster fallback, never removes one, so gating can never strand a rostered node.
 
 // ipSetFromURLs collapses a list of endpoints (the manifest roster / cfg.Peers / Fund banker
 // endpoints) to the set of their canonical host IPs — the set of source addresses those peers connect
