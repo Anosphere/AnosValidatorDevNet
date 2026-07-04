@@ -63,7 +63,7 @@ silently forking.
 | `economics` | fees, stake floors, guardian params | consensus‑critical scalars, read straight off the manifest |
 | `consensus` | `quorum_percent`, `finalization_quorum_percent`, `max_candidate_scan_per_slot` | the quorum thresholds (80% / 60% here) |
 | `genesis` | `hex`, `auth_pubkey_hex`, `unix_ms`, `supply_units` | the genesis account, its hybrid auth pubkey, the fixed epoch anchor, total supply |
-| `roster[]` | `pubkey`, `url` | each validator's compressed P‑256 consensus key + base URL. `PEERS`, the validator set, and each node's port are derived from this |
+| `roster[]` | `pubkey`, `url` | the **initial banker/validator set** (the founding nodes): each one's compressed P‑256 consensus key + base URL. `PEERS`, the validator set, and each node's port are derived from this. (After genesis, the live set becomes Fund‑derived from Banker stakes; there is no separate banker‑list file.) |
 
 A node finds **itself** in the roster by matching its loaded key's consensus pubkey to a
 `roster[].pubkey`, then serves on that entry's port and treats the other URLs as peers — so every VM
