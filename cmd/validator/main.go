@@ -1115,14 +1115,25 @@ func main() {
 	})
 
 	// GET /health : ungated liveness probe (no network header, no IP gate, no rate limit) for uptime
-	// checks / load balancers. Returns 200 + a tiny JSON with the node's network id + latest epoch.
+	// checks / load balancers. Always 200-if-up (the monitoring contract is unchanged); the body
+	// carries the P7.6 progress detail so a process that is alive but NOT finalizing — the exact
+	// failure the epoch-loop recover guards contain — is observable instead of silent: compare
+	// epoch_now vs latest_epoch (resyncing explains a legitimate lag; a recovered loop panic itself
+	// triggers a resync), and a nonzero panics_total flags a node that recovered a panic. The panic
+	// DETAIL (the recovered value) is deliberately NOT surfaced here — this endpoint is ungated/
+	// public, so the raw string would be an attacker oracle ("my input panicked it") and a potential
+	// info leak; it lives in the node's loud CRITICAL logs where the operator looks.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		panicsTotal, _ := engine.PanicStats()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(struct {
 			Status      string `json:"status"`
 			NetworkID   string `json:"network_id"`
 			LatestEpoch uint64 `json:"latest_epoch"`
-		}{"ok", manifest.NetworkID, engine.LatestFinalizedEpoch()})
+			EpochNow    uint64 `json:"epoch_now"`
+			Resyncing   bool   `json:"resyncing"`
+			PanicsTotal uint64 `json:"panics_total"`
+		}{"ok", manifest.NetworkID, engine.LatestFinalizedEpoch(), engine.EpochNow(), engine.ResyncActive(), panicsTotal})
 	})
 
 	// P7.3 edge middlewares, composed OUTSIDE the P7.2 network-id middleware (outer→inner):

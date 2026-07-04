@@ -13,6 +13,7 @@ import (
 	"log"
 	"math/bits"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -209,6 +210,21 @@ type Engine struct {
 	// dead peer. Both guarded by e.mu. Resync deliberately does NOT use this (roster-only).
 	dialPeers  []string
 	dialHealth map[string]*dialHealthEntry
+
+	// --- P7.6 input-robustness: background-goroutine panic containment ---
+	// net/http recovers a panic in a REQUEST handler (one request dies, the node lives), but the
+	// epoch loop and the gossip/broadcast goroutines had no recover — a panic there killed the
+	// whole process, silently stopping finalization while /health kept answering 200. The loop now
+	// runs each iteration under guardIteration (a recovered LOOP panic triggers a resync — see loop)
+	// and every background sender under recoverBGPanic; panicTotal/lastPanic make a recovering node
+	// OBSERVABLE via /health (PanicStats). Guarded by e.mu.
+	panicTotal uint64
+	lastPanic  string
+
+	// presenceSkips counts consecutive presence-gate skips for the P7.4 behind-probe pacing.
+	// Cross-iteration loop state (was a loop local before the P7.6 loopOnce extraction); touched
+	// only by the loop goroutine.
+	presenceSkips int
 
 	startOnce sync.Once
 }
@@ -1304,24 +1320,32 @@ func (e *Engine) pubForEpoch(epoch uint64, id [33]byte) *ecdsa.PublicKey {
 // predicate over the just-finalized end-of-`epoch` state), it latches flipEpoch=`epoch` one-way. Pure
 // over finalized state + the static manifest, so every node latches at the same epoch.
 func (e *Engine) maybeLatchFlip(epoch uint64) {
-	if len(e.manifestKeys) == 0 {
-		return // never latch to an empty set (would zero the quorum denominator); unreachable — the
-		// manifest is guarded non-empty in NewEngine / ParseValidatorSetCSV — but fail safe.
-	}
 	err := e.cfg.DB.Update(func(tx *bbolt.Tx) error {
-		if getFlipEpoch(tx) != 0 {
-			return nil
-		}
-		descs := e.cfg.Econ.BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
-		if !FundSetMatchesManifest(descs, e.manifestKeys) {
-			return nil
-		}
-		return setFlipEpoch(tx, epoch)
+		return e.maybeLatchFlipInTx(tx, epoch)
 	})
 	if err != nil {
 		e.elog(epoch, "maybeLatchFlip error: %v", err)
 		return
 	}
+}
+
+// maybeLatchFlipInTx is the transaction-scoped body of maybeLatchFlip, so the epoch commit can
+// run it inside the SAME atomic bbolt Update as the winner apply + frontier snapshot (P7.6
+// commitEpoch) — it sees the just-applied (uncommitted) state exactly as the post-commit variant
+// saw the committed state.
+func (e *Engine) maybeLatchFlipInTx(tx *bbolt.Tx, epoch uint64) error {
+	if len(e.manifestKeys) == 0 {
+		return nil // never latch to an empty set (would zero the quorum denominator); unreachable — the
+		// manifest is guarded non-empty in NewEngine / ParseValidatorSetCSV — but fail safe.
+	}
+	if getFlipEpoch(tx) != 0 {
+		return nil
+	}
+	descs := e.cfg.Econ.BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
+	if !FundSetMatchesManifest(descs, e.manifestKeys) {
+		return nil
+	}
+	return setFlipEpoch(tx, epoch)
 }
 
 func (e *Engine) HasTx(txid [32]byte) bool {
@@ -1711,7 +1735,21 @@ func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byt
 // polls the roster peers' tips (see probeBehind). LOCAL liveness knob.
 const behindProbeEverySkips = 8
 
-// loop runs epochs.
+// loop runs epochs. Each iteration executes under guardIteration (P7.6): a panic anywhere in an
+// iteration — a poison pool tx crossing ParseTx/Validate/Apply, a fault inside the synchronous
+// runResync/probeBehind calls, an invariant break — is logged loudly (with stack) and the loop
+// CONTINUES instead of the goroutine dying while /health kept answering 200 (a silent finalization
+// stop).
+//
+// A recovered panic before the epoch's commit means we may have SKIPPED an epoch that peers
+// finalized, leaving our committed tip behind. Simply continuing would then build epoch N+1 on
+// stale base and — via the MISMATCH-apply path — commit a frontier root no finalization describes
+// (silent divergence). So a recovered loop panic TRIGGERS A RESYNC: the next iteration short-
+// circuits into the verifying walk, which rebuilds canonical state from the manifest anchor and
+// clears every volatile pool (incl. the poison mempool tx). This makes recover-and-continue behave
+// exactly like the pre-P7.6 crash+restart+resync — minus the process death. The epoch commit is
+// also one atomic bbolt Update (commitEpoch), so a mid-commit panic rolls the whole epoch back and
+// never leaves applied-but-unsnapshotted state for the resync to trip over.
 func (e *Engine) loop(ctx context.Context) {
 	epochMs := e.cfg.EpochDuration.Milliseconds()
 	if epochMs <= 0 {
@@ -1719,9 +1757,45 @@ func (e *Engine) loop(ctx context.Context) {
 	}
 
 	genesisMs := e.cfg.GenesisUnixMs
-	presenceSkips := 0
 
 	for {
+		stop, panicked := e.guardIteration(func() bool { return e.loopOnce(ctx, epochMs, genesisMs) })
+		if stop {
+			return
+		}
+		if panicked {
+			// Resync away any skipped-commit divergence (idempotent; a no-op if a resync is already
+			// pending/active). Zero want-hashes: the verifying walk re-derives the target from peers.
+			e.triggerResync(e.epochNow(), [32]byte{}, [32]byte{})
+			// Pace the retry: a panic before the iteration's first sleep point would otherwise spin
+			// the loop hot. One second keeps the node responsive without burning a core.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}
+}
+
+// guardIteration runs one loop iteration under the P7.6 recover guard. Extracted (rather than a
+// defer inside loopOnce) so the exact production guard is directly unit-testable with a panicking
+// fn. On a panic the iteration reports stop=false — the loop keeps going.
+func (e *Engine) guardIteration(fn func() (stop bool)) (stop, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			stop, panicked = false, true
+			e.noteLoopPanic(r)
+		}
+	}()
+	return fn(), false
+}
+
+// loopOnce is ONE iteration of the epoch loop (the body of the pre-P7.6 for-loop, verbatim except
+// `return` → `return true` and top-level `continue` → `return false`). Returns stop=true only on
+// context cancellation.
+func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop bool) {
+	{
 		// If we're in resync mode, short-circuit normal epoch processing.
 		// This prevents continuing to apply epochs while we know we're divergent.
 		if e.resync.IsActive() {
@@ -1739,10 +1813,10 @@ func (e *Engine) loop(ctx context.Context) {
 				}
 				select {
 				case <-ctx.Done():
-					return
+					return true
 				case <-time.After(d):
 				}
-				continue
+				return false
 			}
 
 			_ = e.runResync(ctx)
@@ -1750,10 +1824,10 @@ func (e *Engine) loop(ctx context.Context) {
 			// After resync attempt (success or failure), restart loop to re-evaluate wall-clock epoch.
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			default:
 			}
-			continue
+			return false
 		}
 
 		// If genesis is in the future, wait until it begins.
@@ -1762,10 +1836,10 @@ func (e *Engine) loop(ctx context.Context) {
 			wait := time.Duration(genesisMs-nowMs) * time.Millisecond
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			case <-time.After(wait):
 			}
-			continue
+			return false
 		}
 
 		// Determine the current wall-clock epoch window.
@@ -1798,14 +1872,14 @@ func (e *Engine) loop(ctx context.Context) {
 		if sleepMs > 0 {
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			case <-time.After(time.Duration(sleepMs) * time.Millisecond):
 			}
 		} else {
 			// We're already past the boundary (GC pause / scheduling / etc). Continue immediately.
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			default:
 			}
 		}
@@ -1822,7 +1896,7 @@ func (e *Engine) loop(ctx context.Context) {
 		// Wait a small skew for peers to arrive
 		select {
 		case <-ctx.Done():
-			return
+			return true
 		case <-time.After(e.cfg.CandidatesSkew):
 		}
 
@@ -1872,14 +1946,13 @@ func (e *Engine) loop(ctx context.Context) {
 			// ROSTER peers for their committed tip; if one is beyond our intake window, resync.
 			// Members never linger here in steady state (peers dial them → presence passes), and a
 			// genesis cold start is safe (everyone reports tip 0 → never triggers).
-			presenceSkips++
-			if presenceSkips%behindProbeEverySkips == 0 {
+			e.presenceSkips++
+			if e.presenceSkips%behindProbeEverySkips == 0 {
 				e.probeBehind(ctx, epoch)
 			}
-			epoch++
-			continue
+			return false
 		}
-		presenceSkips = 0
+		e.presenceSkips = 0
 		// --- end presence quorum gate ---
 
 		// Model B: Merge union of all valid txs; vote only within conflicts.
@@ -2036,7 +2109,7 @@ func (e *Engine) loop(ctx context.Context) {
 		dryRunRoot, err := ComputeDryRunFrontiersRoot(e.cfg.DB, winners)
 		if err != nil {
 			e.elog(epoch, "dry-run frontiers root error: %v — retrying", err)
-			continue
+			return false
 		}
 
 		log.Printf("[epoch=%d] phase:dry-run-done winners=%d acceptedHash=%x frontiersRoot=%x wallMs=%d",
@@ -2051,7 +2124,7 @@ func (e *Engine) loop(ctx context.Context) {
 		sigDER, sigErr := e.cfg.Signer.SignDigest(digest)
 		if sigErr != nil {
 			e.elog(epoch, "finalization: sign error: %v — retrying", sigErr)
-			continue
+			return false
 		}
 
 		// Build accepted txid bytes for the proto field
@@ -2084,7 +2157,7 @@ func (e *Engine) loop(ctx context.Context) {
 		// allow some skew to receive peers' finalizations (peers must finish apply first)
 		select {
 		case <-ctx.Done():
-			return
+			return true
 		case <-time.After(e.cfg.FinalizationSkew):
 		}
 		log.Printf("[epoch=%d] phase:fin-skew-done wallMs=%d", epoch, time.Now().UnixMilli())
@@ -2098,14 +2171,15 @@ func (e *Engine) loop(ctx context.Context) {
 
 		if qCount >= qNeed {
 			if bytes.Equal(qAccepted[:], acceptedHash[:]) && bytes.Equal(qRoot[:], dryRunRoot[:]) {
-				// MATCH: quorum agrees with us. Commit our winners to DB.
+				// MATCH: quorum agrees with us. Commit our winners to DB — apply + epoch-frontier
+				// snapshot + flip latch in ONE atomic bbolt Update (P7.6 commitEpoch).
 				log.Printf("[epoch=%d] phase:apply-start winners=%d validTxs=%d wallMs=%d", epoch, len(winners), len(validParsed), time.Now().UnixMilli())
-				acceptedSet, failedApplied, aerr := e.applyWinners(winners, txBytesByID, validParsed)
+				acceptedSet, failedApplied, aerr := e.commitEpoch(epoch, winners, txBytesByID, validParsed)
 				log.Printf("[epoch=%d] phase:apply-done failed=%d wallMs=%d", epoch, len(failedApplied), time.Now().UnixMilli())
 				if aerr != nil {
 					e.elog(epoch, "apply error: %v — triggering resync", aerr)
 					e.triggerResync(epoch, qAccepted, qRoot)
-					continue
+					return false
 				}
 				if len(failedApplied) > 0 {
 					i := 0
@@ -2116,19 +2190,10 @@ func (e *Engine) loop(ctx context.Context) {
 							break
 						}
 					}
-					e.elog(epoch, "apply had %d failed txs — triggering resync", len(failedApplied))
+					e.elog(epoch, "apply had %d failed txs (epoch rolled back) — triggering resync", len(failedApplied))
 					e.triggerResync(epoch, qAccepted, qRoot)
-					continue
+					return false
 				}
-
-				// snapshot epoch frontiers after commit
-				if err := SaveEpochFrontiers(e.cfg.DB, epoch); err != nil {
-					e.elog(epoch, "finalization: SaveEpochFrontiers error: %v", err)
-				}
-
-				// P4.3: latch the list→Fund flip if the just-finalized Banker set now matches the
-				// manifest list (one-way; deterministic over the finalized state + static manifest).
-				e.maybeLatchFlip(epoch)
 
 				// Cleanup: delete losers + delete accepted-but-failed-apply
 				postSnap, _ := e.buildSnapshot(epoch)
@@ -2187,22 +2252,15 @@ func (e *Engine) loop(ctx context.Context) {
 					}
 
 					if !fetchFailed {
-						// Apply the quorum's winners instead of our own
+						// Apply the quorum's winners instead of our own — same atomic commitEpoch
+						// (apply + frontiers + flip in one Update; any failure rolls it all back).
 						log.Printf("[epoch=%d] phase:apply-quorum-start winners=%d wallMs=%d", epoch, len(qWinners), time.Now().UnixMilli())
-						acceptedSet, failedApplied, aerr := e.applyWinners(qWinners, qTxBytesMap, qParsedMap)
+						acceptedSet, failedApplied, aerr := e.commitEpoch(epoch, qWinners, qTxBytesMap, qParsedMap)
 						log.Printf("[epoch=%d] phase:apply-quorum-done failed=%d wallMs=%d", epoch, len(failedApplied), time.Now().UnixMilli())
 						if aerr != nil || len(failedApplied) > 0 {
-							e.elog(epoch, "MISMATCH: apply quorum failed (err=%v, failed=%d) — triggering resync", aerr, len(failedApplied))
+							e.elog(epoch, "MISMATCH: apply quorum failed (err=%v, failed=%d; epoch rolled back) — triggering resync", aerr, len(failedApplied))
 							e.triggerResync(epoch, qAccepted, qRoot)
 						} else {
-							// snapshot epoch frontiers after commit
-							if err := SaveEpochFrontiers(e.cfg.DB, epoch); err != nil {
-								e.elog(epoch, "finalization: SaveEpochFrontiers error: %v", err)
-							}
-
-							// P4.3: latch the list→Fund flip (mismatch-apply commit path).
-							e.maybeLatchFlip(epoch)
-
 							// Cleanup: same as normal path
 							postSnap, _ := e.buildSnapshot(epoch)
 							log.Printf("[epoch=%d] phase:cleanup-start txPool=%d wallMs=%d", epoch, len(e.txPool), time.Now().UnixMilli())
@@ -2225,6 +2283,7 @@ func (e *Engine) loop(ctx context.Context) {
 		}
 		// --- end finalization ---
 	}
+	return false
 }
 
 // gossipLoop periodically advertises pending txids to peers (INV) and, when requested, delivers
@@ -2241,7 +2300,11 @@ func (e *Engine) gossipLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			e.flushGossipOnce(ctx)
+			// P7.6: one panicking flush must not kill the gossip loop for the life of the process.
+			func() {
+				defer e.recoverBGPanic("gossip-flush")
+				e.flushGossipOnce(ctx)
+			}()
 		}
 	}
 }
@@ -2365,6 +2428,7 @@ func (e *Engine) flushGossipOnce(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer e.recoverBGPanic("gossip-peer") // P7.6: runs before wg.Done (LIFO), so a panic can't leak past Wait
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			e.gossipToPeer(ctx, b.idx, b.url, b.ids, need)
@@ -2709,6 +2773,7 @@ func (e *Engine) broadcastCandidates(epoch uint64, cl *CandidateList) {
 	for _, peer := range e.currentDialPeers() {
 		peer = strings.TrimRight(peer, "/")
 		go func(p string) {
+			defer e.recoverBGPanic("candidates-broadcast") // P7.6
 			var buf bytes.Buffer
 			_, _ = protodelim.MarshalTo(&buf, msg)
 
@@ -2747,6 +2812,7 @@ func (e *Engine) broadcastFinalization(fin *pb.EpochFinalization) {
 	for _, peer := range e.currentDialPeers() {
 		peer = strings.TrimRight(peer, "/")
 		go func(p string) {
+			defer e.recoverBGPanic("finalization-broadcast") // P7.6
 			var buf bytes.Buffer
 			_, _ = protodelim.MarshalTo(&buf, fin)
 
@@ -2872,7 +2938,20 @@ func (e *Engine) getPeerLists(epoch uint64) map[[33]byte]*CandidateList {
 	return out
 }
 
-func (e *Engine) applyWinners(winners map[[32]byte][32]byte, txBytesByID map[[32]byte][]byte, parsed map[[32]byte]*pb.Tx) (map[[32]byte]struct{}, map[[32]byte]error, error) {
+// errCommitAborted rolls back a commitEpoch Update whose winner set had failures; commitEpoch
+// swallows it (the caller distinguishes that outcome via the failed map, as it did pre-P7.6).
+var errCommitAborted = errors.New("commitEpoch: aborted on failed winners")
+
+// commitEpoch persists a finalized epoch — every winner's ApplyTx, the epoch-frontier snapshot,
+// and the list→Fund flip latch — in ONE atomic bbolt Update. Pre-P7.6 these were three separate
+// transactions, leaving a window (a crash, kill -9, or a P7.6-recovered panic between them) where
+// winners were applied but BEpochFrontiers/flip were missing — a state no finalization describes,
+// which a continuing loop would then serve. Any failed winner aborts and rolls back the WHOLE
+// epoch: pre-P7.6 the partial subset committed and the triggered resync wiped it moments later;
+// now the partial state never exists (the pool still holds the bytes — GetTxBytes serves peers
+// fetching quorum txids either way). applied is non-empty only on full success; failed carries
+// the per-tx reasons for the caller's logging.
+func (e *Engine) commitEpoch(epoch uint64, winners map[[32]byte][32]byte, txBytesByID map[[32]byte][]byte, parsed map[[32]byte]*pb.Tx) (map[[32]byte]struct{}, map[[32]byte]error, error) {
 	applied := make(map[[32]byte]struct{})
 	failed := make(map[[32]byte]error)
 
@@ -2904,13 +2983,80 @@ func (e *Engine) applyWinners(winners map[[32]byte][32]byte, txBytesByID map[[32
 				continue
 			}
 			applied[id] = struct{}{}
-			// log.Printf("APPLIED tx %x... acct=%x... seq=%d", id[:4], p.Account.V[:4], p.Seq)
 		}
-		return nil
+		if len(failed) > 0 {
+			return errCommitAborted
+		}
+
+		// Snapshot the post-apply frontiers + latch the flip INSIDE the same transaction: the
+		// Update sees its own uncommitted writes, so both read exactly the state the pre-P7.6
+		// post-commit calls read — now atomically with the apply.
+		if err := saveEpochFrontiersInTx(tx, epoch); err != nil {
+			return fmt.Errorf("SaveEpochFrontiers: %w", err)
+		}
+		return e.maybeLatchFlipInTx(tx, epoch)
 	})
 
+	if err != nil {
+		// Rolled back — nothing persisted, so report nothing applied.
+		applied = make(map[[32]byte]struct{})
+		if errors.Is(err, errCommitAborted) {
+			err = nil
+		}
+	}
 	return applied, failed, err
 }
+
+// noteLoopPanic records a recovered epoch-loop panic (counter + last message for /health, loud
+// CRITICAL log with the stack). The RECOVERY action — a resync that rebuilds canonical state and
+// clears the volatile pools, including any poison mempool tx — is driven by loop() on the panicked
+// return, NOT here: noteLoopPanic runs inside guardIteration's recover, and keeping it to bookkeeping
+// (no triggerResync, no pool surgery) keeps the recovery in one clean, e.mu-free-context place.
+func (e *Engine) noteLoopPanic(r any) {
+	stack := debug.Stack()
+	e.mu.Lock()
+	e.panicTotal++
+	e.lastPanic = fmt.Sprintf("epoch-loop: %v", r)
+	total := e.panicTotal
+	e.mu.Unlock()
+	log.Printf("CRITICAL: epoch-loop PANIC recovered (total=%d) — resyncing to shed any skipped-commit divergence: %v\n%s", total, r, stack)
+}
+
+// recoverBGPanic guards a background send goroutine (the gossip tick, the per-peer gossip
+// fan-out, the candidate/finalization broadcasts): deferred at the top of each. These marshal our
+// OWN data and POST it, so a panic there is an invariant break rather than hostile input — but
+// pre-P7.6 it still killed the whole process. Log it loudly, count it for /health, keep running.
+// No pool purge: senders don't consume pool bytes that could be poison (the loop's consecutive
+// counter owns that).
+func (e *Engine) recoverBGPanic(name string) {
+	if r := recover(); r != nil {
+		stack := debug.Stack()
+		e.mu.Lock()
+		e.panicTotal++
+		e.lastPanic = fmt.Sprintf("%s: %v", name, r)
+		total := e.panicTotal
+		e.mu.Unlock()
+		log.Printf("CRITICAL: %s PANIC recovered (total=%d): %v\n%s", name, total, r, stack)
+	}
+}
+
+// PanicStats surfaces the recovered-panic count + last message for /health: a node that is alive
+// but recovering (or that ever panicked) must be observable, not silent — the P7.6 goal is "never
+// silently stop making progress", and the recover guards remove the "stop"; this removes the
+// "silently".
+func (e *Engine) PanicStats() (total uint64, last string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.panicTotal, e.lastPanic
+}
+
+// EpochNow exposes the wall-clock epoch for /health (alongside LatestFinalizedEpoch, the pair
+// lets an operator see a stalled or lagging node at a glance).
+func (e *Engine) EpochNow() uint64 { return e.epochNow() }
+
+// ResyncActive exposes whether the verifying resync is in progress for /health (a resyncing node
+// legitimately lags; without this bit a lag would read as a stall).
+func (e *Engine) ResyncActive() bool { return e.resync.IsActive() }
 
 func conflictKeyHash(tx *pb.Tx) ([32]byte, bool) {
 	if tx.Account == nil || len(tx.Account.V) != 32 {
