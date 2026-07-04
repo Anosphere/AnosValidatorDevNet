@@ -305,7 +305,9 @@ func assert(cond bool, msg string) {
 	}
 }
 
-func banner(s string) { log.Printf("──────────────────────────────────────── %s", s) }
+func banner(s string) {
+	log.Printf("──────────────────────────────────────── %s", s)
+}
 
 func mustEnv(k string) string {
 	v := strings.TrimSpace(os.Getenv(k))

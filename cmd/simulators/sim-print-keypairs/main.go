@@ -23,8 +23,8 @@ import (
 	"flag"
 	"fmt"
 
-	"anos/internal/simkit"
 	pb "anos/internal/proto"
+	"anos/internal/simkit"
 )
 
 func main() {
