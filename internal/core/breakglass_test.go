@@ -187,7 +187,7 @@ func TestEscrowSlotsSignedBreakglass(t *testing.T) {
 // bgSnap builds a Snapshot holding one base-class source account with balance, plus the config
 // constants a breakglass move reads. epoch is the validation epoch.
 func bgSnap(src *simkit.Account, head [32]byte, bal, seq, epoch uint64) *Snapshot {
-	return &Snapshot{
+	return &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			src.ID: {
 				Head: head, Balance: bal, Seq: seq, Class: src.Class,
@@ -245,7 +245,7 @@ func TestBreakglassChainCreationValidate(t *testing.T) {
 	rid := crypto.ReceivableIDFromTxID([32]byte{0x5a})
 
 	// Snapshot: the source (keyed) + a breakglass-flagged TRANSFER-restricted receivable funding `chain`.
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			src.ID: {Class: src.Class, AuthPubKey: src.AuthPubKeyBytes(), BreakglassCommit: append([]byte(nil), src.Commit...), Seq: 2},
 		},
@@ -296,7 +296,7 @@ func TestBreakglassReleaseValidate(t *testing.T) {
 	chHead[0], dest[0] = 0xc6, 0xd6
 	const unlock, bal = uint64(20), uint64(1000)
 
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			chain.ID: {
 				Head: chHead, Balance: bal, Seq: 1, Class: pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
@@ -382,7 +382,7 @@ func TestBreakglassApplyForcesTransferReceivable(t *testing.T) {
 	}
 	raw, _ := proto.Marshal(bgTx)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, bgTx, txid, testFund)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, bgTx, txid, testFund, testEcon)
 	}); err != nil {
 		t.Fatalf("apply breakglass drain: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestBreakglassApplyForcesTransferReceivable(t *testing.T) {
 	pid, _ := crypto.TxID(plain)
 	praw, _ := proto.Marshal(plain)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, praw, plain, pid, testFund)
+		return ApplyTx(&bboltTxView{tx: tx}, praw, plain, pid, testFund, testEcon)
 	}); err != nil {
 		t.Fatalf("apply plain: %v", err)
 	}

@@ -218,8 +218,8 @@ func (k *HybridPrivateKey) Sign(m [32]byte) (*HybridSig, error) {
 // HybridVerify implements the hybrid-AND rule (keys-spec §5.4): the signature is
 // valid IFF BOTH halves verify over the same 32-byte digest m —
 //
-//	1. ML-DSA-87.Verify(pub.mldsa, m, sig.mldsa), AND
-//	2. ECDSA-P-256.Verify(pub.p256, m, sig.p256) with s ≤ n/2 (low-S).
+//  1. ML-DSA-87.Verify(pub.mldsa, m, sig.mldsa), AND
+//  2. ECDSA-P-256.Verify(pub.p256, m, sig.p256) with s ≤ n/2 (low-S).
 //
 // Either half failing — or a high-S P-256 half — rejects the whole signature.
 func HybridVerify(pub *HybridPubKey, m [32]byte, sig *HybridSig) bool {

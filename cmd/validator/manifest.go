@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -11,20 +12,25 @@ import (
 	"anos/internal/crypto"
 )
 
-// loadManifestIntoEnv reads a network manifest and populates the SAME environment
-// variables main()'s (tested) env path already reads. It deliberately parses nothing
-// itself beyond the manifest file: the downstream EngineConfig is therefore byte-identical
-// to an env boot with the equivalent values. Network-wide fields are authoritative (they
-// overwrite any env of the same name — that is the point: one source of truth, no
-// fork-on-a-forgotten-var). Per-node fields (PEERS, PORT) are DERIVED from the roster by
-// locating this node via its consensus key; an explicit PORT/-port still wins.
-func loadManifestIntoEnv(path string) error {
+// loadManifest reads, validates, and content-addresses a network manifest, populates the SAME
+// environment variables main()'s (tested) env path already reads for the timing/genesis/fund/
+// validator-set fields, and RETURNS the parsed manifest so main() can read the P7.2 scalars that
+// are NOT on the env bridge (economics, quorum/scan-cap, network_id, protocol_version) directly off
+// the typed struct. The env bridge keeps the downstream parsing byte-identical to a historical env
+// boot; the struct is the single source of truth (network_id hashes it). Network-wide fields are
+// authoritative (they overwrite any env of the same name — one source of truth, no fork on a
+// forgotten var); per-node fields (PEERS, PORT) are DERIVED from the roster by locating this node
+// via its consensus key. -manifest is MANDATORY (P7.2): a node with no manifest has no network_id
+// and cannot participate.
+func loadManifest(path string) (*config.Manifest, error) {
 	m, err := config.Load(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Network-wide, consensus-critical — authoritative (overwrite env).
+	// Network-wide, consensus-critical — authoritative (overwrite env). Only the fields main()'s
+	// env path parses are bridged here; the economics/consensus/identity scalars are read off the
+	// returned struct.
 	setenv := func(k, v string) { _ = os.Setenv(k, v) }
 	setenv("EPOCH_MS", strconv.FormatInt(m.Timing.EpochMs, 10))
 	setenv("GENESIS_UNIX_MS", strconv.FormatInt(m.Genesis.UnixMs, 10))
@@ -46,21 +52,35 @@ func loadManifestIntoEnv(path string) error {
 	// Locate THIS node in the roster by its consensus key so PEERS/PORT can be derived.
 	keyPath := strings.TrimSpace(os.Getenv("VALIDATOR_KEY_PATH"))
 	if keyPath == "" {
-		return fmt.Errorf("VALIDATOR_KEY_PATH (or -key) is required to locate this node in the manifest roster")
+		return nil, fmt.Errorf("VALIDATOR_KEY_PATH (or -key) is required to locate this node in the manifest roster")
 	}
 	priv, err := crypto.LoadP256PrivateKeyFromFile(keyPath)
 	if err != nil {
-		return fmt.Errorf("load validator key %q: %w", keyPath, err)
+		return nil, fmt.Errorf("load validator key %q: %w", keyPath, err)
 	}
 	selfID := crypto.CompressP256PublicKey(&priv.PublicKey)
 	selfHex := hex.EncodeToString(selfID[:])
 	self, ok := m.Self(selfHex)
-	if !ok {
-		return fmt.Errorf("this node's consensus key (%s) is not in the manifest roster", selfHex)
-	}
 
-	// PEERS = every other roster URL. Always derived (never trust a hand-set PEERS here).
+	// PEERS = every other roster URL (all of them for a non-roster node — PeersExcluding excludes
+	// nothing then). Always derived (never trust a hand-set PEERS here).
 	setenv("PEERS", strings.Join(m.PeersExcluding(selfHex), ","))
+
+	if !ok {
+		// P7.4 NON-FOUNDER boot — the open-net join path. A key outside the roster is no longer a
+		// refusal: the node shares the identical manifest (same network_id), dials the full roster,
+		// resyncs from it, and becomes a voting member the epoch the post-flip Fund banker set
+		// includes its key (an operator stakes Banker carrying this consensus key + endpoint).
+		// Pre-flip it can only observe. The roster gives it no URL, so the port must be explicit.
+		if strings.TrimSpace(os.Getenv("PORT")) == "" {
+			return nil, fmt.Errorf("consensus key %s is not in the manifest roster: booting as a "+
+				"non-founder requires an explicit -port (the roster cannot derive one)", selfHex)
+		}
+		log.Printf("[boot] consensus key %s is NOT in the manifest roster — booting as a NON-FOUNDER "+
+			"node: dialing the full roster, resync-follows, becomes a voting member once the post-flip "+
+			"Fund banker set includes this key", selfHex)
+		return m, nil
+	}
 
 	// PORT from this node's roster URL, unless an explicit PORT/-port already set it.
 	if strings.TrimSpace(os.Getenv("PORT")) == "" {
@@ -73,5 +93,5 @@ func loadManifestIntoEnv(path string) error {
 	if strings.TrimSpace(os.Getenv("VALIDATOR_IDENTITY_HEX")) == "" && strings.TrimSpace(self.Identity) != "" {
 		setenv("VALIDATOR_IDENTITY_HEX", strings.TrimSpace(self.Identity))
 	}
-	return nil
+	return m, nil
 }

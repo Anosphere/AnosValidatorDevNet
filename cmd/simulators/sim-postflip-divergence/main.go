@@ -5,14 +5,14 @@
 // env list); the P4.3b epoch-ordered verifying walk re-derives the TRUE flip + the post-flip set history
 // from the manifest anchor, so a wiped node converges AND re-derives the same flip_epoch.
 //
-//	1. BEFORE: every node reports flipped=false.
-//	2. FLIP: stake one banker per manifest key (founders stake their list keys) → the predicate fires;
-//	   every node flips to source=fund with fund_set_size == manifest_list_size; record flip_epoch.
-//	3. DIVERGE: stake a 4th banker carrying a FRESH (non-manifest) consensus key → the Fund-derived set
-//	   grows to manifest+1 while the latched flip stays put (one-way). The live network keeps finalizing
-//	   (the 4th key never signs; 3-of-4 >= the 60% finalization quorum).
-//	4. AFTER: every node reports flipped=true, source=fund, fund_set_size == manifest+1, and the SAME
-//	   flip_epoch as in step 2 (the join did not move the flip).
+//  1. BEFORE: every node reports flipped=false.
+//  2. FLIP: stake one banker per manifest key (founders stake their list keys) → the predicate fires;
+//     every node flips to source=fund with fund_set_size == manifest_list_size; record flip_epoch.
+//  3. DIVERGE: stake a 4th banker carrying a FRESH (non-manifest) consensus key → the Fund-derived set
+//     grows to manifest+1 while the latched flip stays put (one-way). The live network keeps finalizing
+//     (the 4th key never signs; 3-of-4 >= the 60% finalization quorum).
+//  4. AFTER: every node reports flipped=true, source=fund, fund_set_size == manifest+1, and the SAME
+//     flip_epoch as in step 2 (the join did not move the flip).
 //
 // The live harness then wipes a node and confirms its P4.3b verifying resync converges to the diverged
 // state AND re-derives the identical flip_epoch. Env: VALIDATOR_URL_LIST, VALIDATOR_SET_PUBKEYS,

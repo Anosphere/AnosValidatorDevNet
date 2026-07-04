@@ -13,6 +13,7 @@ import (
 	"log"
 	"math/bits"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -39,8 +40,13 @@ type EngineConfig struct {
 	QuorumPercent             int // used only for conflict resolution
 	FinalizationQuorumPercent int // quorum for EpochFinalization agreement (default 60)
 	HTTPClient                *http.Client
-	CandidatesSkew            time.Duration
-	FinalizationSkew          time.Duration
+	// ResyncHTTPClient is the DEDICATED bulk-sync client (P7.4): NO global timeout — every resync
+	// request carries its own per-request deadline (resync.go) so a large /sync/chain page can
+	// finish where the shared 2s gossip client could not. Defaulted by NewEngine; injectable for
+	// tests. LOCAL liveness knob, never consensus-relevant.
+	ResyncHTTPClient *http.Client
+	CandidatesSkew   time.Duration
+	FinalizationSkew time.Duration
 
 	FundAccount    [32]byte
 	GenesisAccount [32]byte
@@ -102,6 +108,36 @@ type EngineConfig struct {
 	// configs set a small value. P7's network manifest must content-address it.
 	BreakglassExtraEpochs uint64
 
+	// Econ carries the manifest-pinned monetary + role scalars (fee schedule, role floors, Guardian
+	// divisor/threshold, fund-send epoch slack). buildSnapshot copies it into every Snapshot, and the
+	// engine-side validator-set / Guardian derivations invoke it as e.cfg.Econ.X. CONSENSUS-CRITICAL:
+	// identical on every validator (network_id pins it); NewEngine fails closed if it is unset — P7.2
+	// removed the code-side const defaults.
+	Econ Economics
+
+	// MaxCandidateScanPerSlot bounds how many txids buildCandidateList validates per conflict slot
+	// (P7.1). Manifest-pinned so candidate proposal is deterministic network-wide under a flood;
+	// NewEngine fails closed if 0. P7.3 ALSO uses it as the per-conflict-slot mempool admission cap
+	// (FIFO reject-when-full), so a slot can never accumulate more txids than buildCandidateList
+	// scans — closing the P7.1 ">64-junk buries the real opening" residual.
+	MaxCandidateScanPerSlot uint64
+
+	// MaxMempoolTxs bounds the unsolicited transaction pool (reject-when-full). A LOCAL operational
+	// knob (memory bound), NOT consensus-critical and deliberately NOT manifest-pinned: divergent
+	// caps cannot fork — solicited consensus fetches (fetchMissingTxs) bypass it, and a tx dropped by
+	// one full pool is still held/proposed by other nodes and fetched on demand by any node that needs
+	// it for the union. 0 => NewEngine substitutes defaultMaxMempoolTxs. (P7.3)
+	MaxMempoolTxs int
+
+	// NetworkID / ProtocolVersion are this node's network identity (config.Manifest.NetworkID = the
+	// content hash + SupportedProtocolVersion). The engine stamps them as X-Anos-* headers on every
+	// outbound /peer/* + /sync/* request and verifies them on resync RESPONSES; the cmd/validator
+	// mux middleware verifies them on inbound requests. A misconfiguration guard (spoofable-is-fine),
+	// NOT a security boundary — consensus is sig-authed regardless. Empty NetworkID disables the
+	// check (used only by tests that build an engine directly).
+	NetworkID       string
+	ProtocolVersion int
+
 	// SelfIdentity is this node's Banker account-id (the durable 32-byte PQ identity that staked
 	// Banker), set via VALIDATOR_IDENTITY_HEX (P4.3, working notes §3.7). Until the list→Fund flip
 	// the validator set is keyed by the P-256 consensus key (the env list); after the flip the set
@@ -141,6 +177,54 @@ type Engine struct {
 	resync            ResyncState
 	resyncNextAttempt time.Time
 	resyncFailCount   int
+	// resyncBlacklist skips a roster peer for target selection after a failed attempt / a provable
+	// tip lie (P7.4) — the pre-P7.4 picker re-chose the same highest-tip peer forever, so one
+	// lying peer could strand a wiped node. Guarded by e.mu; cleared wholesale when it would
+	// otherwise exclude every peer (never-strand).
+	resyncBlacklist map[string]time.Time
+
+	// --- P7.4 latest-cached validator set (flip-aware gossip gating) ---
+	// latestEpochSet mirrors the most recent epochSets[E] entry. PeerMemberForEpoch falls back to
+	// it (NOT the static manifest) for epochs the loop has not cached yet — the window in which a
+	// post-flip newly-joined banker's gossip was rejected and a kicked founder's accepted (the two
+	// P7.3 residuals). Written only by setEpochValidatorSet (the loop) + cleared on resync; e.mu.
+	latestEpochSet    map[[33]byte]*ecdsa.PublicKey
+	latestEpochCached uint64
+
+	// --- P7.3 peer-source IP allowlist (the /peer/* front door) ---
+	// rosterIPs is the static set of source IPs the manifest roster reaches us from (derived once
+	// from cfg.Peers at NewEngine). It is the pre-flip set AND a permanent fallback so a node can
+	// never strand itself. dynPeerIPs is refreshed each epoch by the loop from the finalized Fund
+	// banker endpoints (post-flip), so connectivity gating follows the Fund (Q3/Q4). Both are read by
+	// PeerSourceAllowed; dynPeerIPs is guarded by e.mu. Loopback is always allowed (operator/self).
+	rosterIPs  map[string]struct{}
+	dynPeerIPs map[string]struct{}
+
+	// --- P7.4 Fund-native dialing (the outbound half of connectivity-follows-the-Fund) ---
+	// dialPeers is the per-epoch DIAL LIST every broadcast/gossip/fetch loop iterates: the manifest
+	// roster ∪ the finalized Fund banker endpoints (self excluded by consensus key), rebuilt once
+	// per epoch by refreshPeerViews and frozen in between (gossipMask bits are index-keyed against
+	// it; the mask is cleared when the list changes). Empty ⇒ currentDialPeers falls back to
+	// cfg.Peers (direct-engine tests / pre-first-refresh). dialHealth cools down repeatedly
+	// unreachable dial URLs (stale Fund endpoints) so the 200ms gossip tick doesn't stall 2s per
+	// dead peer. Both guarded by e.mu. Resync deliberately does NOT use this (roster-only).
+	dialPeers  []string
+	dialHealth map[string]*dialHealthEntry
+
+	// --- P7.6 input-robustness: background-goroutine panic containment ---
+	// net/http recovers a panic in a REQUEST handler (one request dies, the node lives), but the
+	// epoch loop and the gossip/broadcast goroutines had no recover — a panic there killed the
+	// whole process, silently stopping finalization while /health kept answering 200. The loop now
+	// runs each iteration under guardIteration (a recovered LOOP panic triggers a resync — see loop)
+	// and every background sender under recoverBGPanic; panicTotal/lastPanic make a recovering node
+	// OBSERVABLE via /health (PanicStats). Guarded by e.mu.
+	panicTotal uint64
+	lastPanic  string
+
+	// presenceSkips counts consecutive presence-gate skips for the P7.4 behind-probe pacing.
+	// Cross-iteration loop state (was a loop local before the P7.6 loopOnce extraction); touched
+	// only by the loop goroutine.
+	presenceSkips int
 
 	startOnce sync.Once
 }
@@ -171,7 +255,14 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	}
 	selfID := cfg.Signer.PublicKeyCompressed()
 	if _, ok := cfg.ValidatorSet[selfID]; !ok {
-		return nil, errors.New("signer public key not present in validator set")
+		// P7.4: a NON-FOUNDER node (key not in the manifest roster) may boot — that is the open-net
+		// join path: resync from the roster, follow the chain, then stake Banker; it becomes a
+		// voting member the epoch the Fund-derived set includes its key (post-flip). Pre-flip it can
+		// only observe. Loud, because for a FOUNDER this same condition means a mis-pointed key file
+		// (the manifest loader + network-id handshake are the misconfig tripwires now).
+		log.Printf("[boot] WARNING: this node's consensus key %x… is NOT in the manifest validator set — "+
+			"booting as a NON-FOUNDER (observer until the post-flip Fund banker set includes this key); "+
+			"if this node is a roster founder, VALIDATOR_KEY_PATH points at the wrong key", selfID[:6])
 	}
 	if cfg.EpochDuration <= 0 {
 		cfg.EpochDuration = 5 * time.Second
@@ -180,14 +271,31 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		return nil, errors.New("missing genesis time: set GENESIS_UNIX_MS (milliseconds since unix epoch)")
 	}
 
-	if cfg.QuorumPercent == 0 {
-		cfg.QuorumPercent = 80
+	// P7.2: the consensus-critical scalars are manifest-pinned (network_id covers them) and have NO
+	// code-side default — a validator that cannot supply them fails closed rather than silently
+	// running a value different from what its network_id hashed. The liveness-only skews below keep
+	// their defaults.
+	if cfg.QuorumPercent == 0 || cfg.FinalizationQuorumPercent == 0 {
+		return nil, errors.New("missing consensus quorum percents (set from the manifest consensus block)")
 	}
-	if cfg.FinalizationQuorumPercent == 0 {
-		cfg.FinalizationQuorumPercent = 60
+	if cfg.Econ.unset() {
+		return nil, errors.New("missing economics (fees/floors/divisor/threshold): set from the manifest economics block")
+	}
+	if cfg.MaxCandidateScanPerSlot == 0 {
+		return nil, errors.New("missing consensus.max_candidate_scan_per_slot (set from the manifest)")
+	}
+	// MaxMempoolTxs is a LOCAL liveness bound (not manifest-pinned); substitute the default when unset
+	// so tests / direct engine construction get a sane cap without having to specify one.
+	if cfg.MaxMempoolTxs == 0 {
+		cfg.MaxMempoolTxs = defaultMaxMempoolTxs
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 2 * time.Second}
+	}
+	if cfg.ResyncHTTPClient == nil {
+		// No global timeout — resync.go applies a per-request deadline (a whole-client timeout is
+		// exactly the pre-P7.4 bug: it covered an entire bulk body read).
+		cfg.ResyncHTTPClient = &http.Client{}
 	}
 	if cfg.CandidatesSkew == 0 {
 		cfg.CandidatesSkew = 300 * time.Millisecond
@@ -200,10 +308,14 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		manifestKeys[id] = struct{}{}
 	}
 	e := &Engine{
-		cfg:          cfg,
-		peerLists:    make(map[uint64]map[[33]byte]*CandidateList),
-		manifestKeys: manifestKeys,
-		epochSets:    make(map[uint64]map[[33]byte]*ecdsa.PublicKey),
+		cfg:             cfg,
+		peerLists:       make(map[uint64]map[[33]byte]*CandidateList),
+		manifestKeys:    manifestKeys,
+		epochSets:       make(map[uint64]map[[33]byte]*ecdsa.PublicKey),
+		rosterIPs:       ipSetFromURLs(cfg.Peers),
+		dynPeerIPs:      make(map[string]struct{}),
+		resyncBlacklist: make(map[string]time.Time),
+		dialHealth:      make(map[string]*dialHealthEntry),
 	}
 
 	if err := cfg.DB.Update(func(tx *bbolt.Tx) error { return ensureBuckets(tx) }); err != nil {
@@ -337,7 +449,8 @@ func (e *Engine) bestEffortFundSendCheck(tx *pb.Tx) error {
 	snap := &Snapshot{
 		Accounts:             map[[32]byte]AccountSnap{},
 		FundAccount:          e.cfg.FundAccount,
-		GuardianActiveWeight: 0, // M=0 → threshold collapses to the N>=1 floor (submit-time leniency)
+		GuardianActiveWeight: 0,          // M=0 → threshold collapses to the N>=1 floor (submit-time leniency)
+		Econ:                 e.cfg.Econ, // manifest economics: the quorum/weight math needs the real divisor/threshold
 	}
 	atPosition := false
 	_ = e.cfg.DB.View(func(dbtx *bbolt.Tx) error {
@@ -504,7 +617,7 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 	if sb := tx.GetSend(); sb != nil && sb.To != nil && len(sb.To.V) == 32 {
 		copy(to[:], sb.To.V)
 	}
-	snap := &Snapshot{Accounts: map[[32]byte]AccountSnap{}}
+	snap := &Snapshot{Accounts: map[[32]byte]AccountSnap{}, Econ: e.cfg.Econ}
 	judged := false
 	var jerr error
 	_ = e.cfg.DB.View(func(dbtx *bbolt.Tx) error {
@@ -730,6 +843,159 @@ func (e *Engine) bestEffortBreakglassCheck(tx *pb.Tx) error {
 	return jerr
 }
 
+// isZeroOpeningPrev reports whether prev is the canonical opening-slot predecessor: nil, empty, or
+// an all-zero 32-byte hash. validate coerces nil/empty prev to zeros (ErrBadPrev otherwise), and an
+// opening block carries a 32-zero prev; a non-zero-length-!=32 prev is malformed and never produces
+// a conflict key (conflictKeyHash requires 32 bytes), so it is not the opening slot.
+func isZeroOpeningPrev(prev *pb.Hash32) bool {
+	if prev == nil || len(prev.V) == 0 {
+		return true
+	}
+	if len(prev.V) != 32 {
+		return false
+	}
+	for _, b := range prev.V {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// judgeAbsentOpening decides whether a tx contesting the opening slot (prev=0, seq=1) of a
+// GENUINELY-ABSENT account can never finalize. It is a pure function of the tx bytes (no state), so
+// a lagging node and a fully-synced node reach the identical verdict — a reject here can never be a
+// false-reject caused by local sync lag. It returns an error ONLY for a provably-never-finalizable
+// shape; anything ambiguous (a well-formed opening of the holder's OWN derived id, or a
+// TRANSFER/ESCROW opening whose id-derivation needs the unsynced funding receivable + key source)
+// returns nil (defer) — the authoritative validate at epoch close makes the final call.
+//
+// The one legitimate "an account chain begins with a SEND" case is the Fund and the genesis
+// distributor, both SEEDED at genesis (always present in the DB, first real block at seq>=2 with a
+// non-zero prev), so they never reach this function — the caller's account-present + seq==1 guards
+// exclude them twice over. For any genuinely-absent account, no SEND is a valid first block (its
+// balance is 0, so the normal-send branch fails ErrInsufficientBal, and no other SEND branch admits
+// an absent account), so a SEND — with or without a HybridMultiSig — at the opening slot is junk.
+func judgeAbsentOpening(tx *pb.Tx, acct [32]byte) error {
+	if tx.Type != pb.TxType_TX_TYPE_RECEIVE {
+		// SEND / UNSPECIFIED / reserved type: the only finalizable first block is an opening
+		// RECEIVE, so none of these can ever create the account. Reject so a txid-ground variant
+		// (a bare junk SEND, or one carrying a junk multisig to grind the txid) cannot occupy the
+		// opening conflict slot and stall the real opening.
+		return errors.New("opening slot: only an opening RECEIVE can create an account")
+	}
+	rb := tx.GetReceive()
+	class := rb.GetAccountClass()
+	switch class {
+	case pb.AccountClass_ACCOUNT_CLASS_TRANSFER, pb.AccountClass_ACCOUNT_CLASS_ESCROW:
+		// The id derives from the funding receivable (rs.From / rs.FromSeq) and the key source's
+		// stored keys, which may not be synced here → defer (ambiguous). This residual (a junk opening
+		// relabelled TRANSFER/ESCROW still occupies the conflict slot) is closed downstream by the
+		// validity-aware candidate proposal (buildCandidateList proposes the lowest VALID txid per
+		// contested slot), NOT at this stateless front-door gate.
+		return nil
+	case pb.AccountClass_ACCOUNT_CLASS_FUND:
+		// FUND is a reserved keyless singleton, seeded at genesis and never opened by a RECEIVE.
+		return errors.New("opening RECEIVE: FUND is never opened by a RECEIVE")
+	case pb.AccountClass_ACCOUNT_CLASS_UNSPECIFIED:
+		// validate requires a concrete account_class on an opening.
+		return errors.New("opening RECEIVE: account_class is required")
+	default:
+		// SPENDING/TIMELOCKED/GUARDED/VAULT and ANY unknown enum value (proto3 open enums preserve an
+		// undefined number like 99). The authoritative validate derives a non-TRANSFER/non-ESCROW id as
+		// BaseAccountID(AccountTypeByteForClass(class), auth_pubkey) — a PURE function of the carried key
+		// (AccountTypeByteForClass returns 0 for an unknown class, exactly what validate uses). If the
+		// carried key does not derive to acct, no signature/receivable/future state can make this an
+		// opening of acct — the core forge (attacker self-signs a RECEIVE with its OWN key over the
+		// VICTIM's id), incl. the one-byte-relabel-to-unknown-class variant. A key that DOES derive
+		// means the tx opens the holder's own account (SHA-512 preimage resistance rules out hitting a
+		// victim's id), so defer.
+		ap := rb.GetAuthPubkey().GetV()
+		if len(ap) != crypto.HybridPubKeySize {
+			return errors.New("opening RECEIVE: auth_pubkey must be 2625 bytes")
+		}
+		if crypto.BaseAccountID(crypto.AccountTypeByteForClass(class), ap) != acct {
+			return errors.New("opening RECEIVE: account-id does not derive from the carried auth_pubkey")
+		}
+		return nil
+	}
+}
+
+// bestEffortOpeningCheck closes the opening-slot DoS (P7.1): a junk SEND/RECEIVE on a not-yet-created
+// account grabs that account's opening conflict slot (sha256(account||prev||seq) with prev=0, seq=1)
+// so the real opening can never be proposed. Two shapes enter the pool unguarded today: a SEND on a
+// locally-absent account (resolveAuthPubKeyDB defers it with NO sig check), and a RECEIVE whose
+// carried auth_pubkey the attacker self-signs (verified against the attacker's OWN key). Either can
+// be txid-ground to the lowest txid, which alone becomes the approved candidate proposed every epoch;
+// it fails the epoch-close validate, so that slot commits nothing while the higher-txid real opening
+// is never even proposed = liveness DoS sustained by cheap re-injection each epoch.
+//
+// It mirrors the established bestEffort* gates: own locking (never called under e.mu), defer while
+// resyncing, and reject ONLY a provably-never-finalizable shape at the exact position — everything
+// ambiguous is deferred to the authoritative epoch-close validate, which no winner can skip. It fires
+// its reject arm ONLY on a GENUINELY-ABSENT account at prev=0/seq=1, so it can never touch the Fund,
+// the genesis account (both seeded → always present, first real block seq>=2), or any legit keyless
+// / multisig SEND (all seq>=2 on an existing account) — those are excluded by the account-present and
+// seq==1 guards before any judgement. ApplyTx is untouched → resync-safe.
+func (e *Engine) bestEffortOpeningCheck(tx *pb.Tx) error {
+	if tx.Account == nil || len(tx.Account.V) != 32 {
+		return nil // no 32-byte account → conflictKeyHash produces no key → no DoS; defer
+	}
+	if tx.Seq != 1 || !isZeroOpeningPrev(tx.Prev) {
+		return nil // only the true opening slot can contest a legitimate opening; anything else defers
+	}
+	// NOTE: a breakglass reveal is NOT blanket-deferred here. A reveal-carrying SEND at the opening
+	// slot is still junk (no SEND is a valid first block) and judgeAbsentOpening must reject it — else
+	// attaching a reveal is a one-field bypass of the SEND-reject arm. A legit breakglass/return-stake
+	// opening is a TRANSFER-class RECEIVE, which judgeAbsentOpening defers; bestEffortBreakglassCheck
+	// (which runs first) still owns the reveal-commitment verdict for those.
+	var acct [32]byte
+	copy(acct[:], tx.Account.V)
+	e.mu.Lock()
+	resyncing := e.resync.IsActive()
+	e.mu.Unlock()
+	if resyncing {
+		return nil // catching up — don't judge
+	}
+	var jerr error
+	_ = e.cfg.DB.View(func(dbtx *bbolt.Tx) error {
+		if _, ok := getAccountRecord(dbtx, acct); ok {
+			// Account already exists locally (this includes the always-seeded Fund + genesis). It is
+			// NOT an opening: a seq=1/prev=0 tx here can never finalize (validate: prev!=head,
+			// seq!=head+1) and is already sig-checked against the cached key upstream. Defer.
+			return nil
+		}
+		jerr = judgeAbsentOpening(tx, acct)
+		return nil
+	})
+	return jerr
+}
+
+// P7.3 mempool admission bounds. These are LOCAL liveness knobs (see EngineConfig.MaxMempoolTxs), NOT
+// consensus-critical: a node that rejects a tx here does not fork — the tx is still held/proposed by
+// other nodes, and any node that needs it for the epoch union fetches it via the SOLICITED path
+// (fetchMissingTxs), which bypasses these bounds. Two caps compose:
+//   - global: MaxMempoolTxs total unsolicited txs (a memory bound).
+//   - per conflict slot: MaxCandidateScanPerSlot txids, FIFO reject-when-full, so a slot can never hold
+//     more candidates than buildCandidateList scans — an already-admitted opening cannot be evicted by
+//     later ground-lower junk. This closes the P7.1 ">64-junk buries the real opening" residual.
+const defaultMaxMempoolTxs = 200_000
+
+// admissionRejectLocked returns a non-empty reason to reject an UNSOLICITED tx (submit / gossip-push)
+// under the mempool bounds, or "" to admit. The caller holds e.mu and has confirmed txid is not
+// already pooled. It reads but does not mutate the pool.
+func (e *Engine) admissionRejectLocked(tx *pb.Tx, txid [32]byte) string {
+	if e.cfg.MaxMempoolTxs > 0 && len(e.txPool) >= e.cfg.MaxMempoolTxs {
+		return "global mempool cap"
+	}
+	if key, ok := conflictKeyHash(tx); ok {
+		if uint64(len(e.conflictPool[key])) >= e.cfg.MaxCandidateScanPerSlot {
+			return "conflict-slot cap" // slot full; keep incumbents (FIFO) so junk can't evict a real block
+		}
+	}
+	return ""
+}
+
 func (e *Engine) SubmitTx(raw []byte) error {
 	tx, err := ParseTx(raw)
 	if err != nil {
@@ -754,6 +1020,12 @@ func (e *Engine) SubmitTx(raw []byte) error {
 	// A non-Fund SEND carrying a multisig is an attestor-gated release (or junk); judge it at the
 	// gate so a txid-ground variant can't occupy the chain's conflict slot. No-op without a multisig.
 	if err := e.bestEffortReleaseCheck(tx); err != nil {
+		return err
+	}
+	// A junk SEND/RECEIVE contesting an absent account's opening slot (prev=0, seq=1) is rejected
+	// here so it can't grind the opening conflict slot and stall the real opening (P7.1). No-op for
+	// any tx that isn't at an opening slot on a locally-absent account.
+	if err := e.bestEffortOpeningCheck(tx); err != nil {
 		return err
 	}
 	txid, err := crypto.TxID(tx)
@@ -783,6 +1055,13 @@ func (e *Engine) SubmitTx(raw []byte) error {
 	if _, ok := e.txPool[txid]; ok {
 		dup = true
 	} else {
+		// Bounded mempool admission (P7.3). A submitted tx is UNSOLICITED, so it is subject to the
+		// global + per-conflict-slot caps; reject-when-full rather than evict.
+		if reason := e.admissionRejectLocked(tx, txid); reason != "" {
+			e.mu.Unlock()
+			log.Printf("[tx] submit reject (%s) txid=%x", reason, txid[:4])
+			return fmt.Errorf("mempool full: %s", reason)
+		}
 		e.txPool[txid] = append([]byte(nil), raw...)
 	}
 
@@ -870,8 +1149,32 @@ func (e *Engine) ListReceivables(toAcct [32]byte) ([]*pb.Receivable, error) {
 }
 
 // ReceiveCandidateList stores a peer candidate list for an epoch after verifying signature and list hash.
+// P7.3 epoch-window intake bounds. A live candidate list / finalization for an epoch far from the
+// current wall-clock epoch is rejected up front so a member cannot grow peerLists / peerFinals (both
+// keyed by epoch and pruned only for the epoch that just closed) or the on-disk finalization store
+// without bound. LOCAL liveness consts, not consensus: a message outside the window could never be
+// counted for the current epoch anyway, and differing windows across nodes cannot fork (the message
+// is simply re-sendable once its epoch is current). Generous vs any real clock skew / processing lag
+// — epochNow is wall-clock, so even a GC-stalled node computes the current epoch.
+const (
+	maxIntakeEpochLag   = 8 // buffer messages up to this many epochs behind wall-clock now
+	maxIntakeEpochAhead = 2 // ...and this many ahead (clock-skew tolerance)
+)
+
+// epochWithinIntakeWindow reports whether ep is close enough to the current wall-clock epoch to
+// buffer a live candidate list / finalization for it (guards against uint underflow).
+func (e *Engine) epochWithinIntakeWindow(ep uint64) bool {
+	now := e.epochNow()
+	return ep+maxIntakeEpochLag >= now && ep <= now+maxIntakeEpochAhead
+}
+
 func (e *Engine) ReceiveCandidateList(fromURL string, cl *CandidateList) error {
 	_ = fromURL // identity is the pubkey, not URL
+
+	// 0) reject a candidate list for an epoch far from now so a member can't grow peerLists unbounded.
+	if !e.epochWithinIntakeWindow(cl.Epoch) {
+		return errors.New("reject: epoch outside intake window")
+	}
 
 	// 1) membership check against the validator set for THIS epoch (manifest list pre-flip, the
 	// Fund-derived set post-flip). The loop re-checks membership against the authoritative cached
@@ -954,7 +1257,7 @@ func (e *Engine) validatorSetForEpoch(epoch uint64) (map[[33]byte]*ecdsa.PublicK
 		if flip == 0 || epoch <= flip {
 			return nil // manifest list
 		}
-		descs := BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
+		descs := e.cfg.Econ.BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
 		m := make(map[[33]byte]*ecdsa.PublicKey, len(descs))
 		for _, vd := range descs {
 			pub, err := crypto.ParseCompressedP256(vd.ConsensusKey)
@@ -978,6 +1281,13 @@ func (e *Engine) setEpochValidatorSet(epoch uint64, set map[[33]byte]*ecdsa.Publ
 		e.epochSets = make(map[uint64]map[[33]byte]*ecdsa.PublicKey)
 	}
 	e.epochSets[epoch] = set
+	// P7.4: mirror the newest set for the flip-aware gossip-gate fallback (PeerMemberForEpoch).
+	// The loop is the ONLY writer here — intake paths never populate epochSets/latestEpochSet, so
+	// the quorum's frozen per-epoch set can never be seeded by a mid-epoch racy derivation.
+	if epoch >= e.latestEpochCached {
+		e.latestEpochCached = epoch
+		e.latestEpochSet = set
+	}
 	// Prune epochs well behind the one just cached (keep a generous window for late messages).
 	const keepWindow = 128
 	if epoch > keepWindow {
@@ -1010,24 +1320,32 @@ func (e *Engine) pubForEpoch(epoch uint64, id [33]byte) *ecdsa.PublicKey {
 // predicate over the just-finalized end-of-`epoch` state), it latches flipEpoch=`epoch` one-way. Pure
 // over finalized state + the static manifest, so every node latches at the same epoch.
 func (e *Engine) maybeLatchFlip(epoch uint64) {
-	if len(e.manifestKeys) == 0 {
-		return // never latch to an empty set (would zero the quorum denominator); unreachable — the
-		// manifest is guarded non-empty in NewEngine / ParseValidatorSetCSV — but fail safe.
-	}
 	err := e.cfg.DB.Update(func(tx *bbolt.Tx) error {
-		if getFlipEpoch(tx) != 0 {
-			return nil
-		}
-		descs := BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
-		if !FundSetMatchesManifest(descs, e.manifestKeys) {
-			return nil
-		}
-		return setFlipEpoch(tx, epoch)
+		return e.maybeLatchFlipInTx(tx, epoch)
 	})
 	if err != nil {
 		e.elog(epoch, "maybeLatchFlip error: %v", err)
 		return
 	}
+}
+
+// maybeLatchFlipInTx is the transaction-scoped body of maybeLatchFlip, so the epoch commit can
+// run it inside the SAME atomic bbolt Update as the winner apply + frontier snapshot (P7.6
+// commitEpoch) — it sees the just-applied (uncommitted) state exactly as the post-commit variant
+// saw the committed state.
+func (e *Engine) maybeLatchFlipInTx(tx *bbolt.Tx, epoch uint64) error {
+	if len(e.manifestKeys) == 0 {
+		return nil // never latch to an empty set (would zero the quorum denominator); unreachable — the
+		// manifest is guarded non-empty in NewEngine / ParseValidatorSetCSV — but fail safe.
+	}
+	if getFlipEpoch(tx) != 0 {
+		return nil
+	}
+	descs := e.cfg.Econ.BankerValidatorSet(listStakesInTx(tx), listBankerInfoInTx(tx))
+	if !FundSetMatchesManifest(descs, e.manifestKeys) {
+		return nil
+	}
+	return setFlipEpoch(tx, epoch)
 }
 
 func (e *Engine) HasTx(txid [32]byte) bool {
@@ -1093,7 +1411,15 @@ func (e *Engine) LatestFinalizedEpoch() uint64 {
 	return latest
 }
 
-func (e *Engine) ReceiveGossipedTx(raw []byte) error {
+// ReceiveGossipedTx admits an UNSOLICITED gossiped tx (the /peer/tx/push path): it is subject to the
+// bounded-mempool admission caps (P7.3). Solicited consensus fetches use receiveGossipedTx(raw, true).
+func (e *Engine) ReceiveGossipedTx(raw []byte) error { return e.receiveGossipedTx(raw, false) }
+
+// receiveGossipedTx is the shared gossip-intake path. solicited=true (fetchMissingTxs pulling txs the
+// epoch union NEEDS) BYPASSES the mempool admission caps so finalization can always complete; the caps
+// gate only unsolicited push/submit intake, so a full pool can never starve a node of a tx it must
+// validate — it fetches that tx on demand regardless.
+func (e *Engine) receiveGossipedTx(raw []byte, solicited bool) error {
 	tx, err := ParseTx(raw)
 	if err != nil {
 		return err
@@ -1121,6 +1447,11 @@ func (e *Engine) ReceiveGossipedTx(raw []byte) error {
 	if err := e.bestEffortReleaseCheck(tx); err != nil {
 		return err
 	}
+	// Opening-slot DoS gate (P7.1): reject a junk SEND/RECEIVE grinding an absent account's opening
+	// conflict slot on the gossip path too (junk propagates via /peer/tx/push + the inv/get fetch).
+	if err := e.bestEffortOpeningCheck(tx); err != nil {
+		return err
+	}
 	txid, err := crypto.TxID(tx)
 	if err != nil {
 		return err
@@ -1140,21 +1471,26 @@ func (e *Engine) ReceiveGossipedTx(raw []byte) error {
 	seen := e.epochNow()
 
 	e.mu.Lock()
+	if e.txPool == nil {
+		e.txPool = make(map[[32]byte][]byte)
+	}
+	_, gdup := e.txPool[txid]
+	if !gdup && !solicited {
+		// Bounded mempool admission (P7.3): unsolicited gossip is subject to the caps. Reject BEFORE
+		// stamping txSeenEpoch so a rejected tx leaves no bookkeeping behind.
+		if reason := e.admissionRejectLocked(tx, txid); reason != "" {
+			e.mu.Unlock()
+			log.Printf("[tx] gossip reject (%s) txid=%x", reason, txid[:4])
+			return fmt.Errorf("mempool full: %s", reason)
+		}
+	}
 	if e.txSeenEpoch == nil {
 		e.txSeenEpoch = make(map[[32]byte]uint64)
 	}
 	if _, exists := e.txSeenEpoch[txid]; !exists {
 		e.txSeenEpoch[txid] = seen
 	}
-
-	gdup := false
-
-	if e.txPool == nil {
-		e.txPool = make(map[[32]byte][]byte)
-	}
-	if _, ok := e.txPool[txid]; ok {
-		gdup = true
-	} else {
+	if !gdup {
 		e.txPool[txid] = append([]byte(nil), raw...)
 	}
 	if e.gossipPending == nil {
@@ -1198,7 +1534,20 @@ func (e *Engine) ReceiveGossipedTx(raw []byte) error {
 	return nil
 }
 
+// ReceiveFinalization ingests a finalization received from a PEER (the /peer/finalization handler): it
+// is subject to the epoch-intake window. The epoch loop stores its OWN finalization via
+// storeSelfFinalization, which bypasses the window (self-produced authoritative data — the node's own
+// quorum vote must never be dropped just because a slow loop iteration drifted past the window).
 func (e *Engine) ReceiveFinalization(fin *pb.EpochFinalization) error {
+	return e.receiveFinalization(fin, false)
+}
+
+// storeSelfFinalization records THIS node's own finalization (loop path), bypassing the intake window.
+func (e *Engine) storeSelfFinalization(fin *pb.EpochFinalization) error {
+	return e.receiveFinalization(fin, true)
+}
+
+func (e *Engine) receiveFinalization(fin *pb.EpochFinalization, selfStore bool) error {
 	if fin == nil {
 		return errors.New("nil finalization")
 	}
@@ -1213,6 +1562,16 @@ func (e *Engine) ReceiveFinalization(fin *pb.EpochFinalization) error {
 	}
 	if fin.Sig == nil || len(fin.Sig.V) < 64 || len(fin.Sig.V) > 80 {
 		return errors.New("bad sig")
+	}
+
+	// Reject a PEER finalization for an epoch far from now so a member can't grow peerFinals / the
+	// on-disk finalization store unbounded (P7.3). The node's OWN finalization (selfStore) bypasses this
+	// — finalizationQuorum counts votes only from peerFinals[epoch] with no separate self-count, so
+	// dropping the self-store would silently discard the node's own vote. Resync persists past-epoch
+	// finalizations via a different path (the walk's finPersistBatch), so this live-intake bound never
+	// impedes catch-up.
+	if !selfStore && !e.epochWithinIntakeWindow(fin.Epoch) {
+		return errors.New("epoch outside intake window")
 	}
 
 	var signerID [33]byte
@@ -1281,16 +1640,22 @@ func (e *Engine) ReceiveFinalization(fin *pb.EpochFinalization) error {
 // Stops if it reaches `have` (if non-zero) or hits max blocks or missing tx bytes.
 // Returns (txsHeadBackwards, reachedHave).
 //
+// maxBytes > 0 additionally byte-budgets the PAGE (P7.4): the walk stops early (reachedHave=false)
+// once the accumulated raw bytes reach it, always after at least one tx. The serving handler was
+// otherwise building a whole-chain response in memory, and the resync CLIENT could not read a
+// response past protodelim's 4 MiB cap anyway — the P7.4 paging client continues from the returned
+// tail's prev, so an early stop is a page boundary, never data loss.
+//
 // accountID is used only for diagnostics / special synthetic-anchor handling;
 // tx bytes themselves are always read from BTxs.
-func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byte, max int) ([][]byte, bool) {
-	log.Printf("SYNCCHAIN ENGINE CALLED acct=%x target=%x have=%x max=%d", accountID[:4], targetHead[:4], have[:4], max)
+func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byte, max int, maxBytes int) ([][]byte, bool) {
 	if max <= 0 {
 		max = 2000
 	}
 
 	var out [][]byte
 	reachedHave := false
+	totalBytes := 0
 
 	if err := e.cfg.DB.View(func(tx *bbolt.Tx) error {
 		if tx.Bucket(BTxs) == nil {
@@ -1310,11 +1675,11 @@ func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byt
 				if have != ([32]byte{}) && cur == have {
 					reachedHave = true
 				}
-				log.Printf("SYNCCHAIN head missing acct=%x cur=%x have=%x reached=%v", accountID[:4], cur[:4], have[:4], reachedHave)
 				break
 			}
 
 			out = append(out, raw)
+			totalBytes += len(raw)
 
 			ptx, err := ParseTx(raw)
 			if err != nil {
@@ -1345,10 +1710,15 @@ func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byt
 			if have == ([32]byte{}) {
 				// Normal account-chain heuristic: missing prev means synthetic base.
 				if _, err := getTxRaw(tx, prev); err != nil {
-					log.Printf("SYNCCHAIN acct=%x stopping at synthetic base prev=%x", accountID[:4], prev[:4])
 					reachedHave = true
 					break
 				}
+			}
+
+			// P7.4 page budget — checked LAST so a boundary/base verdict above is never lost, and
+			// only after ≥1 appended tx so a page always advances the client.
+			if maxBytes > 0 && totalBytes >= maxBytes {
+				break
 			}
 
 			cur = prev
@@ -1358,11 +1728,28 @@ func (e *Engine) SyncChain(accountID [32]byte, targetHead [32]byte, have [32]byt
 		log.Printf("SYNCCHAIN DB.View error: %v", err)
 	}
 
-	log.Printf("SYNCCHAIN DONE acct=%x target=%x out=%d reached=%v", accountID[:4], targetHead[:4], len(out), reachedHave)
 	return out, reachedHave
 }
 
-// loop runs epochs.
+// behindProbeEverySkips paces the P7.4 behind-probe: every Nth consecutive presence-skip the loop
+// polls the roster peers' tips (see probeBehind). LOCAL liveness knob.
+const behindProbeEverySkips = 8
+
+// loop runs epochs. Each iteration executes under guardIteration (P7.6): a panic anywhere in an
+// iteration — a poison pool tx crossing ParseTx/Validate/Apply, a fault inside the synchronous
+// runResync/probeBehind calls, an invariant break — is logged loudly (with stack) and the loop
+// CONTINUES instead of the goroutine dying while /health kept answering 200 (a silent finalization
+// stop).
+//
+// A recovered panic before the epoch's commit means we may have SKIPPED an epoch that peers
+// finalized, leaving our committed tip behind. Simply continuing would then build epoch N+1 on
+// stale base and — via the MISMATCH-apply path — commit a frontier root no finalization describes
+// (silent divergence). So a recovered loop panic TRIGGERS A RESYNC: the next iteration short-
+// circuits into the verifying walk, which rebuilds canonical state from the manifest anchor and
+// clears every volatile pool (incl. the poison mempool tx). This makes recover-and-continue behave
+// exactly like the pre-P7.6 crash+restart+resync — minus the process death. The epoch commit is
+// also one atomic bbolt Update (commitEpoch), so a mid-commit panic rolls the whole epoch back and
+// never leaves applied-but-unsnapshotted state for the resync to trip over.
 func (e *Engine) loop(ctx context.Context) {
 	epochMs := e.cfg.EpochDuration.Milliseconds()
 	if epochMs <= 0 {
@@ -1372,6 +1759,43 @@ func (e *Engine) loop(ctx context.Context) {
 	genesisMs := e.cfg.GenesisUnixMs
 
 	for {
+		stop, panicked := e.guardIteration(func() bool { return e.loopOnce(ctx, epochMs, genesisMs) })
+		if stop {
+			return
+		}
+		if panicked {
+			// Resync away any skipped-commit divergence (idempotent; a no-op if a resync is already
+			// pending/active). Zero want-hashes: the verifying walk re-derives the target from peers.
+			e.triggerResync(e.epochNow(), [32]byte{}, [32]byte{})
+			// Pace the retry: a panic before the iteration's first sleep point would otherwise spin
+			// the loop hot. One second keeps the node responsive without burning a core.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}
+}
+
+// guardIteration runs one loop iteration under the P7.6 recover guard. Extracted (rather than a
+// defer inside loopOnce) so the exact production guard is directly unit-testable with a panicking
+// fn. On a panic the iteration reports stop=false — the loop keeps going.
+func (e *Engine) guardIteration(fn func() (stop bool)) (stop, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			stop, panicked = false, true
+			e.noteLoopPanic(r)
+		}
+	}()
+	return fn(), false
+}
+
+// loopOnce is ONE iteration of the epoch loop (the body of the pre-P7.6 for-loop, verbatim except
+// `return` → `return true` and top-level `continue` → `return false`). Returns stop=true only on
+// context cancellation.
+func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop bool) {
+	{
 		// If we're in resync mode, short-circuit normal epoch processing.
 		// This prevents continuing to apply epochs while we know we're divergent.
 		if e.resync.IsActive() {
@@ -1389,10 +1813,10 @@ func (e *Engine) loop(ctx context.Context) {
 				}
 				select {
 				case <-ctx.Done():
-					return
+					return true
 				case <-time.After(d):
 				}
-				continue
+				return false
 			}
 
 			_ = e.runResync(ctx)
@@ -1400,10 +1824,10 @@ func (e *Engine) loop(ctx context.Context) {
 			// After resync attempt (success or failure), restart loop to re-evaluate wall-clock epoch.
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			default:
 			}
-			continue
+			return false
 		}
 
 		// If genesis is in the future, wait until it begins.
@@ -1412,10 +1836,10 @@ func (e *Engine) loop(ctx context.Context) {
 			wait := time.Duration(genesisMs-nowMs) * time.Millisecond
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			case <-time.After(wait):
 			}
-			continue
+			return false
 		}
 
 		// Determine the current wall-clock epoch window.
@@ -1437,20 +1861,25 @@ func (e *Engine) loop(ctx context.Context) {
 		if epochSetIsFund {
 			log.Printf("[epoch=%d] phase:validator-set source=fund size=%d", epoch, len(epochSet))
 		}
+		// P7.3/P7.4: refresh BOTH connectivity views from the finalized Fund banker endpoints —
+		// the inbound /peer/* source-IP allowlist AND the outbound dial list — so connectivity
+		// (gating + dialing) follows the Fund post-flip (roster stays a permanent union member /
+		// fallback). Once per epoch; liveness-only (never a fork).
+		e.refreshPeerViews(epoch)
 
 		// Sleep until the epoch boundary (end of this epoch).
 		sleepMs := epochEndMs - nowMs
 		if sleepMs > 0 {
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			case <-time.After(time.Duration(sleepMs) * time.Millisecond):
 			}
 		} else {
 			// We're already past the boundary (GC pause / scheduling / etc). Continue immediately.
 			select {
 			case <-ctx.Done():
-				return
+				return true
 			default:
 			}
 		}
@@ -1467,7 +1896,7 @@ func (e *Engine) loop(ctx context.Context) {
 		// Wait a small skew for peers to arrive
 		select {
 		case <-ctx.Done():
-			return
+			return true
 		case <-time.After(e.cfg.CandidatesSkew):
 		}
 
@@ -1490,10 +1919,19 @@ func (e *Engine) loop(ctx context.Context) {
 		}
 
 		// --- Presence quorum gate (liveness) ---
-		// "All validators" here means: self + everyone in our configured Peers list.
-		// If fewer than 60% are present this epoch, we skip applying anything and retry next epoch.
-		expected := 1 + len(e.cfg.Peers)     // self + peers we expect
-		present := 1 + len(peerLists)        // self + peers we actually received candidate lists from
+		// P7.4: the denominator is THIS epoch's validator set — the manifest list pre-flip (where
+		// it equals self + cfg.Peers, so the arithmetic is byte-identical to the old static form)
+		// and the Fund-derived set post-flip (where the static form ignored joiners/kicks). A
+		// non-member (a pre-join follower node) counts only the member lists it received; its own
+		// presence doesn't count and its participation is observation. Purely a liveness heuristic
+		// — the finalization quorum below is the authoritative gate either way.
+		selfID := e.cfg.Signer.PublicKeyCompressed()
+		_, selfIsMember := epochSet[selfID]
+		expected := len(epochSet)
+		present := len(peerLists) // member lists received (filtered above)
+		if selfIsMember {
+			present++
+		}
 		required := (expected*60 + 99) / 100 // ceil(expected * 0.60)
 		if required < 1 {
 			required = 1
@@ -1502,9 +1940,19 @@ func (e *Engine) loop(ctx context.Context) {
 		if present < required {
 			log.Printf("epoch %d skipped: presence %d/%d (<60%%); will retry next epoch", epoch, present, expected)
 
-			epoch++
-			continue
+			// P7.4 behind-probe: a node NOBODY dials (a non-roster pre-join follower, booted fresh)
+			// receives no lists and no finalizations, so it would presence-skip forever at genesis
+			// state and never notice the chain is far ahead. While skipping, periodically ask the
+			// ROSTER peers for their committed tip; if one is beyond our intake window, resync.
+			// Members never linger here in steady state (peers dial them → presence passes), and a
+			// genesis cold start is safe (everyone reports tip 0 → never triggers).
+			e.presenceSkips++
+			if e.presenceSkips%behindProbeEverySkips == 0 {
+				e.probeBehind(ctx, epoch)
+			}
+			return false
 		}
+		e.presenceSkips = 0
 		// --- end presence quorum gate ---
 
 		// Model B: Merge union of all valid txs; vote only within conflicts.
@@ -1661,7 +2109,7 @@ func (e *Engine) loop(ctx context.Context) {
 		dryRunRoot, err := ComputeDryRunFrontiersRoot(e.cfg.DB, winners)
 		if err != nil {
 			e.elog(epoch, "dry-run frontiers root error: %v — retrying", err)
-			continue
+			return false
 		}
 
 		log.Printf("[epoch=%d] phase:dry-run-done winners=%d acceptedHash=%x frontiersRoot=%x wallMs=%d",
@@ -1676,7 +2124,7 @@ func (e *Engine) loop(ctx context.Context) {
 		sigDER, sigErr := e.cfg.Signer.SignDigest(digest)
 		if sigErr != nil {
 			e.elog(epoch, "finalization: sign error: %v — retrying", sigErr)
-			continue
+			return false
 		}
 
 		// Build accepted txid bytes for the proto field
@@ -1696,8 +2144,8 @@ func (e *Engine) loop(ctx context.Context) {
 			AcceptedTxids:     acceptedTxidBytes,
 		}
 
-		// store our own finalization (and memory map)
-		if err := e.ReceiveFinalization(fin); err != nil {
+		// store our own finalization (and memory map); bypasses the intake window (self-vote must count)
+		if err := e.storeSelfFinalization(fin); err != nil {
 			e.elog(epoch, "finalization: store self error: %v", err)
 		}
 
@@ -1709,7 +2157,7 @@ func (e *Engine) loop(ctx context.Context) {
 		// allow some skew to receive peers' finalizations (peers must finish apply first)
 		select {
 		case <-ctx.Done():
-			return
+			return true
 		case <-time.After(e.cfg.FinalizationSkew):
 		}
 		log.Printf("[epoch=%d] phase:fin-skew-done wallMs=%d", epoch, time.Now().UnixMilli())
@@ -1723,14 +2171,15 @@ func (e *Engine) loop(ctx context.Context) {
 
 		if qCount >= qNeed {
 			if bytes.Equal(qAccepted[:], acceptedHash[:]) && bytes.Equal(qRoot[:], dryRunRoot[:]) {
-				// MATCH: quorum agrees with us. Commit our winners to DB.
+				// MATCH: quorum agrees with us. Commit our winners to DB — apply + epoch-frontier
+				// snapshot + flip latch in ONE atomic bbolt Update (P7.6 commitEpoch).
 				log.Printf("[epoch=%d] phase:apply-start winners=%d validTxs=%d wallMs=%d", epoch, len(winners), len(validParsed), time.Now().UnixMilli())
-				acceptedSet, failedApplied, aerr := e.applyWinners(winners, txBytesByID, validParsed)
+				acceptedSet, failedApplied, aerr := e.commitEpoch(epoch, winners, txBytesByID, validParsed)
 				log.Printf("[epoch=%d] phase:apply-done failed=%d wallMs=%d", epoch, len(failedApplied), time.Now().UnixMilli())
 				if aerr != nil {
 					e.elog(epoch, "apply error: %v — triggering resync", aerr)
 					e.triggerResync(epoch, qAccepted, qRoot)
-					continue
+					return false
 				}
 				if len(failedApplied) > 0 {
 					i := 0
@@ -1741,19 +2190,10 @@ func (e *Engine) loop(ctx context.Context) {
 							break
 						}
 					}
-					e.elog(epoch, "apply had %d failed txs — triggering resync", len(failedApplied))
+					e.elog(epoch, "apply had %d failed txs (epoch rolled back) — triggering resync", len(failedApplied))
 					e.triggerResync(epoch, qAccepted, qRoot)
-					continue
+					return false
 				}
-
-				// snapshot epoch frontiers after commit
-				if err := SaveEpochFrontiers(e.cfg.DB, epoch); err != nil {
-					e.elog(epoch, "finalization: SaveEpochFrontiers error: %v", err)
-				}
-
-				// P4.3: latch the list→Fund flip if the just-finalized Banker set now matches the
-				// manifest list (one-way; deterministic over the finalized state + static manifest).
-				e.maybeLatchFlip(epoch)
 
 				// Cleanup: delete losers + delete accepted-but-failed-apply
 				postSnap, _ := e.buildSnapshot(epoch)
@@ -1763,7 +2203,7 @@ func (e *Engine) loop(ctx context.Context) {
 
 				e.elog(epoch,
 					"finalized. quorum=%d/%d: (elapsed=%s) : broadcasted to %d : lists received=%d : Applied (winner_accounts=%d, candidate_txs=%d)",
-					qCount, qNeed, time.Since(start).Truncate(time.Millisecond), len(e.cfg.Peers), len(peerLists), len(winners), len(validParsed))
+					qCount, qNeed, time.Since(start).Truncate(time.Millisecond), len(e.currentDialPeers()), len(peerLists), len(winners), len(validParsed))
 
 			} else {
 				// MISMATCH: quorum agreed on something different.
@@ -1812,22 +2252,15 @@ func (e *Engine) loop(ctx context.Context) {
 					}
 
 					if !fetchFailed {
-						// Apply the quorum's winners instead of our own
+						// Apply the quorum's winners instead of our own — same atomic commitEpoch
+						// (apply + frontiers + flip in one Update; any failure rolls it all back).
 						log.Printf("[epoch=%d] phase:apply-quorum-start winners=%d wallMs=%d", epoch, len(qWinners), time.Now().UnixMilli())
-						acceptedSet, failedApplied, aerr := e.applyWinners(qWinners, qTxBytesMap, qParsedMap)
+						acceptedSet, failedApplied, aerr := e.commitEpoch(epoch, qWinners, qTxBytesMap, qParsedMap)
 						log.Printf("[epoch=%d] phase:apply-quorum-done failed=%d wallMs=%d", epoch, len(failedApplied), time.Now().UnixMilli())
 						if aerr != nil || len(failedApplied) > 0 {
-							e.elog(epoch, "MISMATCH: apply quorum failed (err=%v, failed=%d) — triggering resync", aerr, len(failedApplied))
+							e.elog(epoch, "MISMATCH: apply quorum failed (err=%v, failed=%d; epoch rolled back) — triggering resync", aerr, len(failedApplied))
 							e.triggerResync(epoch, qAccepted, qRoot)
 						} else {
-							// snapshot epoch frontiers after commit
-							if err := SaveEpochFrontiers(e.cfg.DB, epoch); err != nil {
-								e.elog(epoch, "finalization: SaveEpochFrontiers error: %v", err)
-							}
-
-							// P4.3: latch the list→Fund flip (mismatch-apply commit path).
-							e.maybeLatchFlip(epoch)
-
 							// Cleanup: same as normal path
 							postSnap, _ := e.buildSnapshot(epoch)
 							log.Printf("[epoch=%d] phase:cleanup-start txPool=%d wallMs=%d", epoch, len(e.txPool), time.Now().UnixMilli())
@@ -1850,6 +2283,7 @@ func (e *Engine) loop(ctx context.Context) {
 		}
 		// --- end finalization ---
 	}
+	return false
 }
 
 // gossipLoop periodically advertises pending txids to peers (INV) and, when requested, delivers
@@ -1866,18 +2300,28 @@ func (e *Engine) gossipLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			e.flushGossipOnce(ctx)
+			// P7.6: one panicking flush must not kill the gossip loop for the life of the process.
+			func() {
+				defer e.recoverBGPanic("gossip-flush")
+				e.flushGossipOnce(ctx)
+			}()
 		}
 	}
 }
 
 func (e *Engine) flushGossipOnce(ctx context.Context) {
-	if len(e.cfg.Peers) == 0 {
+	// P7.4: gossip fans out over the per-epoch DIAL LIST (roster ∪ Fund banker endpoints), not the
+	// static boot list. The list is frozen between refreshes and gossipMask bits index into it (the
+	// mask is cleared whenever the list changes). Peers in a dial-health cooldown are skipped this
+	// tick — the flush below BLOCKS on its slowest dial, so one dead Fund endpoint must not turn
+	// every 200ms tick into a 2s stall.
+	peers := e.currentDialPeers()
+	if len(peers) == 0 {
 		return
 	}
 
-	// Majority of peers (excluding self): floor(n/2)+1
-	need := (len(e.cfg.Peers) / 2) + 1
+	// Majority of dial peers (excluding self): floor(n/2)+1
+	need := (len(peers) / 2) + 1
 	if need < 1 {
 		need = 1
 	}
@@ -1886,6 +2330,26 @@ func (e *Engine) flushGossipOnce(ctx context.Context) {
 		idx int
 		url string
 		ids [][32]byte
+	}
+
+	// Health-filter BEFORE taking e.mu (dialAllowed locks e.mu itself).
+	type dialTarget struct {
+		idx int
+		url string
+	}
+	targets := make([]dialTarget, 0, len(peers))
+	for i, peer := range peers {
+		if i >= 63 {
+			break // bitmask limitation (documented 63-peer gossip cap)
+		}
+		peer = strings.TrimRight(peer, "/")
+		if !e.dialAllowed(peer) {
+			continue
+		}
+		targets = append(targets, dialTarget{idx: i, url: peer})
+	}
+	if len(targets) == 0 {
+		return
 	}
 
 	var batches []peerBatch
@@ -1932,12 +2396,8 @@ func (e *Engine) flushGossipOnce(ctx context.Context) {
 	}
 
 	// Per-peer selection: only txids not yet acked by that peer.
-	for i, peer := range e.cfg.Peers {
-		if i >= 63 {
-			break // bitmask limitation
-		}
-		peer = strings.TrimRight(peer, "/")
-		bit := uint64(1) << uint(i)
+	for _, t := range targets {
+		bit := uint64(1) << uint(t.idx)
 
 		ids := make([][32]byte, 0, len(pending))
 		for _, id := range pending {
@@ -1948,7 +2408,7 @@ func (e *Engine) flushGossipOnce(ctx context.Context) {
 		if len(ids) == 0 {
 			continue
 		}
-		batches = append(batches, peerBatch{idx: i, url: peer, ids: ids})
+		batches = append(batches, peerBatch{idx: t.idx, url: t.url, ids: ids})
 	}
 	e.mu.Unlock()
 
@@ -1968,6 +2428,7 @@ func (e *Engine) flushGossipOnce(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer e.recoverBGPanic("gossip-peer") // P7.6: runs before wg.Done (LIFO), so a panic can't leak past Wait
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			e.gossipToPeer(ctx, b.idx, b.url, b.ids, need)
@@ -1980,8 +2441,10 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 	if len(ids) == 0 || peerIdx < 0 || peerIdx >= 63 {
 		return
 	}
-	gossipStart := time.Now().UnixMilli()
-	log.Printf("[gossip] peer=%s ids=%d start wallMs=%d", peerURL, len(ids), gossipStart)
+	// No per-tick "start" log here: a REACHABLE peer that persistently refuses our inv (a kicked
+	// founder — still in the permanent roster dial set — or a network-id mismatch) is correctly
+	// never acked (the P7.4 false-ACK fix), so we re-inv it every 200ms; a per-tick line would be a
+	// slow disk-fill (the vector P7.3 removed elsewhere). The flush-level aggregate log remains.
 	bit := uint64(1) << uint(peerIdx)
 
 	epoch := e.epochNow()
@@ -1997,22 +2460,38 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", peerURL+"/peer/tx/inv", &invBuf)
 	req.Header.Set("Content-Type", "application/x-protobuf")
+	e.setAnosHeaders(req)
 	resp, err := e.cfg.HTTPClient.Do(req)
 	if err != nil || resp == nil {
+		e.recordDialResult(peerURL, false) // transport failure feeds the dial-health cooldown
 		return
 	}
+	e.recordDialResult(peerURL, true)
 
 	var want pb.TxWant
+	invOK := false
 	func() {
 		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return
 		}
 		br := bufio.NewReader(resp.Body)
-		_ = protodelim.UnmarshalFrom(br, &want)
+		if protodelim.UnmarshalFrom(br, &want) != nil {
+			return
+		}
+		invOK = true
 	}()
+	if !invOK {
+		// The peer refused or garbled the inv (membership gate, network-id mismatch, overload).
+		// Do NOT ack (P7.4 false-ACK fix): the txids stay pending and retry next tick, bounded by
+		// cleanupAfterEpoch draining gossip state every committed epoch. Pre-P7.4 a non-2xx here
+		// fell through to "peer wants nothing" = a FULL ACK — the amplifier that turned a
+		// transient membership rejection (e.g. a just-joined banker's pre-cache window) into a
+		// permanently-undelivered tx for that peer.
+		return
+	}
 
-	// If peer wants nothing, treat as ACK for everything we advertised.
+	// If peer (2xx, well-formed) wants nothing, treat as ACK for everything we advertised.
 	acked := make([][32]byte, 0, len(ids))
 	if len(want.Txid) == 0 {
 		acked = append(acked, ids...)
@@ -2020,8 +2499,10 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 		return
 	}
 
-	// Build PUSH with only wanted txs.
+	// Build PUSH with only wanted txs, byte-capped so the body always clears the receiver's 4 MiB
+	// protodelim read limit (overflow stays pending → next tick).
 	push := &pb.TxPush{Epoch: epoch, From: &pb.Pub32{V: vid[:]}}
+	pushBytes := 0
 	for _, h := range want.Txid {
 		if h == nil || len(h.V) != 32 {
 			continue
@@ -2033,10 +2514,14 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 		if len(raw) == 0 {
 			continue
 		}
+		if pushBytes > 0 && pushBytes+len(raw) > maxGossipPushBytes {
+			break
+		}
 		tx, err := ParseTx(raw)
 		if err != nil {
 			continue
 		}
+		pushBytes += len(raw)
 		push.Tx = append(push.Tx, tx)
 		acked = append(acked, txid)
 	}
@@ -2049,6 +2534,7 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 
 	req2, _ := http.NewRequestWithContext(ctx, "POST", peerURL+"/peer/tx/push", &pushBuf)
 	req2.Header.Set("Content-Type", "application/x-protobuf")
+	e.setAnosHeaders(req2)
 	resp2, err := e.cfg.HTTPClient.Do(req2)
 	if err != nil || resp2 == nil {
 		return
@@ -2060,11 +2546,8 @@ func (e *Engine) gossipToPeer(ctx context.Context, peerIdx int, peerURL string, 
 		}
 	}()
 	if len(acked) == 0 {
-		log.Printf("[gossip] peer=%s acked=0 done wallMs=%d (elapsed=%dms)", peerURL, time.Now().UnixMilli(), time.Now().UnixMilli()-gossipStart)
 		return
 	}
-
-	log.Printf("[gossip] peer=%s acked=%d done wallMs=%d (elapsed=%dms)", peerURL, len(acked), time.Now().UnixMilli(), time.Now().UnixMilli()-gossipStart)
 	e.recordGossipAck(bit, need, acked)
 }
 
@@ -2101,6 +2584,7 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 
 		EscrowAttestationDelayEpochs: e.cfg.EscrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        e.cfg.BreakglassExtraEpochs,
+		Econ:                         e.cfg.Econ,
 	}
 	err := e.cfg.DB.View(func(tx *bbolt.Tx) error {
 		ab := tx.Bucket(BAccounts)
@@ -2174,7 +2658,7 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 		// derives identical values — the determinism the quorum math depends on.
 		snap.FundStakeRows = listStakesInTx(tx)
 		active := listGuardianActiveInTx(tx)
-		snap.GuardianActiveWeight = ActiveGuardianWeight(snap.FundStakeRows, active, epoch, e.cfg.GuardianActiveWindowEpochs)
+		snap.GuardianActiveWeight = e.cfg.Econ.ActiveGuardianWeight(snap.FundStakeRows, active, epoch, e.cfg.GuardianActiveWindowEpochs)
 
 		return nil
 	})
@@ -2183,15 +2667,67 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 
 // buildCandidateListV2 builds a txid-only candidate list ("votes").
 // It ignores raws and uses e.approved (one tx per conflict key).
+// e.cfg.MaxCandidateScanPerSlot (manifest consensus.max_candidate_scan_per_slot) bounds how many
+// txids buildCandidateList validates per conflict slot when searching for the lowest VALID candidate.
+// It caps the CPU an attacker can force by flooding a slot with ground-low invalid txids; the
+// residual (a flood past the cap that buries the real block) is bounded by mempool admission limits
+// (P7.3), which cap how many txids a slot can accumulate. A cap hit is logged (never silent).
+// Generous vs any honest slot (1-2 txids); pinning it in the manifest keeps proposal deterministic
+// network-wide under a flood (P7.2).
 func (e *Engine) buildCandidateList(epoch uint64, snap *Snapshot) (*CandidateList, [][32]byte) {
-	_ = snap
-
+	// Snapshot the conflict pool + the raw bytes it references under the lock; validate OUTSIDE the lock
+	// (ValidateTxAgainstSnapshot is a pure function of snap and holds no engine state).
 	e.mu.Lock()
-	ids := make([][32]byte, 0, len(e.approved))
-	for _, txid := range e.approved {
-		ids = append(ids, txid)
+	slots := make([][][32]byte, 0, len(e.conflictPool))
+	rawByID := make(map[[32]byte][]byte)
+	for _, txids := range e.conflictPool {
+		slots = append(slots, append([][32]byte(nil), txids...))
+		for _, id := range txids {
+			if raw, ok := e.txPool[id]; ok {
+				rawByID[id] = raw
+			}
+		}
 	}
 	e.mu.Unlock()
+
+	// Per conflict slot, propose the LOWEST-txid candidate that VALIDATES against snap — NOT the
+	// blindly-lowest txid. A validity-blind pick lets a ground-low junk block (in particular a junk
+	// opening relabelled TRANSFER/ESCROW, which the stateless front-door gate must defer) starve a slot:
+	// it is proposed alone, fails the epoch-close validate, and the real (higher-txid) block for the
+	// same slot — which is never proposed — can never win. Skipping invalid candidates so the lowest
+	// VALID one is proposed closes that opening-slot DoS regardless of how the junk is labelled. This is
+	// deterministic given snap (all synced nodes hold the same finalized snapshot → same verdict, even
+	// if they hold different junk); a node too far behind to validate the real block yet simply proposes
+	// nothing for that slot and relies on the synced quorum (pre-existing lagging-node behaviour). It is
+	// LIVENESS-only: ApplyTx and the authoritative dry-run validate (which re-checks the union) are
+	// unchanged, so it cannot fork or affect resync. (It supersedes the raw lowest-txid e.approved cache
+	// for proposal; e.approved is still maintained as the incremental per-slot lowest-txid tracker.)
+	ids := make([][32]byte, 0, len(slots))
+	for _, txids := range slots {
+		sort.Slice(txids, func(i, j int) bool { return bytes.Compare(txids[i][:], txids[j][:]) < 0 })
+		scanned := 0
+		for _, id := range txids {
+			if uint64(scanned) >= e.cfg.MaxCandidateScanPerSlot {
+				log.Printf("[epoch=%d] candidate scan cap (%d) hit for a conflict slot; deferring it (mempool bounding is P7.3)", epoch, e.cfg.MaxCandidateScanPerSlot)
+				break
+			}
+			raw, ok := rawByID[id]
+			if !ok {
+				continue // bytes not held locally (shouldn't happen for a pooled txid) — skip
+			}
+			scanned++
+			tx, err := ParseTx(raw)
+			if err != nil {
+				continue
+			}
+			cid, verr := ValidateTxAgainstSnapshot(tx, snap)
+			if verr != nil || cid != id {
+				continue // invalid (or txid mismatch) → skip; try the next-lowest txid for this slot
+			}
+			ids = append(ids, id)
+			break
+		}
+	}
 
 	// stable order for list_hash/signature
 	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
@@ -2227,22 +2763,33 @@ func (e *Engine) broadcastCandidates(epoch uint64, cl *CandidateList) {
 		msg.Txid = append(msg.Txid, &pb.Hash32{V: id[:]})
 	}
 
-	for _, peer := range e.cfg.Peers {
+	// P7.4: broadcast over the per-epoch dial list (roster ∪ Fund banker endpoints) so a post-flip
+	// joined banker actually receives candidates. Fire-and-forget per peer (2s client). These
+	// once-per-epoch consensus broadcasts are deliberately NOT gated by the dial-health cooldown
+	// (unlike the 200ms gossip flush, which BLOCKS on its slowest dial): a briefly-flapping peer
+	// must keep receiving candidates/finalizations the instant it recovers, and a dead endpoint here
+	// costs only a short-lived goroutine bounded by the 2s client timeout. recordDialResult still
+	// feeds the health signal the gossip flush consults.
+	for _, peer := range e.currentDialPeers() {
 		peer = strings.TrimRight(peer, "/")
 		go func(p string) {
+			defer e.recoverBGPanic("candidates-broadcast") // P7.6
 			var buf bytes.Buffer
 			_, _ = protodelim.MarshalTo(&buf, msg)
 
 			req, _ := http.NewRequest("POST", p+"/peer/candidates", &buf)
 			req.Header.Set("Content-Type", "application/x-protobuf")
+			e.setAnosHeaders(req)
 			// Optional: include your own URL if you use it for debugging
 			// req.Header.Set("X-Validator-URL", e.cfg.SelfURL)
 
 			resp, err := e.cfg.HTTPClient.Do(req)
 			if err != nil {
+				e.recordDialResult(p, false)
 				log.Printf("candidates POST to %s failed: %v", p, err)
 				return
 			}
+			e.recordDialResult(p, true)
 			defer resp.Body.Close()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				b, _ := io.ReadAll(resp.Body)
@@ -2258,19 +2805,27 @@ func (e *Engine) broadcastFinalization(fin *pb.EpochFinalization) {
 	if fin == nil {
 		return
 	}
-	for _, peer := range e.cfg.Peers {
+	// P7.4: same per-epoch dial list as candidates — a joined banker's finalization reception (and
+	// therefore its ability to count us toward ITS quorum view) must follow the Fund. Not gated by
+	// the dial-health cooldown (see broadcastCandidates): a recovering peer must receive
+	// finalizations immediately, and the fire-and-forget goroutine is 2s-bounded.
+	for _, peer := range e.currentDialPeers() {
 		peer = strings.TrimRight(peer, "/")
 		go func(p string) {
+			defer e.recoverBGPanic("finalization-broadcast") // P7.6
 			var buf bytes.Buffer
 			_, _ = protodelim.MarshalTo(&buf, fin)
 
 			req, _ := http.NewRequest("POST", p+"/peer/finalization", &buf)
 			req.Header.Set("Content-Type", "application/x-protobuf")
+			e.setAnosHeaders(req)
 			resp, err := e.cfg.HTTPClient.Do(req)
 			if err != nil {
+				e.recordDialResult(p, false)
 				log.Printf("finalization POST to %s failed: %v", p, err)
 				return
 			}
+			e.recordDialResult(p, true)
 			defer resp.Body.Close()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				b, _ := io.ReadAll(resp.Body)
@@ -2383,7 +2938,20 @@ func (e *Engine) getPeerLists(epoch uint64) map[[33]byte]*CandidateList {
 	return out
 }
 
-func (e *Engine) applyWinners(winners map[[32]byte][32]byte, txBytesByID map[[32]byte][]byte, parsed map[[32]byte]*pb.Tx) (map[[32]byte]struct{}, map[[32]byte]error, error) {
+// errCommitAborted rolls back a commitEpoch Update whose winner set had failures; commitEpoch
+// swallows it (the caller distinguishes that outcome via the failed map, as it did pre-P7.6).
+var errCommitAborted = errors.New("commitEpoch: aborted on failed winners")
+
+// commitEpoch persists a finalized epoch — every winner's ApplyTx, the epoch-frontier snapshot,
+// and the list→Fund flip latch — in ONE atomic bbolt Update. Pre-P7.6 these were three separate
+// transactions, leaving a window (a crash, kill -9, or a P7.6-recovered panic between them) where
+// winners were applied but BEpochFrontiers/flip were missing — a state no finalization describes,
+// which a continuing loop would then serve. Any failed winner aborts and rolls back the WHOLE
+// epoch: pre-P7.6 the partial subset committed and the triggered resync wiped it moments later;
+// now the partial state never exists (the pool still holds the bytes — GetTxBytes serves peers
+// fetching quorum txids either way). applied is non-empty only on full success; failed carries
+// the per-tx reasons for the caller's logging.
+func (e *Engine) commitEpoch(epoch uint64, winners map[[32]byte][32]byte, txBytesByID map[[32]byte][]byte, parsed map[[32]byte]*pb.Tx) (map[[32]byte]struct{}, map[[32]byte]error, error) {
 	applied := make(map[[32]byte]struct{})
 	failed := make(map[[32]byte]error)
 
@@ -2410,18 +2978,85 @@ func (e *Engine) applyWinners(winners map[[32]byte][32]byte, txBytesByID map[[32
 				continue
 			}
 
-			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount); aerr != nil {
+			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
 				failed[id] = aerr
 				continue
 			}
 			applied[id] = struct{}{}
-			// log.Printf("APPLIED tx %x... acct=%x... seq=%d", id[:4], p.Account.V[:4], p.Seq)
 		}
-		return nil
+		if len(failed) > 0 {
+			return errCommitAborted
+		}
+
+		// Snapshot the post-apply frontiers + latch the flip INSIDE the same transaction: the
+		// Update sees its own uncommitted writes, so both read exactly the state the pre-P7.6
+		// post-commit calls read — now atomically with the apply.
+		if err := saveEpochFrontiersInTx(tx, epoch); err != nil {
+			return fmt.Errorf("SaveEpochFrontiers: %w", err)
+		}
+		return e.maybeLatchFlipInTx(tx, epoch)
 	})
 
+	if err != nil {
+		// Rolled back — nothing persisted, so report nothing applied.
+		applied = make(map[[32]byte]struct{})
+		if errors.Is(err, errCommitAborted) {
+			err = nil
+		}
+	}
 	return applied, failed, err
 }
+
+// noteLoopPanic records a recovered epoch-loop panic (counter + last message for /health, loud
+// CRITICAL log with the stack). The RECOVERY action — a resync that rebuilds canonical state and
+// clears the volatile pools, including any poison mempool tx — is driven by loop() on the panicked
+// return, NOT here: noteLoopPanic runs inside guardIteration's recover, and keeping it to bookkeeping
+// (no triggerResync, no pool surgery) keeps the recovery in one clean, e.mu-free-context place.
+func (e *Engine) noteLoopPanic(r any) {
+	stack := debug.Stack()
+	e.mu.Lock()
+	e.panicTotal++
+	e.lastPanic = fmt.Sprintf("epoch-loop: %v", r)
+	total := e.panicTotal
+	e.mu.Unlock()
+	log.Printf("CRITICAL: epoch-loop PANIC recovered (total=%d) — resyncing to shed any skipped-commit divergence: %v\n%s", total, r, stack)
+}
+
+// recoverBGPanic guards a background send goroutine (the gossip tick, the per-peer gossip
+// fan-out, the candidate/finalization broadcasts): deferred at the top of each. These marshal our
+// OWN data and POST it, so a panic there is an invariant break rather than hostile input — but
+// pre-P7.6 it still killed the whole process. Log it loudly, count it for /health, keep running.
+// No pool purge: senders don't consume pool bytes that could be poison (the loop's consecutive
+// counter owns that).
+func (e *Engine) recoverBGPanic(name string) {
+	if r := recover(); r != nil {
+		stack := debug.Stack()
+		e.mu.Lock()
+		e.panicTotal++
+		e.lastPanic = fmt.Sprintf("%s: %v", name, r)
+		total := e.panicTotal
+		e.mu.Unlock()
+		log.Printf("CRITICAL: %s PANIC recovered (total=%d): %v\n%s", name, total, r, stack)
+	}
+}
+
+// PanicStats surfaces the recovered-panic count + last message for /health: a node that is alive
+// but recovering (or that ever panicked) must be observable, not silent — the P7.6 goal is "never
+// silently stop making progress", and the recover guards remove the "stop"; this removes the
+// "silently".
+func (e *Engine) PanicStats() (total uint64, last string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.panicTotal, e.lastPanic
+}
+
+// EpochNow exposes the wall-clock epoch for /health (alongside LatestFinalizedEpoch, the pair
+// lets an operator see a stalled or lagging node at a glance).
+func (e *Engine) EpochNow() uint64 { return e.epochNow() }
+
+// ResyncActive exposes whether the verifying resync is in progress for /health (a resyncing node
+// legitimately lags; without this bit a lag would read as a stall).
+func (e *Engine) ResyncActive() bool { return e.resync.IsActive() }
 
 func conflictKeyHash(tx *pb.Tx) ([32]byte, bool) {
 	if tx.Account == nil || len(tx.Account.V) != 32 {
@@ -2454,11 +3089,14 @@ func (e *Engine) fetchMissingTxs(epoch uint64, missing [][32]byte) {
 		return
 	}
 
-	log.Printf("[fetch] starting: need=%d peers=%d", len(missing), len(e.cfg.Peers))
+	// P7.4: pull from the per-epoch dial list — a tx proposed ONLY by a post-flip joined banker
+	// exists only on that banker, so the epoch union is completable only if we can dial it.
+	peers := e.currentDialPeers()
+	log.Printf("[fetch] starting: need=%d peers=%d", len(missing), len(peers))
 
 	resolved := make(map[[32]byte]struct{})
 
-	for i, peer := range e.cfg.Peers {
+	for i, peer := range peers {
 		// Build list of still-missing txids
 		var still [][32]byte
 		for _, id := range missing {
@@ -2472,6 +3110,9 @@ func (e *Engine) fetchMissingTxs(epoch uint64, missing [][32]byte) {
 		}
 
 		peer = strings.TrimRight(peer, "/")
+		if !e.dialAllowed(peer) {
+			continue // cooling down (dead Fund endpoint) — don't spend a 2s timeout on it here
+		}
 		log.Printf("[fetch] trying peer=%s still_missing=%d", peer, len(still))
 
 		vid := e.cfg.Signer.PublicKeyCompressed()
@@ -2488,11 +3129,14 @@ func (e *Engine) fetchMissingTxs(epoch uint64, missing [][32]byte) {
 
 		req, _ := http.NewRequest("POST", peer+"/peer/tx/get", &buf)
 		req.Header.Set("Content-Type", "application/x-protobuf")
+		e.setAnosHeaders(req)
 		resp, err := e.cfg.HTTPClient.Do(req)
 		if err != nil || resp == nil {
+			e.recordDialResult(peer, false)
 			log.Printf("[fetch] peer=%s failed: %v", peer, err)
 			continue
 		}
+		e.recordDialResult(peer, true)
 
 		got := 0
 		func() {
@@ -2513,7 +3157,8 @@ func (e *Engine) fetchMissingTxs(epoch uint64, missing [][32]byte) {
 				if err != nil {
 					continue
 				}
-				if err := e.ReceiveGossipedTx(raw); err == nil {
+				// SOLICITED: these are txs the epoch union needs, so bypass the mempool admission caps.
+				if err := e.receiveGossipedTx(raw, true); err == nil {
 					txid, _ := crypto.TxID(tx)
 					resolved[txid] = struct{}{}
 					got++
@@ -2525,6 +3170,60 @@ func (e *Engine) fetchMissingTxs(epoch uint64, missing [][32]byte) {
 	}
 
 	log.Printf("[fetch] done: resolved=%d/%d", len(resolved), len(missing))
+}
+
+// probeBehind polls the ROSTER peers' /sync/latest (the resync anchor set — deliberately NOT the
+// dial list) with the short gossip client, and triggers a resync when a peer's committed tip is
+// beyond our intake window. Called only while presence-skipping (an idle node), so the sequential
+// 2s-bounded probes cannot delay a live epoch. This is what lets a freshly-booted non-roster
+// follower converge BEFORE anyone dials it: boot → probe → verifying resync → follow → stake.
+// Genesis cold-start safe: peers at tip 0 can never exceed latest+lag.
+//
+// triggerResync WIPES local state, so this must not fire on an implausible or already-suspect tip:
+// it applies the SAME wall-clock plausibility cap + resync blacklist pickResyncTarget uses. A lone
+// roster peer lying with a huge /sync/latest (e.g. 10^12) is therefore capped out and cannot drive
+// a wiped observer into re-downloading the chain every probe interval (a cheap griefing / livelock
+// lever on the join path). A slow LOCAL clock degrades the probe (it may not auto-fire) rather than
+// stranding — a member still resyncs via the normal finalization-mismatch path.
+func (e *Engine) probeBehind(ctx context.Context, epoch uint64) {
+	capEp := e.epochNow() + maxIntakeEpochAhead
+	best := uint64(0)
+	for _, p := range e.cfg.Peers {
+		p = strings.TrimRight(p, "/")
+		if e.resyncPeerBlacklisted(p) {
+			continue // a peer that already failed us / lied is not a trigger source
+		}
+		req, err := http.NewRequestWithContext(ctx, "GET", p+"/sync/latest", nil)
+		if err != nil {
+			continue
+		}
+		e.setAnosHeaders(req)
+		resp, err := e.cfg.HTTPClient.Do(req)
+		if err != nil || resp == nil {
+			continue
+		}
+		var out pb.SyncLatestResponse
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return
+			}
+			if e.checkAnosResponseHeader(resp.Header) != nil {
+				return
+			}
+			_ = protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out)
+		}()
+		if out.LatestEpoch > capEp {
+			continue // implausible tip (beyond wall-clock) — never trigger a destructive resync on it
+		}
+		if out.LatestEpoch > best {
+			best = out.LatestEpoch
+		}
+	}
+	if lat := e.LatestFinalizedEpoch(); best > lat+maxIntakeEpochLag {
+		e.elog(epoch, "behind-probe: roster reports committed tip %d, local tip %d — triggering resync", best, lat)
+		e.triggerResync(best, [32]byte{}, [32]byte{})
+	}
 }
 
 func (e *Engine) epochAtUnixMs(nowMs int64) uint64 {

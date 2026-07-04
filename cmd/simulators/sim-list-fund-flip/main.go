@@ -9,9 +9,9 @@
 // node. Because the match requires the full key set, the cutover is byte-identical (seamless): the
 // validators keep signing with the very same keys, so consensus never skips a beat.
 //
-//	1. BEFORE: /debug/consensus/flip reports flipped=false (manifest list drives consensus).
-//	2. Stake one banker per manifest key (>= 50k, 1-month tier), carrying that exact consensus key.
-//	3. AFTER: every node reports flipped=true, flip_epoch>0, and fund_set_size == manifest_list_size.
+//  1. BEFORE: /debug/consensus/flip reports flipped=false (manifest list drives consensus).
+//  2. Stake one banker per manifest key (>= 50k, 1-month tier), carrying that exact consensus key.
+//  3. AFTER: every node reports flipped=true, flip_epoch>0, and fund_set_size == manifest_list_size.
 //
 // The latch is one-way (a later kick can't revert it — pinned by the unit tests); the live harness
 // additionally confirms the flip survives a wipe+resync (P4.3a interim re-latch). Env:

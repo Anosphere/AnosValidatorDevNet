@@ -49,7 +49,7 @@ func applyStakeSend(t *testing.T, db *bbolt.DB, from, fromHead [32]byte, seq uin
 	}
 	raw, _ := proto.Marshal(ptx)
 	err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
 	})
 	return txid, err
 }
@@ -170,7 +170,7 @@ func TestStakeSubFloorAttestorStoredNotEligible(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("want 2 stored stakes, got %d", len(rows))
 	}
-	if IsAttestor(rows, att) {
+	if testEcon.IsAttestor(rows, att) {
 		t.Error("sub-floor attestor stake must NOT confer Attestor membership")
 	}
 }
@@ -200,7 +200,7 @@ func TestStakeRoutedAttributesToSource(t *testing.T) {
 	if rows[0].Amount != bal {
 		t.Errorf("routed stake amount = %d, want the drained balance %d", rows[0].Amount, bal)
 	}
-	if !IsAttestor(rows, source) {
+	if !testEcon.IsAttestor(rows, source) {
 		t.Error("the routed 8,000-anos attestor stake should make the SOURCE an Attestor")
 	}
 }
@@ -301,23 +301,23 @@ func TestRoleDerivations(t *testing.T) {
 	}
 
 	// floor((30000+25000)/2000) = 27; h's 1,000 → floor(1000/2000) = 0.
-	if w := GuardianWeight(rows, g); w != 27 {
-		t.Errorf("GuardianWeight(g) = %d, want 27", w)
+	if w := testEcon.GuardianWeight(rows, g); w != 27 {
+		t.Errorf("testEcon.GuardianWeight(g) = %d, want 27", w)
 	}
-	if w := GuardianWeight(rows, h); w != 0 {
-		t.Errorf("GuardianWeight(h) = %d, want 0", w)
+	if w := testEcon.GuardianWeight(rows, h); w != 0 {
+		t.Errorf("testEcon.GuardianWeight(h) = %d, want 0", w)
 	}
 	// g: banker stake 30k < 50k floor → NOT a banker; attestor 25k >= 5k → attestor.
-	if IsBanker(rows, g) {
+	if testEcon.IsBanker(rows, g) {
 		t.Error("g must NOT be a Banker (30k < 50k floor)")
 	}
-	if !IsAttestor(rows, g) {
+	if !testEcon.IsAttestor(rows, g) {
 		t.Error("g must be an Attestor (25k >= 5k floor)")
 	}
 	if got := len(StakesByRole(rows, StakedForBanker)); got != 1 {
 		t.Errorf("StakesByRole(banker) = %d rows, want 1 (the single banker-tagged stake, floor not applied here)", got)
 	}
-	if ids := BankerIdentities(rows); len(ids) != 0 {
+	if ids := testEcon.BankerIdentities(rows); len(ids) != 0 {
 		t.Errorf("BankerIdentities = %v, want none (no banker stake meets the 50k floor)", ids)
 	}
 }
@@ -353,7 +353,7 @@ func newStakeValidateFixture(t *testing.T, senderClass pb.AccountClass, seed byt
 	priv, pub := crypto.GenerateHybridKeyFromSeed([32]byte{seed})
 	tb := crypto.AccountTypeByteForClass(senderClass)
 	id := crypto.BaseAccountID(tb, pub.Encode())
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			id: {Balance: anosUnits(1_000_000), Seq: 0, Class: senderClass, AuthPubKey: pub.Encode()},
 		},

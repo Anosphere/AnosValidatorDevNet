@@ -42,7 +42,7 @@ func newTransferOpenFixture(t *testing.T) *transferOpenFixture {
 	var rid, dest [32]byte
 	rid[0], dest[0] = 0x42, 0x77
 
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
 			srcID: {
 				Seq:              fromSeq,

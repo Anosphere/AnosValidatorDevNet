@@ -1,7 +1,6 @@
 package core
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -10,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,8 +101,18 @@ func (e *Engine) runResync(ctx context.Context) error {
 
 	e.elog(mismatchEpoch, "RESYNC starting (verifying walk): peer=%s targetEpoch=%d", peer, targetEp)
 
+	// A failure past this point is attributed to the picked peer (unless WE are shutting down):
+	// blacklist it so the next attempt re-anchors elsewhere instead of re-picking the same
+	// highest-tip peer forever (P7.4 — a lying/broken peer could strand a wiped node).
+	failPeer := func(stage string, err error) {
+		if ctx.Err() == nil {
+			e.blacklistResyncPeer(peer, stage+": "+err.Error())
+		}
+	}
+
 	frontiers, err := e.fetchAllFrontiers(ctx, peer, targetEp)
 	if err != nil {
+		failPeer("frontiers", err)
 		e.setResyncError(err)
 		e.elog(targetEp, "RESYNC failed (frontiers): %v", err)
 		return err
@@ -111,6 +122,7 @@ func (e *Engine) runResync(ctx context.Context) error {
 	// txid-indexed map. No apply happens here — the verifying walk applies in epoch order below.
 	txByID, err := e.wipeAndDownloadChains(ctx, peer, targetEp, frontiers)
 	if err != nil {
+		failPeer("download", err)
 		e.setResyncError(err)
 		e.elog(targetEp, "RESYNC failed (download): %v", err)
 		return err
@@ -118,9 +130,10 @@ func (e *Engine) runResync(ctx context.Context) error {
 
 	// The epoch-ordered verifying walk: re-derives the validator-set history (and the flip) from the
 	// manifest anchor, verifying each set-change + the tip, and checks the tip frontier root. The
-	// per-epoch finalizations are fetched from the peer; the walk persists them as it goes.
-	getFins := func(ep uint64) ([]*pb.EpochFinalization, error) { return e.httpSyncFinalization(ctx, peer, ep) }
-	if err := e.verifyingWalk(ctx, targetEp, txByID, getFins); err != nil {
+	// per-epoch finalizations come from the ranged-prefetching finFetcher (per-epoch fallback for an
+	// old peer); the walk persists them in batches as it goes.
+	if err := e.verifyingWalk(ctx, targetEp, txByID, newFinFetcher(e, ctx, peer, targetEp).get); err != nil {
+		failPeer("verifying walk", err)
 		e.setResyncError(err)
 		e.elog(targetEp, "RESYNC failed (verifying walk): %v", err)
 		return err
@@ -137,7 +150,11 @@ func (e *Engine) runResync(ctx context.Context) error {
 	e.peerFinals = make(map[uint64]map[[33]byte]*pb.EpochFinalization)
 	// Drop cached per-epoch validator sets computed under the pre-resync flip state; the loop
 	// re-derives + re-caches each epoch's set from the rebuilt finalized state before any quorum read.
+	// The latest-cached fallback (P7.4 flip-aware gossip gate) is dropped with them for the same
+	// reason — until the loop re-caches, PeerMemberForEpoch falls back to the manifest set.
 	e.epochSets = make(map[uint64]map[[33]byte]*ecdsa.PublicKey)
+	e.latestEpochSet = nil
+	e.latestEpochCached = 0
 
 	e.resync = ResyncState{
 		Mode:         ResyncIdle,
@@ -177,8 +194,9 @@ func minInt(a, b int) int {
 	return b
 }
 
-// pickResyncTarget chooses the resync peer + target epoch: the peer reporting the highest
-// /sync/latest.
+// pickResyncTarget chooses the resync peer + target epoch: the highest-tip reachable, non-
+// blacklisted ROSTER peer (resync/bootstrap deliberately stays anchored to the static manifest
+// roster — a wiped node has no Fund state to derive peers from; locked P7.4 decision).
 //
 // Unlike the P4.3a interim it does NOT compute a finalization quorum against the static env list
 // here. Post-flip the real validators are the Fund-derived set, not the env list, so an env-list
@@ -187,26 +205,101 @@ func minInt(a, b int) int {
 // re-derives every epoch's set from the manifest anchor forward and verifies each set-change + the
 // tip against the prior already-trusted set. A peer that lies about its tip is rejected there (its
 // finalizations won't verify against the derived set / the tip frontier root won't match), so simply
-// picking the highest tip is safe.
+// picking the highest tip is safe for STATE — but pre-P7.4 the SAME lying peer was re-picked forever
+// (highest tip wins every retry), stranding a wiped node, and a bogus tip like 10^12 would drive the
+// walk to loop toward 10^12. Three liveness layers fix that WITHOUT a hard clock dependence that
+// could itself strand a clock-skewed node:
+//   - wall-clock cap (SOFT): epochs are anchored to GenesisUnixMs+EpochDuration, so a committed tip
+//     beyond the current wall-clock epoch (+ intake skew) is implausible. We PREFER a peer whose tip
+//     is within the cap; a lone liar is simply not preferred (an honest within-cap peer wins). We do
+//     NOT blacklist on the cap — if EVERY reachable peer is above it, that means OUR clock is slow,
+//     not that the whole roster is lying, so we fall back to the highest tip but CLAMP the target to
+//     the cap (bounding the walk against a genuine liar while still making progress). This is the fix
+//     for the clock-skew self-strand: a slow clock stays ~cap epochs behind and keeps following,
+//     never locking out (the walk has no clock dependence).
+//   - blacklist: a peer whose resync ATTEMPT failed (runResync failPeer) is skipped for a window, so
+//     the next attempt re-anchors to a different peer;
+//   - never-strand: if every candidate was skipped by the blacklist, it is cleared and the scan
+//     repeats once — the roster is the ONLY recovery path, so we rotate rather than lock out.
 func (e *Engine) pickResyncTarget(ctx context.Context, mismatchEpoch uint64) (peer string, targetEp uint64, err error) {
-	bestEp := uint64(0)
-	bestPeer := ""
-	for _, p := range e.cfg.Peers {
-		p = strings.TrimRight(p, "/")
-		ep, e2 := e.httpSyncLatest(ctx, p)
-		if e2 != nil {
-			continue
-		}
-		if ep > bestEp {
-			bestEp = ep
-			bestPeer = p
-		}
-	}
-	if bestPeer == "" {
-		return "", 0, errors.New("resync: no reachable peers")
-	}
 	_ = mismatchEpoch // the mismatch only TRIGGERS resync; we re-anchor to the peer's verified tip.
-	return bestPeer, bestEp, nil
+	for pass := 0; pass < 2; pass++ {
+		capEp := e.epochNow() + maxIntakeEpochAhead
+		bestInCap, peerInCap := uint64(0), "" // highest tip within the plausibility cap (preferred)
+		bestAny, peerAny := uint64(0), ""     // highest tip overall (fallback when OUR clock is slow)
+		skippedBlacklisted := false
+		for _, p := range e.cfg.Peers {
+			p = strings.TrimRight(p, "/")
+			if e.resyncPeerBlacklisted(p) {
+				skippedBlacklisted = true
+				continue
+			}
+			ep, e2 := e.httpSyncLatest(ctx, p)
+			if e2 != nil {
+				continue
+			}
+			if ep > bestAny {
+				bestAny, peerAny = ep, p
+			}
+			if ep <= capEp && ep > bestInCap {
+				bestInCap, peerInCap = ep, p
+			}
+		}
+		switch {
+		case peerInCap != "":
+			// Normal case: an honest peer within the plausibility cap. A lone liar (tip > cap) is
+			// ignored here, costing no resync attempt.
+			return peerInCap, bestInCap, nil
+		case peerAny != "":
+			// Every reachable peer is above the cap ⇒ almost certainly our clock is slow, not the
+			// whole roster lying. Use the highest tip but CLAMP the target to the cap so a genuine
+			// liar cannot drive an unbounded walk; the target stays a real committed epoch (< the
+			// honest tip when the clock is slow) so the walk still makes progress.
+			target := bestAny
+			if target > capEp {
+				target = capEp
+			}
+			log.Printf("[resync] all peers report a tip above the wall-clock cap %d (local clock likely slow); using %s, target clamped to %d", capEp, peerAny, target)
+			return peerAny, target, nil
+		}
+		if !skippedBlacklisted {
+			break
+		}
+		e.mu.Lock()
+		e.resyncBlacklist = make(map[string]time.Time)
+		e.mu.Unlock()
+		log.Printf("[resync] all candidate peers were blacklisted — clearing the blacklist and rescanning (never-strand)")
+	}
+	return "", 0, errors.New("resync: no reachable peers")
+}
+
+// resyncPeerBlacklisted reports (and lazily expires) a peer's resync blacklist entry.
+func (e *Engine) resyncPeerBlacklisted(peer string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	until, ok := e.resyncBlacklist[peer]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(e.resyncBlacklist, peer)
+		return false
+	}
+	return true
+}
+
+// blacklistResyncPeer skips a peer for resync target selection for resyncBlacklistWindow. Called
+// on a failed attempt attributable to the picked peer (never on our own ctx cancellation) and on a
+// provable tip lie. Liveness-only: worst case an honest peer is skipped for one window while the
+// roster rotation finds another.
+func (e *Engine) blacklistResyncPeer(peer, why string) {
+	if peer == "" {
+		return
+	}
+	e.mu.Lock()
+	e.resyncBlacklist[peer] = time.Now().Add(resyncBlacklistWindow)
+	e.mu.Unlock()
+	log.Printf("[resync] blacklisting peer %s for %s: %s", peer, resyncBlacklistWindow, why)
 }
 
 // fetchAllFrontiers pulls /sync/frontiers pages until complete.
@@ -364,6 +457,10 @@ func (e *Engine) verifyingWalk(ctx context.Context, targetEp uint64, txByID map[
 	// 1), with the manifest list as the anchor set (validatorSetForEpoch returns it while pre-flip).
 	const anchorEpoch = uint64(0)
 
+	// Persist fetched finalizations in BATCHES (P7.4): one fsynced DB transaction per epoch was the
+	// second hidden linear-in-chain-age resync cost (alongside the per-epoch fetch RTT).
+	batch := finPersistBatch{e: e}
+
 	for ep := anchorEpoch + 1; ep <= targetEp; ep++ {
 		select {
 		case <-ctx.Done():
@@ -381,7 +478,7 @@ func (e *Engine) verifyingWalk(ctx context.Context, targetEp uint64, txByID map[
 		}
 		if len(fins) > 0 {
 			// Persist so THIS node can later serve the verifying walk to others.
-			if perr := e.persistFinalizations(ep, fins); perr != nil {
+			if perr := batch.add(ep, fins); perr != nil {
 				return fmt.Errorf("persist finalization epoch %d: %w", ep, perr)
 			}
 		}
@@ -455,6 +552,9 @@ func (e *Engine) verifyingWalk(ctx context.Context, targetEp uint64, txByID map[
 				return fmt.Errorf("tip frontier root mismatch at epoch %d: have=%x want=%x", targetEp, root[:8], tipRoot[:8])
 			}
 		}
+	}
+	if err := batch.flush(); err != nil {
+		return fmt.Errorf("persist finalizations: %w", err)
 	}
 	return nil
 }
@@ -631,7 +731,7 @@ func (e *Engine) applyEpochTxids(ids [][32]byte, txByID map[[32]byte][]byte) err
 			if cid != id {
 				return fmt.Errorf("accepted txid does not match its bytes: want %x have %x", id[:8], cid[:8])
 			}
-			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount); aerr != nil {
+			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
 				return fmt.Errorf("apply accepted tx %x: %w", id[:8], aerr)
 			}
 		}
@@ -639,45 +739,202 @@ func (e *Engine) applyEpochTxids(ids [][32]byte, txByID map[[32]byte][]byte) err
 	})
 }
 
-func (e *Engine) persistFinalizations(epoch uint64, fins []*pb.EpochFinalization) error {
-	return e.cfg.DB.Update(func(tx *bbolt.Tx) error {
+// finPersistBatch accumulates the walk's fetched finalizations and writes them in a few large DB
+// transactions instead of one fsynced transaction per epoch (P7.4). A mid-walk failure loses only
+// the unflushed tail — irrelevant, since a failed resync restarts from scratch anyway.
+type finPersistBatch struct {
+	e     *Engine
+	items []finBatchItem
+	nFins int
+}
+
+type finBatchItem struct {
+	epoch uint64
+	fins  []*pb.EpochFinalization
+}
+
+const (
+	finPersistFlushEpochs = 512  // flush after this many buffered epochs...
+	finPersistFlushFins   = 8192 // ...or this many buffered finalizations, whichever first
+)
+
+func (b *finPersistBatch) add(epoch uint64, fins []*pb.EpochFinalization) error {
+	b.items = append(b.items, finBatchItem{epoch: epoch, fins: fins})
+	b.nFins += len(fins)
+	if len(b.items) >= finPersistFlushEpochs || b.nFins >= finPersistFlushFins {
+		return b.flush()
+	}
+	return nil
+}
+
+func (b *finPersistBatch) flush() error {
+	if len(b.items) == 0 {
+		return nil
+	}
+	err := b.e.cfg.DB.Update(func(tx *bbolt.Tx) error {
 		if err := ensureBuckets(tx); err != nil {
 			return err
 		}
-		for _, fin := range fins {
-			if fin == nil || fin.Signer == nil || len(fin.Signer.V) != 33 {
-				continue
-			}
-			var signerID [33]byte
-			copy(signerID[:], fin.Signer.V)
-			raw, err := proto.Marshal(fin)
-			if err != nil {
-				continue
-			}
-			if err := PutFinalization(tx, epoch, signerID, raw); err != nil {
-				return err
+		for _, it := range b.items {
+			for _, fin := range it.fins {
+				if fin == nil || fin.Signer == nil || len(fin.Signer.V) != 33 {
+					continue
+				}
+				var signerID [33]byte
+				copy(signerID[:], fin.Signer.V)
+				raw, merr := proto.Marshal(fin)
+				if merr != nil {
+					continue
+				}
+				if err := PutFinalization(tx, it.epoch, signerID, raw); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	})
+	b.items = nil
+	b.nFins = 0
+	return err
 }
 
-// ---- HTTP helpers (protobuf over protodelim) ----
+// ---- HTTP helpers (protobuf over protodelim, via the dedicated resync client) ----
+//
+// P7.4: resync has its OWN http.Client (EngineConfig.ResyncHTTPClient, NO global timeout) with a
+// per-request deadline, 429/503 Retry-After pacing, and byte-capped whole-body reads. The shared 2s
+// gossip client (cfg.HTTPClient) is untouched — 2s is right for tiny consensus messages and was the
+// P7-kickoff Correction #1 bug when reused for bulk /sync downloads. The pacing is the P7.3
+// carry-forward (a): /sync is metered for unknown sources, so a fresh (not-yet-member) node's
+// bootstrap burst must slow down on 429 instead of livelocking (the old client aborted on ANY
+// non-2xx → wipe → retry → same 429 forever).
+
+const (
+	// resyncMetaTimeout bounds one small resync request (latest / frontiers page / finalization
+	// range). resyncChainTimeout bounds one /sync/chain PAGE — pages are byte-capped server-side
+	// (P7.4), so a fixed generous per-page deadline is sound where a whole-chain deadline was not.
+	resyncMetaTimeout  = 10 * time.Second
+	resyncChainTimeout = 60 * time.Second
+
+	// resyncMaxAttempts caps 429/503 retries per request; resyncRetryAfterMax caps how long a
+	// peer's Retry-After can make us wait per attempt.
+	resyncMaxAttempts   = 5
+	resyncRetryAfterMax = 10 * time.Second
+
+	// resyncMaxRespBytes caps any single resync response body read into memory. It deliberately
+	// EXCEEDS protodelim's 4 MiB default (a 25-signer mass-send epoch's finalization set can pass
+	// 4 MiB — a latent large-epoch resync breaker); responses are peer-supplied but everything
+	// decoded from them is verified by the walk before it can affect state.
+	resyncMaxRespBytes = 64 << 20
+
+	// resyncBlacklistWindow is how long a peer that failed a resync attempt (or provably lied
+	// about its tip) is skipped by pickResyncTarget. LOCAL liveness knob.
+	resyncBlacklistWindow = 5 * time.Minute
+
+	// finRangeSpan is how many epochs one ranged /sync/finalization request asks for; the server
+	// may cover fewer (its byte budget) and says how far it got via X-Anos-Fin-Through.
+	finRangeSpan = 4096
+)
+
+// resyncResp is one fully-read resync response: the body is consumed within the request deadline
+// (so the deadline covers the whole transfer) and validated/parsed from memory afterwards.
+type resyncResp struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+// resyncDo issues one logical resync request, retrying on 429/503 with Retry-After pacing. build
+// must return a FRESH request each attempt (POST bodies are consumed on send); resyncDo stamps the
+// X-Anos-* identity headers. Any other status is returned to the caller undisturbed.
+func (e *Engine) resyncDo(ctx context.Context, timeout time.Duration, build func(ctx context.Context) (*http.Request, error)) (*resyncResp, error) {
+	for attempt := 1; ; attempt++ {
+		rr, retryAfter, err := e.resyncDoOnce(ctx, timeout, build)
+		if err != nil {
+			return nil, err
+		}
+		if (rr.status != http.StatusTooManyRequests && rr.status != http.StatusServiceUnavailable) ||
+			attempt >= resyncMaxAttempts {
+			return rr, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryAfter):
+		}
+	}
+}
+
+func (e *Engine) resyncDoOnce(ctx context.Context, timeout time.Duration, build func(ctx context.Context) (*http.Request, error)) (*resyncResp, time.Duration, error) {
+	rctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := build(rctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	e.setAnosHeaders(req)
+	resp, err := e.cfg.ResyncHTTPClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, resyncMaxRespBytes+1))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(body) > resyncMaxRespBytes {
+		return nil, 0, fmt.Errorf("resync: response exceeds %d bytes", resyncMaxRespBytes)
+	}
+	return &resyncResp{status: resp.StatusCode, header: resp.Header, body: body}, parseRetryAfter(resp.Header.Get("Retry-After")), nil
+}
+
+// parseRetryAfter reads a Retry-After seconds value (our own limiter sends "1"); default 1s,
+// capped so a hostile peer cannot park the client.
+func parseRetryAfter(v string) time.Duration {
+	d := time.Second
+	if s, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && s > 0 {
+		d = time.Duration(s) * time.Second
+	}
+	if d > resyncRetryAfterMax {
+		d = resyncRetryAfterMax
+	}
+	return d
+}
+
+// resyncCheck applies the shared response validation: 2xx + the bidirectional network-id header
+// (a wrong-network peer must be rejected BEFORE we decode its bytes, P7.2).
+func (e *Engine) resyncCheck(rr *resyncResp, what, peer string) error {
+	if rr.status < 200 || rr.status >= 300 {
+		b := rr.body
+		if len(b) > 200 {
+			b = b[:200]
+		}
+		return fmt.Errorf("%s %s: status %d body=%q", what, peer, rr.status, string(b))
+	}
+	if err := e.checkAnosResponseHeader(rr.header); err != nil {
+		return fmt.Errorf("%s %s: %w", what, peer, err)
+	}
+	return nil
+}
+
+// unmarshalDelim decodes one delimited message from a fully-read body, with the resync-side size
+// cap (protodelim's default 4 MiB would reject the large responses resyncMaxRespBytes admits).
+func unmarshalDelim(body []byte, m proto.Message) error {
+	return protodelim.UnmarshalOptions{MaxSize: resyncMaxRespBytes}.UnmarshalFrom(bytes.NewReader(body), m)
+}
 
 func (e *Engine) httpSyncLatest(ctx context.Context, peer string) (uint64, error) {
 	peer = strings.TrimRight(peer, "/")
-	req, _ := http.NewRequestWithContext(ctx, "GET", peer+"/sync/latest", nil)
-	resp, err := e.cfg.HTTPClient.Do(req)
+	rr, err := e.resyncDo(ctx, resyncMetaTimeout, func(c context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(c, "GET", peer+"/sync/latest", nil)
+	})
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("sync/latest %s: %s body=%q", peer, resp.Status, string(b))
+	if err := e.resyncCheck(rr, "sync/latest", peer); err != nil {
+		return 0, err
 	}
 	var out pb.SyncLatestResponse
-	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {
+	if err := unmarshalDelim(rr.body, &out); err != nil {
 		return 0, err
 	}
 	return out.LatestEpoch, nil
@@ -686,21 +943,114 @@ func (e *Engine) httpSyncLatest(ctx context.Context, peer string) (uint64, error
 func (e *Engine) httpSyncFinalization(ctx context.Context, peer string, epoch uint64) ([]*pb.EpochFinalization, error) {
 	peer = strings.TrimRight(peer, "/")
 	url := fmt.Sprintf("%s/sync/finalization?epoch=%d", peer, epoch)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := e.cfg.HTTPClient.Do(req)
+	rr, err := e.resyncDo(ctx, resyncMetaTimeout, func(c context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(c, "GET", url, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("sync/finalization %s: %s body=%q", peer, resp.Status, string(b))
+	if err := e.resyncCheck(rr, "sync/finalization", peer); err != nil {
+		return nil, err
 	}
 	var out pb.SyncFinalizationResponse
-	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {
+	if err := unmarshalDelim(rr.body, &out); err != nil {
 		return nil, err
 	}
 	return out.Finalizations, nil
+}
+
+// errRangedUnsupported marks a peer that predates the P7.4 ranged /sync/finalization form (its
+// handler 400s on a missing ?epoch=, or it doesn't stamp X-Anos-Fin-Through). The caller falls
+// back to the historical per-epoch fetch — mixed-version interop, no flag day.
+var errRangedUnsupported = errors.New("resync: peer does not support ranged /sync/finalization")
+
+// httpSyncFinalizationRange fetches finalizations for epochs [from..to] in ONE request. The server
+// returns whole epochs up to its byte budget and stamps the last covered epoch in
+// X-Anos-Fin-Through; each finalization self-describes its epoch (proto-clean, no new message).
+// Returns the finalizations grouped by epoch plus `through` (>= from on success).
+func (e *Engine) httpSyncFinalizationRange(ctx context.Context, peer string, from, to uint64) (map[uint64][]*pb.EpochFinalization, uint64, error) {
+	peer = strings.TrimRight(peer, "/")
+	url := fmt.Sprintf("%s/sync/finalization?from=%d&to=%d", peer, from, to)
+	rr, err := e.resyncDo(ctx, resyncMetaTimeout, func(c context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(c, "GET", url, nil)
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if rr.status == http.StatusBadRequest || rr.status == http.StatusNotFound {
+		return nil, 0, errRangedUnsupported
+	}
+	if err := e.resyncCheck(rr, "sync/finalization(range)", peer); err != nil {
+		return nil, 0, err
+	}
+	through, perr := strconv.ParseUint(strings.TrimSpace(rr.header.Get(HeaderFinThrough)), 10, 64)
+	if perr != nil || through < from || through > to {
+		// Missing/nonsense coverage marker: treat as an old/odd peer, not a fatal error.
+		return nil, 0, errRangedUnsupported
+	}
+	var out pb.SyncFinalizationResponse
+	if err := unmarshalDelim(rr.body, &out); err != nil {
+		return nil, 0, err
+	}
+	byEp := make(map[uint64][]*pb.EpochFinalization)
+	for _, f := range out.Finalizations {
+		if f == nil || f.Epoch < from || f.Epoch > through {
+			continue // out-of-range entries are ignored (defensive; the walk verifies content anyway)
+		}
+		byEp[f.Epoch] = append(byEp[f.Epoch], f)
+	}
+	return byEp, through, nil
+}
+
+// finFetcher feeds verifyingWalk's ascending per-epoch finalization reads, prefetching RANGED
+// pages when the peer supports them and transparently falling back to the per-epoch fetch when it
+// doesn't. Consumed entries are deleted, bounding memory to ~one server page. This removes the
+// 1-RTT-per-epoch cost that made resync duration scale linearly with chain AGE (~17k epochs/day
+// at 5s epochs) — the P7.4 replacement for the once-mooted batch endpoint, with no proto change.
+type finFetcher struct {
+	e        *Engine
+	ctx      context.Context
+	peer     string
+	targetEp uint64
+	ranged   bool
+	cache    map[uint64][]*pb.EpochFinalization
+	through  uint64 // highest epoch covered by fetched ranges (0 = nothing fetched yet)
+}
+
+func newFinFetcher(e *Engine, ctx context.Context, peer string, targetEp uint64) *finFetcher {
+	return &finFetcher{e: e, ctx: ctx, peer: peer, targetEp: targetEp, ranged: true,
+		cache: make(map[uint64][]*pb.EpochFinalization)}
+}
+
+func (f *finFetcher) get(ep uint64) ([]*pb.EpochFinalization, error) {
+	for f.ranged && f.through < ep {
+		from := f.through + 1
+		if from < ep {
+			from = ep // the walk consumes ascending; anything below ep was already served
+		}
+		to := from + finRangeSpan - 1
+		if to > f.targetEp {
+			to = f.targetEp
+		}
+		byEp, through, err := f.e.httpSyncFinalizationRange(f.ctx, f.peer, from, to)
+		if errors.Is(err, errRangedUnsupported) {
+			f.ranged = false
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range byEp {
+			f.cache[k] = v
+		}
+		f.through = through // >= from (validated) → guaranteed progress, no spin
+	}
+	if f.ranged {
+		fins := f.cache[ep]
+		delete(f.cache, ep)
+		return fins, nil
+	}
+	return f.e.httpSyncFinalization(f.ctx, f.peer, ep)
 }
 
 func (e *Engine) httpSyncFrontiers(ctx context.Context, peer string, epoch uint64, cursor [32]byte, limit int) (*pb.SyncFrontiersResponse, error) {
@@ -709,49 +1059,97 @@ func (e *Engine) httpSyncFrontiers(ctx context.Context, peer string, epoch uint6
 	if cursor != ([32]byte{}) {
 		url += "&cursor=" + hex.EncodeToString(cursor[:])
 	}
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := e.cfg.HTTPClient.Do(req)
+	rr, err := e.resyncDo(ctx, resyncMetaTimeout, func(c context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(c, "GET", url, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("sync/frontiers %s: %s body=%q", peer, resp.Status, string(b))
+	if err := e.resyncCheck(rr, "sync/frontiers", peer); err != nil {
+		return nil, err
 	}
 	var out pb.SyncFrontiersResponse
-	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {
+	if err := unmarshalDelim(rr.body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-func (e *Engine) httpSyncChain(ctx context.Context, peer string, acct [32]byte, targetHead [32]byte, have [32]byte, max int) ([][]byte, bool, error) {
+// httpSyncChain downloads an account chain from targetHead back to `have`, PAGING through the
+// server's byte-budgeted responses (P7.4): a page that stops early (reachedHave=false, non-empty)
+// is continued from the last returned tx's prev, using only the existing request fields. maxTotal
+// bounds the total blocks across pages (the pre-P7.4 MaxBlocks semantics). This is what lets a
+// long chain download survive both the old whole-body deadline and protodelim's 4 MiB read cap.
+func (e *Engine) httpSyncChain(ctx context.Context, peer string, acct [32]byte, targetHead [32]byte, have [32]byte, maxTotal int) ([][]byte, bool, error) {
 	peer = strings.TrimRight(peer, "/")
-	reqMsg := &pb.SyncChainRequest{
-		Account:    &pb.AccountId{V: acct[:]},
-		TargetHead: &pb.Hash32{V: targetHead[:]},
-		MaxBlocks:  uint32(max),
+	var all [][]byte
+	cur := targetHead
+	for {
+		remain := maxTotal - len(all)
+		if remain <= 0 {
+			return all, false, nil // total-block cap without reaching the boundary (caller errors)
+		}
+		txs, reached, err := e.httpSyncChainPage(ctx, peer, acct, cur, have, remain)
+		if err != nil {
+			return nil, false, err
+		}
+		all = append(all, txs...)
+		if reached {
+			return all, true, nil
+		}
+		if len(txs) == 0 {
+			return all, false, nil // no progress and no boundary — stop (caller errors)
+		}
+		// Continue from the tail tx's prev. Progress guard: a zero prev (chain base without the
+		// boundary) or a non-advancing prev means the peer cannot take us further — stop rather
+		// than loop.
+		last, perr := ParseTx(txs[len(txs)-1])
+		if perr != nil {
+			return nil, false, fmt.Errorf("resync: parse page tail: %w", perr)
+		}
+		if last.Prev == nil || len(last.Prev.V) != 32 {
+			return all, false, nil
+		}
+		var prev [32]byte
+		copy(prev[:], last.Prev.V)
+		if prev == ([32]byte{}) || prev == cur {
+			return all, false, nil
+		}
+		cur = prev
 	}
-	if have != ([32]byte{}) {
-		reqMsg.Have = &pb.Hash32{V: have[:]}
-	}
-	var buf bytes.Buffer
-	_, _ = protodelim.MarshalTo(&buf, reqMsg)
+}
 
-	req, _ := http.NewRequestWithContext(ctx, "POST", peer+"/sync/chain", &buf)
-	req.Header.Set("Content-Type", "application/x-protobuf")
-	resp, err := e.cfg.HTTPClient.Do(req)
+// httpSyncChainPage is one /sync/chain request (the pre-P7.4 whole call, now with a per-page
+// deadline and a fresh POST body per 429 retry).
+func (e *Engine) httpSyncChainPage(ctx context.Context, peer string, acct [32]byte, targetHead [32]byte, have [32]byte, max int) ([][]byte, bool, error) {
+	rr, err := e.resyncDo(ctx, resyncChainTimeout, func(c context.Context) (*http.Request, error) {
+		reqMsg := &pb.SyncChainRequest{
+			Account:    &pb.AccountId{V: acct[:]},
+			TargetHead: &pb.Hash32{V: targetHead[:]},
+			MaxBlocks:  uint32(max),
+		}
+		if have != ([32]byte{}) {
+			reqMsg.Have = &pb.Hash32{V: have[:]}
+		}
+		var buf bytes.Buffer
+		if _, err := protodelim.MarshalTo(&buf, reqMsg); err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(c, "POST", peer+"/sync/chain", &buf)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		return req, nil
+	})
 	if err != nil {
 		return nil, false, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, false, fmt.Errorf("sync/chain %s: %s body=%q", peer, resp.Status, string(b))
+	if err := e.resyncCheck(rr, "sync/chain", peer); err != nil {
+		return nil, false, err
 	}
 	var out pb.SyncChainResponse
-	if err := protodelim.UnmarshalFrom(bufio.NewReader(resp.Body), &out); err != nil {
+	if err := unmarshalDelim(rr.body, &out); err != nil {
 		return nil, false, err
 	}
 

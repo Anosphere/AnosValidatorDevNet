@@ -36,7 +36,7 @@ func newGuardian(seed byte) *tGuardian {
 }
 
 // guardianStake returns a StakeRow giving `g` `anos` whole-anos of 1-year stake (so
-// GuardianWeight(g) = floor(anos/2000)).
+// testEcon.GuardianWeight(g) = floor(anos/2000)).
 func guardianStake(g *tGuardian, depositSeed byte, whoAnos uint64) StakeRow {
 	return StakeRow{
 		DepositTxid: [32]byte{depositSeed},
@@ -92,7 +92,7 @@ func signFundSend(tx *pb.Tx, signers []*tGuardian) {
 // snapWithGuardians builds a Snapshot whose Accounts carry each guardian's auth pubkey, whose
 // FundStakeRows give the stated weights, and whose GuardianActiveWeight is M.
 func snapWithGuardians(fund, fundHead [32]byte, fundSeq uint64, rows []StakeRow, M uint64, gs ...*tGuardian) *Snapshot {
-	snap := &Snapshot{
+	snap := &Snapshot{Econ: testEcon,
 		Accounts:             map[[32]byte]AccountSnap{},
 		Receivables:          map[[32]byte]ReceivableSnap{},
 		Epoch:                100,
@@ -119,8 +119,8 @@ func TestGuardianQuorumThreshold(t *testing.T) {
 		{100, 70},
 	}
 	for _, c := range cases {
-		if got := GuardianQuorumThreshold(c.M); got != c.want {
-			t.Errorf("GuardianQuorumThreshold(%d) = %d, want %d", c.M, got, c.want)
+		if got := testEcon.GuardianQuorumThreshold(c.M); got != c.want {
+			t.Errorf("testEcon.GuardianQuorumThreshold(%d) = %d, want %d", c.M, got, c.want)
 		}
 	}
 }
@@ -140,13 +140,13 @@ func TestActiveGuardianWeight(t *testing.T) {
 		{GuardianID: g3.id, LastActiveEpoch: 79},  // 100-79=21 > 20 → expired
 	}
 	// Only g1 (4) + g2 (3) are active = 7. g3 expired. (g3's weight 1 excluded.)
-	if got := ActiveGuardianWeight(rows, active, epoch, window); got != 7 {
+	if got := testEcon.ActiveGuardianWeight(rows, active, epoch, window); got != 7 {
 		t.Errorf("ActiveGuardianWeight = %d, want 7 (g1+g2 active, g3 expired)", got)
 	}
 	// A "lastActive" row for a now-non-Guardian (no stake) contributes 0.
 	stranger := newGuardian(9)
 	active = append(active, GuardianActiveRow{GuardianID: stranger.id, LastActiveEpoch: 100})
-	if got := ActiveGuardianWeight(rows, active, epoch, window); got != 7 {
+	if got := testEcon.ActiveGuardianWeight(rows, active, epoch, window); got != 7 {
 		t.Errorf("ActiveGuardianWeight with non-Guardian active row = %d, want 7", got)
 	}
 }
@@ -341,7 +341,7 @@ func applyFundSend(t *testing.T, db *bbolt.DB, tx *pb.Tx, txid [32]byte) error {
 	t.Helper()
 	raw, _ := proto.Marshal(tx)
 	return db.Update(func(btx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: btx}, raw, tx, txid, testFund)
+		return ApplyTx(&bboltTxView{tx: btx}, raw, tx, txid, testFund, testEcon)
 	})
 }
 
@@ -590,14 +590,14 @@ func TestValidateFundSendEndToEnd(t *testing.T) {
 
 	// fund_send_epoch too stale (self-exclude-from-M attack) → rejected.
 	staleSnap := snapWithGuardians(fund, fundHead, 1, rows, 7, g1, g2)
-	staleSnap.Epoch = 100 + guardianFundSendEpochSlackEpochs + 5
+	staleSnap.Epoch = 100 + testEcon.GuardianFundSendEpochSlackEpochs + 5
 	stale := buildFundSend(fund, fundHead, 2, [32]byte{0x42}, anosUnits(10), 100, []*tGuardian{g1, g2})
 	if _, err := ValidateTxAgainstSnapshot(stale, staleSnap); err == nil {
 		t.Error("Fund SEND with stale fund_send_epoch accepted (self-exclusion vector)")
 	}
 	// ...but within the slack it is accepted.
 	freshSnap := snapWithGuardians(fund, fundHead, 1, rows, 7, g1, g2)
-	freshSnap.Epoch = 100 + guardianFundSendEpochSlackEpochs
+	freshSnap.Epoch = 100 + testEcon.GuardianFundSendEpochSlackEpochs
 	fresh := buildFundSend(fund, fundHead, 2, [32]byte{0x42}, anosUnits(10), 100, []*tGuardian{g1, g2})
 	if _, err := ValidateTxAgainstSnapshot(fresh, freshSnap); err != nil {
 		t.Errorf("Fund SEND at the staleness boundary rejected: %v", err)

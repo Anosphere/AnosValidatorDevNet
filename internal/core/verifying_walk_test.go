@@ -246,14 +246,18 @@ func newWalkTestEngine(t *testing.T, vs []*tValidator) *Engine {
 	var genesis, fund [32]byte
 	genesis[0], fund[0] = 0xAA, 0xFD
 	e, err := NewEngine(EngineConfig{
-		DB:                db,
-		Signer:            NewLocalP256Signer(vs[0].priv), // a manifest member, satisfies NewEngine
-		ValidatorSet:      set,
-		GenesisUnixMs:     1,
-		GenesisAccount:    genesis,
-		GenesisSupply:     1_000_000_000,
-		GenesisAuthPubKey: make([]byte, crypto.HybridPubKeySize), // never spent in these tests
-		FundAccount:       fund,
+		DB:                        db,
+		Signer:                    NewLocalP256Signer(vs[0].priv), // a manifest member, satisfies NewEngine
+		ValidatorSet:              set,
+		GenesisUnixMs:             1,
+		GenesisAccount:            genesis,
+		GenesisSupply:             1_000_000_000,
+		GenesisAuthPubKey:         make([]byte, crypto.HybridPubKeySize), // never spent in these tests
+		FundAccount:               fund,
+		QuorumPercent:             80,
+		FinalizationQuorumPercent: 60,
+		MaxCandidateScanPerSlot:   64,
+		Econ:                      testEcon, // manifest-pinned economics (P7.2); NewEngine fails closed without it
 	})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)

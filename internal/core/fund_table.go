@@ -58,36 +58,16 @@ const (
 	StakedForAttestor = "attestor"
 )
 
-// Anos-side stake floors + the Guardian derivation divisor (governance constants;
-// spec-19 §5, working notes §3.6). These are INTERPRETATION thresholds applied when
-// deriving roles from the table — NOT deposit-acceptance gates: a sub-floor or
-// unknown-tag stake is stored, never rejected (the deposit path never inspects these).
-// Amounts are in whole anos; the table stores amounts in base units, so each is scaled by
-// UnitsPerAnos at comparison time.
-//
-// v1 hardcodes them. They become consensus-critical once P2.3/P3.2/P4 consume the derived
-// memberships to gate Fund SENDs / releases / the validator set, so P7's network manifest
-// must content-address + pin them (like EPOCH_MS / the delay constants).
-const (
-	bankerStakeFloorAnos   uint64 = 50_000
-	attestorStakeFloorAnos uint64 = 5_000
-	// Every 2000 anos locked for one year confers one Guardian signature toward Fund SENDs.
-	guardianDivisorAnos uint64 = 2_000
-	// GuardianSendThresholdBps is the fraction (in basis points) of the ACTIVE Guardian
-	// signature weight a Fund SEND must collect to pass (spec-19 §6.2): 7000 bps = 70%.
-	// Consensus-critical (gates every Fund outflow); P7's manifest must pin it like the
-	// floors/divisor above. The pass test is approved >= ceil(bps/10000 * activeWeight).
-	GuardianSendThresholdBps uint64 = 7_000
-	// guardianFundSendEpochSlackEpochs bounds how STALE a Fund SEND's fund_send_epoch may be
-	// relative to the finalizing epoch (the upper bound is "not in the future"). It exists to
-	// stop a Guardian from stamping an ancient epoch to self-exclude from the active denominator
-	// M while still counting toward N (spec-19 §6.2; see the validate gate). It must be small
-	// relative to GUARDIAN_ACTIVE_WINDOW_EPOCHS (so a recently-stamped signer stays well inside
-	// the active window) yet comfortably larger than normal finalization lag (so a legitimate
-	// send is not rejected before it can win). Consensus-critical; P7's manifest must pin it and
-	// enforce slack < window.
-	guardianFundSendEpochSlackEpochs uint64 = 8
-)
+// The Anos-side stake floors (banker 50k / attestor 5k), the Guardian derivation divisor
+// (2000), the Fund-SEND pass threshold (7000 bps = 70%), and the fund-send epoch slack (8) are
+// consensus-critical governance scalars. They are NOT deposit-acceptance gates — a sub-floor or
+// unknown-tag stake is stored, never rejected — but INTERPRETATION thresholds applied when
+// deriving roles from the table (amounts in whole anos, scaled by UnitsPerAnos at comparison).
+// P7.2 moved them out of Go consts and INTO the network manifest: they now live on the Economics
+// value carried by the Snapshot / EngineConfig, so a differently-tuned network is a different
+// network_id rather than a silent fork. The role derivations below are therefore methods on
+// Economics (they read ec.BankerStakeFloorAnos etc.), and the fund-send slack is read off
+// snap.Econ.GuardianFundSendEpochSlackEpochs in the validator.
 
 // StakeRecord is one stake deposit in the reference table (the value stored under a
 // deposit_txid key). StakerID is the staking IDENTITY — the original owner. For a stake
@@ -245,23 +225,23 @@ func roleEligible(rows []StakeRow, id [32]byte, tag string, floorAnos uint64) bo
 }
 
 // IsAttestor reports whether `id` is a current Attestor: ≥1 active Attestor-tagged stake
-// ≥ 5,000 anos (spec-19 §5, §6.1).
-func IsAttestor(rows []StakeRow, id [32]byte) bool {
-	return roleEligible(rows, id, StakedForAttestor, attestorStakeFloorAnos)
+// ≥ the manifest attestor floor (5,000 anos on the current net; spec-19 §5, §6.1).
+func (ec Economics) IsAttestor(rows []StakeRow, id [32]byte) bool {
+	return roleEligible(rows, id, StakedForAttestor, ec.AttestorStakeFloorAnos)
 }
 
-// IsBanker reports whether `id` is a current Banker: ≥1 active Banker-tagged stake
-// ≥ 50,000 anos (the validator-set membership predicate; consensus key + endpoint are
-// mutable attributes layered on in P4).
-func IsBanker(rows []StakeRow, id [32]byte) bool {
-	return roleEligible(rows, id, StakedForBanker, bankerStakeFloorAnos)
+// IsBanker reports whether `id` is a current Banker: ≥1 active Banker-tagged stake ≥ the
+// manifest banker floor (50,000 anos on the current net; the validator-set membership
+// predicate; consensus key + endpoint are mutable attributes layered on in P4).
+func (ec Economics) IsBanker(rows []StakeRow, id [32]byte) bool {
+	return roleEligible(rows, id, StakedForBanker, ec.BankerStakeFloorAnos)
 }
 
-// GuardianWeight returns floor(Σ id's ACTIVE 1-year stake / 2000 anos) — the number of
-// Guardian signatures the identity contributes toward a Fund SEND (spec-19 §5, §6.2). Any
-// stake locked for one year counts toward the sum regardless of its staked_for tag; 1-month
-// stakes confer none. ≥1 ⇒ the identity is a Guardian.
-func GuardianWeight(rows []StakeRow, id [32]byte) uint64 {
+// GuardianWeight returns floor(Σ id's ACTIVE 1-year stake / divisor) — the number of Guardian
+// signatures the identity contributes toward a Fund SEND (spec-19 §5, §6.2; divisor = 2000 anos
+// on the current net). Any stake locked for one year counts toward the sum regardless of its
+// staked_for tag; 1-month stakes confer none. ≥1 ⇒ the identity is a Guardian.
+func (ec Economics) GuardianWeight(rows []StakeRow, id [32]byte) uint64 {
 	var sumUnits uint64
 	for _, s := range rows {
 		if s.Status == StakeStatusActive && s.StakerID == id &&
@@ -269,7 +249,7 @@ func GuardianWeight(rows []StakeRow, id [32]byte) uint64 {
 			sumUnits += s.Amount
 		}
 	}
-	return sumUnits / (guardianDivisorAnos * UnitsPerAnos)
+	return sumUnits / (ec.GuardianDivisorAnos * UnitsPerAnos)
 }
 
 // StakesByRole returns every active stake carrying the given tag (the enumerate-by-role
@@ -289,10 +269,10 @@ func StakesByRole(rows []StakeRow, tag string) []StakeRow {
 // §P4.1): the distinct identities that currently qualify as Bankers (active Banker stake
 // ≥ floor), sorted. P4 resolves each identity's mutable consensus key + endpoint and
 // deterministic activation; P2.2 only projects membership.
-func BankerIdentities(rows []StakeRow) [][32]byte {
+func (ec Economics) BankerIdentities(rows []StakeRow) [][32]byte {
 	seen := make(map[[32]byte]struct{})
 	var out [][32]byte
-	floorUnits := bankerStakeFloorAnos * UnitsPerAnos
+	floorUnits := ec.BankerStakeFloorAnos * UnitsPerAnos
 	for _, s := range rows {
 		if s.Status != StakeStatusActive || s.StakedFor != StakedForBanker || s.Amount < floorUnits {
 			continue
@@ -387,13 +367,13 @@ func isGuardianActive(lastActive, epoch, window uint64) bool {
 // `window` at `epoch`. Weight is recomputed from `rows` each call, so a Guardian whose 1-yr
 // stake later dropped below the floor (weight 0) stops contributing even while still "active".
 // Pure over its inputs → identical on every validator that built the same finalized snapshot.
-func ActiveGuardianWeight(rows []StakeRow, active []GuardianActiveRow, epoch, window uint64) uint64 {
+func (ec Economics) ActiveGuardianWeight(rows []StakeRow, active []GuardianActiveRow, epoch, window uint64) uint64 {
 	var sum uint64
 	for _, g := range active {
 		if !isGuardianActive(g.LastActiveEpoch, epoch, window) {
 			continue
 		}
-		sum += GuardianWeight(rows, g.GuardianID)
+		sum += ec.GuardianWeight(rows, g.GuardianID)
 	}
 	return sum
 }
@@ -403,8 +383,8 @@ func ActiveGuardianWeight(rows []StakeRow, active []GuardianActiveRow, epoch, wi
 // weight is 0 (genesis / fully-dormant window) this is 0, so the separate N>=1 floor in the
 // verifier governs — the first Fund SEND is authorized by any single eligible Guardian
 // (self-bootstrapping; no genesis seed).
-func GuardianQuorumThreshold(activeWeight uint64) uint64 {
-	return (activeWeight*GuardianSendThresholdBps + 9_999) / 10_000
+func (ec Economics) GuardianQuorumThreshold(activeWeight uint64) uint64 {
+	return (activeWeight*ec.GuardianSendThresholdBps + 9_999) / 10_000
 }
 
 // --- Banker validator-descriptor projection (BBankerInfo, spec-18 §3.7, build-plan §P4.1) ---
@@ -543,10 +523,10 @@ type ValidatorDescriptor struct {
 // stake rows + the descriptor projection) → identical on every validator that built the same
 // finalized snapshot. In P4.1 this is exposed read-only (the env list still drives live consensus);
 // P4.3 switches the live set source to it at the latching list→Fund flip.
-func BankerValidatorSet(rows []StakeRow, infos []BankerInfo) []ValidatorDescriptor {
+func (ec Economics) BankerValidatorSet(rows []StakeRow, infos []BankerInfo) []ValidatorDescriptor {
 	var out []ValidatorDescriptor
 	for _, bi := range infos {
-		if !IsBanker(rows, bi.Identity) || !crypto.ValidCompressedP256(bi.ConsensusKey) {
+		if !ec.IsBanker(rows, bi.Identity) || !crypto.ValidCompressedP256(bi.ConsensusKey) {
 			continue
 		}
 		var vd ValidatorDescriptor

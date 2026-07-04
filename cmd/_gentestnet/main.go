@@ -6,13 +6,15 @@
 // The dir is underscore-prefixed so `go build ./...` ignores it (like cmd/_livesetup).
 //
 // Usage (real 5-VM testnet, one shared port):
-//   go run ./cmd/_gentestnet \
-//     -endpoints 35.234.70.37:30303,34.159.203.177:30303,34.107.74.229:30303,35.242.233.86:30303,35.234.117.219:30303 \
-//     -manifest-out config/testnet.json -secrets-dir ../deploy-bundles
+//
+//	go run ./cmd/_gentestnet \
+//	  -endpoints 35.234.70.37:30303,34.159.203.177:30303,34.107.74.229:30303,35.242.233.86:30303,35.234.117.219:30303 \
+//	  -manifest-out config/testnet.json -secrets-dir ../deploy-bundles
 //
 // Usage (localhost identity test, distinct ports on one host):
-//   go run ./cmd/_gentestnet -endpoints 127.0.0.1:30303,127.0.0.1:30304,127.0.0.1:30305 \
-//     -manifest-out /tmp/localnet.json -secrets-dir /tmp/localsecrets
+//
+//	go run ./cmd/_gentestnet -endpoints 127.0.0.1:30303,127.0.0.1:30304,127.0.0.1:30305 \
+//	  -manifest-out /tmp/localnet.json -secrets-dir /tmp/localsecrets
 //
 // To REPRODUCE the same genesis on a later run, pass -genesis-seed <hex> and
 // -genesis-unix-ms <ms> (both echoed to the secrets bundle on the first run). Genesis
@@ -48,9 +50,9 @@ func main() {
 	genesisSeedHex := flag.String("genesis-seed", "", "optional 32-byte hex seed to reproduce a fixed genesis (default: fresh)")
 	genesisUnixMs := flag.Int64("genesis-unix-ms", 0, "optional fixed genesis timestamp ms (default: now)")
 	supply := flag.Uint64("supply-units", 1_000_000_000_000_000, "genesis supply units (1e9 Anos @ 1e6 units)")
-	networkID := flag.String("network-id", "", "optional network id (left empty for this hand-rolled precursor; P7 fills it)")
 
-	// Consensus timing/economics — defaults mirror the proven short TEST values.
+	// Consensus timing/economics — defaults mirror the proven short TEST values. (network_id is
+	// COMPUTED from the canonical manifest below, not a flag — P7.2.)
 	epochMs := flag.Int64("epoch-ms", 2000, "epoch duration in ms")
 	timelocked := flag.Uint64("timelocked-delay-epochs", 6, "")
 	guardianWin := flag.Uint64("guardian-active-window-epochs", 20, "")
@@ -120,9 +122,9 @@ func main() {
 
 	fundHex := strings.Repeat("ff", 32)
 	m := config.Manifest{
-		Version:        config.SupportedVersion,
-		NetworkID:      *networkID,
-		FundAccountHex: fundHex,
+		Version:         config.SupportedVersion,
+		ProtocolVersion: config.SupportedProtocolVersion,
+		FundAccountHex:  fundHex,
 		Timing: config.Timing{
 			EpochMs:                      *epochMs,
 			TimelockedDelayEpochs:        *timelocked,
@@ -135,6 +137,24 @@ func main() {
 			EscrowAttestationDelayEpochs: *escrowDelay,
 			BreakglassExtraEpochs:        *breakglass,
 		},
+		// Canonical production economics + consensus tuning (network-invariant; matches the core
+		// client-side consts so a sim's fee matches a validator's).
+		Economics: config.Economics{
+			MinFee:                           1_000,
+			MaxFee:                           3_000_000,
+			AttestedEscrowFee:                100_000,
+			FeeBps:                           50,
+			BankerStakeFloorAnos:             50_000,
+			AttestorStakeFloorAnos:           5_000,
+			GuardianDivisorAnos:              2_000,
+			GuardianSendThresholdBps:         7_000,
+			GuardianFundSendEpochSlackEpochs: 8,
+		},
+		Consensus: config.Consensus{
+			QuorumPercent:             80,
+			FinalizationQuorumPercent: 60,
+			MaxCandidateScanPerSlot:   64,
+		},
 		Genesis: config.Genesis{
 			Hex:           hex.EncodeToString(genID[:]),
 			AuthPubkeyHex: hex.EncodeToString(genPub.Encode()),
@@ -146,6 +166,13 @@ func main() {
 	if err := m.Validate(); err != nil {
 		log.Fatalf("generated manifest failed validation: %v", err)
 	}
+	// Content-address the manifest so the shipped config carries its network_id (a tripwire against a
+	// later hand-edit that forgets to recompute it).
+	id, err := config.ComputeNetworkID(&m)
+	if err != nil {
+		log.Fatalf("compute network_id: %v", err)
+	}
+	m.NetworkID = id
 
 	out, err := json.MarshalIndent(&m, "", "  ")
 	if err != nil {

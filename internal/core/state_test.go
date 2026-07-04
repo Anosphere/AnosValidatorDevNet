@@ -30,9 +30,9 @@ func accountRecordEqual(a, b AccountRecord) bool {
 
 func sampleTransferRecord() AccountRecord {
 	r := AccountRecord{
-		Balance: 123456,
-		Seq:     7,
-		Class:   pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
+		Balance:        123456,
+		Seq:            7,
+		Class:          pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
 		TransferUnlock: 999,
 		TransferFlags:  0x01,
 	}

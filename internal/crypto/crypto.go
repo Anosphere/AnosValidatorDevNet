@@ -2,7 +2,6 @@ package crypto
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -21,7 +20,6 @@ var (
 	domainTxSignable     = []byte("ANOSv2-TxSignable\x00")
 	domainReceivable     = []byte("ANOSv2-Receivable\x00")
 	domainFeeReceivable  = []byte("ANOSv2-FeeReceivable\x00")
-	domainCandidates     = []byte("ANOSv2-Candidates\x00")
 	domainStakeOwnerAuth = []byte("ANOSv2-StakeOwnerAuth\x00")
 )
 
@@ -541,35 +539,6 @@ func CandidatesListHash(sortedTxIDs [][32]byte) [32]byte {
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
-}
-
-// CandidatesSignBytes returns bytes to sign: domain || epoch(u64 LE) || validatorID(32) || listHash(32).
-func CandidatesSignBytes(epoch uint64, validatorID [32]byte, listHash [32]byte) []byte {
-	buf := make([]byte, 0, len(domainCandidates)+8+32+32)
-	buf = append(buf, domainCandidates...)
-	var u64 [8]byte
-	binary.LittleEndian.PutUint64(u64[:], epoch)
-	buf = append(buf, u64[:]...)
-	buf = append(buf, validatorID[:]...)
-	buf = append(buf, listHash[:]...)
-	return buf
-}
-
-// VerifyCandidatesSig verifies candidate list signature.
-func VerifyCandidatesSig(pub ed25519.PublicKey, epoch uint64, validatorID [32]byte, listHash [32]byte, sig []byte) bool {
-	if len(pub) != 32 || len(sig) != 64 {
-		return false
-	}
-	sb := CandidatesSignBytes(epoch, validatorID, listHash)
-	h := Hash32(sb)
-	return ed25519.Verify(pub, h[:], sig)
-}
-
-// SignCandidates signs candidate list payload.
-func SignCandidates(priv ed25519.PrivateKey, epoch uint64, validatorID [32]byte, listHash [32]byte) []byte {
-	sb := CandidatesSignBytes(epoch, validatorID, listHash)
-	h := Hash32(sb)
-	return ed25519.Sign(priv, h[:])
 }
 
 // LexSortTxIDs sorts txids lexicographically in-place.

@@ -1,0 +1,51 @@
+# Builds and publishes a validator release whenever a version tag (vX.Y.Z) is pushed.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# It cross-compiles the validator for linux/amd64 + linux/arm64 (static, no cgo), attaches the
+# network manifest (config/testnet.json) so the binary and its config are version-locked together,
+# writes a SHA256SUMS over all three, and creates the GitHub Release with those assets. Runs on
+# GitHub's runners, so no local Go toolchain or credentials are needed — only the ability to push a tag.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write        # required to create the release + upload assets (uses the built-in GITHUB_TOKEN)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # build with exactly the Go version the module declares
+
+      - name: Build binaries + assemble assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w" -o "dist/validator-linux-$arch" ./cmd/validator
+          done
+          cp config/testnet.json dist/testnet.json
+          ( cd dist && sha256sum validator-linux-amd64 validator-linux-arm64 testnet.json > SHA256SUMS )
+          echo "built:" && ls -la dist
+
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/validator-linux-amd64
+            dist/validator-linux-arm64
+            dist/testnet.json
+            dist/SHA256SUMS
+          generate_release_notes: true

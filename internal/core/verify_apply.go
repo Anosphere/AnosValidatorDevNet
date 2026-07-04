@@ -79,6 +79,12 @@ type Snapshot struct {
 	// creation + delayForSourceClass(sourceClass) + BreakglassExtraEpochs. CONSENSUS-CRITICAL,
 	// injected from config (BREAKGLASS_EXTRA_EPOCHS); local test configs set a small value.
 	BreakglassExtraEpochs uint64
+	// Econ carries the manifest-pinned monetary + role scalars (fee schedule, role floors,
+	// Guardian divisor/threshold, fund-send epoch slack) that validation reads (P7.2). buildSnapshot
+	// copies e.cfg.Econ into it; the role-derivation methods (IsAttestor / GuardianWeight /
+	// GuardianQuorumThreshold) are invoked as snap.Econ.X, and the fee + slack checks read its
+	// fields directly. CONSENSUS-CRITICAL: identical on every validator (network_id pins it).
+	Econ Economics
 }
 
 type AccountSnap struct {
@@ -563,9 +569,9 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			if fse > snap.Epoch {
 				return [32]byte{}, fmt.Errorf("fund send: fund_send_epoch %d is in the future (epoch %d)", fse, snap.Epoch)
 			}
-			if fse+guardianFundSendEpochSlackEpochs < snap.Epoch {
+			if fse+snap.Econ.GuardianFundSendEpochSlackEpochs < snap.Epoch {
 				return [32]byte{}, fmt.Errorf("fund send: fund_send_epoch %d is too stale (epoch %d, slack %d)",
-					fse, snap.Epoch, guardianFundSendEpochSlackEpochs)
+					fse, snap.Epoch, snap.Econ.GuardianFundSendEpochSlackEpochs)
 			}
 			if err := verifyFundSendQuorum(tx, snap); err != nil {
 				return [32]byte{}, err
@@ -738,7 +744,7 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 					return [32]byte{}, errors.New("breakglass move must route through a transfer chain, not target the Fund")
 				}
 			}
-			exp := ExpectedFee(amt)
+			exp := snap.Econ.RequiredFee(amt)
 			if fee != exp {
 				return [32]byte{}, errors.New("bad fee")
 			}
@@ -1026,14 +1032,14 @@ func verifyFundSendQuorum(tx *pb.Tx, snap *Snapshot) error {
 	if err := eachVerifiedSigner(tx, snap, func(id [32]byte) {
 		// A verifying signer that is not an eligible Guardian contributes weight 0 (still
 		// deduped by eachVerifiedSigner) — ignored, not fatal.
-		approved += GuardianWeight(snap.FundStakeRows, id)
+		approved += snap.Econ.GuardianWeight(snap.FundStakeRows, id)
 	}); err != nil {
 		return err
 	}
 	if approved < 1 {
 		return errors.New("fund send: needs at least one valid eligible-Guardian signature")
 	}
-	threshold := GuardianQuorumThreshold(snap.GuardianActiveWeight)
+	threshold := snap.Econ.GuardianQuorumThreshold(snap.GuardianActiveWeight)
 	if approved < threshold {
 		return fmt.Errorf("fund send: approved guardian weight %d < required %d (70%% of active weight %d)",
 			approved, threshold, snap.GuardianActiveWeight)
@@ -1126,7 +1132,7 @@ func verifyReleaseAttestorQuorum(tx *pb.Tx, snap *Snapshot, reqM uint64) error {
 	}
 	var n uint64
 	if err := eachVerifiedSigner(tx, snap, func(id [32]byte) {
-		if IsAttestor(snap.FundStakeRows, id) {
+		if snap.Econ.IsAttestor(snap.FundStakeRows, id) {
 			n++
 		}
 	}); err != nil {
@@ -1376,8 +1382,8 @@ func validateEscrowOpening(tx *pb.Tx, snap *Snapshot, rs ReceivableSnap, acct [3
 	// move something. The funder paid the normal send fee on the funding SEND; the attested fee (if
 	// any) is taken out of the deposited amount at the opening apply.
 	if eo.GetAttested() {
-		if rs.Amount <= AttestedEscrowFee {
-			return fmt.Errorf("escrow opening: attested funding amount %d must exceed the attested fee %d", rs.Amount, AttestedEscrowFee)
+		if rs.Amount <= snap.Econ.AttestedEscrowFee {
+			return fmt.Errorf("escrow opening: attested funding amount %d must exceed the attested fee %d", rs.Amount, snap.Econ.AttestedEscrowFee)
 		}
 	} else if rs.Amount == 0 {
 		return errors.New("escrow opening: funding amount must be positive")
@@ -1434,7 +1440,7 @@ func recordGuardianActivity(tx *bbolt.Tx, parsed *pb.Tx, epoch uint64) error {
 
 // ApplyTx applies a validated tx to DB state.
 // It assumes prev/seq correctness was checked against snapshot and updates haven't happened mid-commit.
-func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAcct [32]byte) error {
+func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAcct [32]byte, econ Economics) error {
 	if parsed.Account == nil || len(parsed.Account.V) != 32 {
 		return errors.New("bad account")
 	}
@@ -1516,7 +1522,7 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 			bal -= amt
 		} else {
 			// Enforce fee schedule (SEND only)
-			exp := ExpectedFee(amt)
+			exp := econ.RequiredFee(amt)
 			if fee != exp {
 				return errors.New("bad fee")
 			}
@@ -1992,12 +1998,12 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 				// Charge the attested fee out of the credited balance (the funder paid the normal send
 				// fee on the funding SEND) and credit it to the Fund. validate guaranteed bal > fee; the
 				// idempotency guard at the top of ApplyTx keeps a resync re-apply from double-charging.
-				if bal <= AttestedEscrowFee {
+				if bal <= econ.AttestedEscrowFee {
 					return errors.New("escrow opening: attested funding amount must exceed the attested fee")
 				}
-				bal -= AttestedEscrowFee
+				bal -= econ.AttestedEscrowFee
 				out.Balance = bal
-				if err := creditFund(view.tx, fundAcct, AttestedEscrowFee); err != nil {
+				if err := creditFund(view.tx, fundAcct, econ.AttestedEscrowFee); err != nil {
 					return err
 				}
 			}

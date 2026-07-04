@@ -575,33 +575,42 @@ func epochFrontierKey(epoch uint64, acct [32]byte) []byte {
 }
 
 // SaveEpochFrontiers snapshots the current post-state BAccounts heads into BEpochFrontiers
-// for this epoch. Call this immediately after applying winners (post-state).
+// for this epoch. Call this immediately after applying winners (post-state). The live epoch loop
+// no longer calls this db-level form — its commit runs saveEpochFrontiersInTx inside the SAME
+// transaction as the winner apply (P7.6 commitEpoch, atomicity); resync and tests still use this.
 func SaveEpochFrontiers(db *bbolt.DB, epoch uint64) error {
 	return db.Update(func(tx *bbolt.Tx) error {
-		if err := ensureBuckets(tx); err != nil {
+		return saveEpochFrontiersInTx(tx, epoch)
+	})
+}
+
+// saveEpochFrontiersInTx is the transaction-scoped body of SaveEpochFrontiers: inside an Update
+// it sees the transaction's own uncommitted writes, so the snapshot taken by commitEpoch is over
+// exactly the just-applied state.
+func saveEpochFrontiersInTx(tx *bbolt.Tx, epoch uint64) error {
+	if err := ensureBuckets(tx); err != nil {
+		return err
+	}
+	acc := tx.Bucket(BAccounts)
+	out := tx.Bucket(BEpochFrontiers)
+
+	c := acc.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if len(k) != 32 {
+			continue
+		}
+		head, _, _, _, ok := unpackAccount(v)
+		if !ok {
+			continue
+		}
+		var acct [32]byte
+		copy(acct[:], k)
+		if err := out.Put(epochFrontierKey(epoch, acct), head[:]); err != nil {
 			return err
 		}
-		acc := tx.Bucket(BAccounts)
-		out := tx.Bucket(BEpochFrontiers)
+	}
 
-		c := acc.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			if len(k) != 32 {
-				continue
-			}
-			head, _, _, _, ok := unpackAccount(v)
-			if !ok {
-				continue
-			}
-			var acct [32]byte
-			copy(acct[:], k)
-			if err := out.Put(epochFrontierKey(epoch, acct), head[:]); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
+	return nil
 }
 
 type FrontierEntry struct {

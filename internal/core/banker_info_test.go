@@ -122,7 +122,7 @@ func TestBankerValidatorSet(t *testing.T) {
 		{Identity: b2, ConsensusKey: k2, Endpoint: "e2", SendSeq: 1},
 		{Identity: b3, ConsensusKey: make([]byte, 33), Endpoint: "e3", SendSeq: 1}, // malformed key
 	}
-	set := BankerValidatorSet(rows, infos)
+	set := testEcon.BankerValidatorSet(rows, infos)
 	if len(set) != 1 {
 		t.Fatalf("want 1 validator, got %d", len(set))
 	}
@@ -131,7 +131,7 @@ func TestBankerValidatorSet(t *testing.T) {
 	}
 	// Kicking B1's stake drops it from the set (membership gate).
 	rows[0].Status = StakeStatusKicked
-	if got := BankerValidatorSet(rows, infos); len(got) != 0 {
+	if got := testEcon.BankerValidatorSet(rows, infos); len(got) != 0 {
 		t.Errorf("kicked banker still in the set: %d entries", len(got))
 	}
 }
@@ -174,7 +174,7 @@ func TestRoutedBankerStakeRecordsNoDescriptor(t *testing.T) {
 	}
 	raw, _ := proto.Marshal(ptx)
 	mustUpdate(t, db, func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txidFor(chain, 2), fund)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txidFor(chain, 2), fund, testEcon)
 	})
 
 	// The STAKE row IS recorded under the source identity (weight/voting attribution).
@@ -237,7 +237,7 @@ func TestBankerRotationReplacesDescriptorInSet(t *testing.T) {
 		if nForB != 1 {
 			t.Fatalf("[%s] want exactly 1 descriptor for the identity, got %d", label, nForB)
 		}
-		set := BankerValidatorSet(rows, infos)
+		set := testEcon.BankerValidatorSet(rows, infos)
 		if len(set) != 1 {
 			t.Fatalf("[%s] want 1 validator in the set, got %d", label, len(set))
 		}
@@ -270,7 +270,7 @@ func TestBankerRotationReplacesDescriptorInSet(t *testing.T) {
 
 	// Membership survived the sub-floor rotation purely via the original 60k stake.
 	rows, _ := ListAllStakes(db)
-	if !IsBanker(rows, b) {
+	if !testEcon.IsBanker(rows, b) {
 		t.Error("sub-floor rotation dropped Banker membership (the original 50k stake should still qualify)")
 	}
 
@@ -331,7 +331,7 @@ func TestBankerRotationThroughApply(t *testing.T) {
 		t.Errorf("want 2 banker stake rows for B, got %d", bankerRows)
 	}
 	// Derived set: one validator, the NEW key, old key gone, membership intact.
-	set := BankerValidatorSet(rows, infos)
+	set := testEcon.BankerValidatorSet(rows, infos)
 	if len(set) != 1 || !bytes.Equal(set[0].ConsensusKey[:], k2) {
 		t.Fatalf("derived set did not rotate to K2: %+v", set)
 	}
@@ -340,7 +340,7 @@ func TestBankerRotationThroughApply(t *testing.T) {
 			t.Error("old key K1 still in the derived set after apply-path rotation")
 		}
 	}
-	if !IsBanker(rows, b) {
+	if !testEcon.IsBanker(rows, b) {
 		t.Error("Banker membership lost after the sub-floor rotation deposit")
 	}
 }
@@ -369,7 +369,7 @@ func applyBankerStakeThrough(t *testing.T, db *bbolt.DB, from, fromHead [32]byte
 	}
 	raw, _ := proto.Marshal(ptx)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
 	}); err != nil {
 		t.Fatalf("apply banker stake seq=%d: %v", seq, err)
 	}
