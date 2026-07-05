@@ -1,11 +1,11 @@
 {
   "version": 2,
   "protocol_version": 1,
-  "network_id": "82a4d3bd12d31fa2abb087710f524fc9f8b73e393480fc71cbd8066b53c339f7",
+  "network_id": "20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2",
   "kat_digest": "",
   "fund_account_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   "timing": {
-    "epoch_ms": 2000,
+    "epoch_ms": 5000,
     "timelocked_delay_epochs": 6,
     "guardian_active_window_epochs": 20,
     "stake_lock_1mo_epochs": 4,
