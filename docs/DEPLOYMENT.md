@@ -8,7 +8,7 @@ You download the program and the network config from GitHub. The maintainer send
 file — your key — plus a short note with your specific values. Wherever a command says `<YOUR_…>`, use the
 value from that note.
 
-The network id for this net is `82a4d3bd12d31fa2abb087710f524fc9f8b73e393480fc71cbd8066b53c339f7`.
+The network id for this net is `20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2`.
 
 ---
 
@@ -86,7 +86,7 @@ gcloud compute firewall-rules create anos-p2p \
 ```sh
 curl -s localhost:30303/health
 ```
-- `network_id` must equal `82a4d3bd12d31fa2abb087710f524fc9f8b73e393480fc71cbd8066b53c339f7`. If it
+- `network_id` must equal `20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2`. If it
   differs, your `testnet.json` is wrong — re‑download it (step 2).
 - Your key is the right one if `journalctl -u anos-validator | grep 'Validator Public Key'` prints
   `<YOUR_PUBKEY>`. **A wrong key still boots and shows advancing epochs but signs nothing — the pubkey
