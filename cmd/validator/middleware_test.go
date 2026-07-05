@@ -8,7 +8,7 @@ import (
 	"anos/internal/core"
 )
 
-const testNetID = "82a4d3bd12d31fa2abb087710f524fc9f8b73e393480fc71cbd8066b53c339f7"
+const testNetID = "20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2"
 
 func TestGatedPath(t *testing.T) {
 	gated := []string{"/peer/candidates", "/peer/finalization", "/peer/tx/inv", "/peer/tx/push", "/peer/tx/get", "/sync/latest", "/sync/chain"}

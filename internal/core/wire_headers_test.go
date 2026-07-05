@@ -3,14 +3,14 @@ package core
 import "testing"
 
 func TestCheckAnosHeaders(t *testing.T) {
-	const id = "82a4d3bd12d31fa2abb087710f524fc9f8b73e393480fc71cbd8066b53c339f7"
+	const id = "20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2"
 	cases := []struct {
 		name          string
 		gotID, gotVer string
 		wantErr       bool
 	}{
 		{"match", id, "1", false},
-		{"case-insensitive id", "82A4D3BD12D31FA2ABB087710F524FC9F8B73E393480FC71CBD8066B53C339F7", "1", false},
+		{"case-insensitive id", "20BD2EC07A6EB9A6CA9314934F3B252767BCE683150E4F3EC081F91578951FF2", "1", false},
 		{"wrong id", "deadbeef", "1", true},
 		{"missing id", "", "1", true},
 		{"wrong version", id, "2", true},
