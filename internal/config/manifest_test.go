@@ -252,3 +252,19 @@ func TestValidateRejectsUnsupportedProtocolVersion(t *testing.T) {
 		t.Error("Validate accepted an unsupported protocol_version")
 	}
 }
+
+// The v0.3.0 cutover's mutual exclusion (D10): a pre-forquinn manifest (schema 2,
+// protocol_version 1) must refuse to boot on this binary — the counterpart of old binaries
+// refusing v3 manifests. Guards against a stale testnet.json silently rejoining the old net.
+func TestValidateRejectsPreForquinnManifest(t *testing.T) {
+	m := validManifest()
+	m.Version = 2
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted a schema-v2 (pre-forquinn) manifest")
+	}
+	m = validManifest()
+	m.ProtocolVersion = 1
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted a protocol_version-1 (pre-forquinn) manifest")
+	}
+}

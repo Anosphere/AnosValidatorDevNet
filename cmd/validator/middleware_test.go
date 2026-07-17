@@ -8,7 +8,7 @@ import (
 	"anos/internal/core"
 )
 
-const testNetID = "20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2"
+const testNetID = "305bffb513e844b51e10d2a1b3592b5327fe86970c2901fe3576f549fb331d82"
 
 func TestGatedPath(t *testing.T) {
 	gated := []string{"/peer/candidates", "/peer/finalization", "/peer/tx/inv", "/peer/tx/push", "/peer/tx/get", "/sync/latest", "/sync/chain"}
@@ -31,7 +31,7 @@ func TestAnosNetworkMiddleware(t *testing.T) {
 		nextCalled = true
 		w.WriteHeader(http.StatusOK)
 	})
-	h := anosNetworkMiddleware(next, testNetID, 1)
+	h := anosNetworkMiddleware(next, testNetID, 2)
 
 	do := func(path string, setHeaders bool, netID string, ver string) *httptest.ResponseRecorder {
 		nextCalled = false
@@ -46,16 +46,16 @@ func TestAnosNetworkMiddleware(t *testing.T) {
 	}
 
 	// A gated path with correct headers passes and the response is stamped with our identity.
-	rec := do("/peer/candidates", true, testNetID, "1")
+	rec := do("/peer/candidates", true, testNetID, "2")
 	if !nextCalled || rec.Code != http.StatusOK {
 		t.Errorf("gated + correct headers: nextCalled=%v code=%d", nextCalled, rec.Code)
 	}
-	if rec.Header().Get(core.HeaderNetworkID) != testNetID || rec.Header().Get(core.HeaderProtocolVersion) != "1" {
+	if rec.Header().Get(core.HeaderNetworkID) != testNetID || rec.Header().Get(core.HeaderProtocolVersion) != "2" {
 		t.Errorf("response missing our identity headers: %v", rec.Header())
 	}
 
 	// A gated path with a wrong network id is rejected (421) and never reaches the handler.
-	rec = do("/peer/tx/push", true, "deadbeef", "1")
+	rec = do("/peer/tx/push", true, "deadbeef", "2")
 	if nextCalled || rec.Code != http.StatusMisdirectedRequest {
 		t.Errorf("gated + wrong id: nextCalled=%v code=%d (want 421, no next)", nextCalled, rec.Code)
 	}

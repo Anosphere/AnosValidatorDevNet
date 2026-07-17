@@ -12,11 +12,10 @@ import (
 // bump SupportedProtocolVersion alongside. A surprise diff here means an accidental,
 // fork-inducing change to canonicalBytes().
 //
-// forquinn INTERIM re-pin (phase 2): the timing block gained guarded_send_min_interval_epochs
-// (appended last), an intended preimage-layout change. The paired version/domain bumps (D10:
-// SupportedProtocolVersion 1→2, schema 2→3, ANOS_MANIFEST_V2 domain) land together in the
-// phase-6 cutover, which re-pins this once more — nothing ships between phases.
-const wantCanonicalNetworkID = "fe7bb2d3f8b54435a01780374e724a9355a49ac8376ba3be700146c1caf20e04"
+// forquinn OFFICIAL pin (the v0.3.0 cutover): the timing block gained
+// guarded_send_min_interval_epochs (appended last) and the D10 bumps landed together —
+// SupportedProtocolVersion 1→2, schema 2→3, ANOS_MANIFEST_V2 domain.
+const wantCanonicalNetworkID = "a56db73ce62a3df039d2064f67dd15101ed857d0fbbb6495d68923e9b2862c48"
 
 func TestNetworkIDPinned(t *testing.T) {
 	m := validManifest()
@@ -113,8 +112,8 @@ func TestCanonicalPreimageHead(t *testing.T) {
 	}
 	var want bytes.Buffer
 	want.WriteString(networkIDDomain)
-	putU32(&want, uint32(SupportedVersion))         // version = 2
-	putU32(&want, uint32(SupportedProtocolVersion)) // protocol_version = 1
+	putU32(&want, uint32(SupportedVersion))         // version = 3
+	putU32(&want, uint32(SupportedProtocolVersion)) // protocol_version = 2
 	putU32(&want, 0)                                // kat_digest: 0-length frame
 	putU32(&want, 32)                               // fund_account: 32-byte frame length
 	for i := 0; i < 32; i++ {

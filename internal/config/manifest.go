@@ -29,8 +29,8 @@ import (
 // the JSON (which fields exist). A manifest carrying any other version is rejected
 // (refuse-to-boot) rather than silently mis-parsed. Bumped whenever the manifest gains or
 // loses a field. P7.2 bumps it 1 -> 2 (adds protocol_version, kat_digest, economics,
-// consensus).
-const SupportedVersion = 2
+// consensus). forquinn bumps it 2 -> 3 (adds timing.guarded_send_min_interval_epochs).
+const SupportedVersion = 3
 
 // SupportedProtocolVersion is the consensus RULESET version this binary implements — the
 // structural rules that are algorithms/byte-formats, NOT config scalars (the SignBytesACTE
@@ -40,12 +40,17 @@ const SupportedVersion = 2
 // whenever any of those structural rules changes. The manifest declares the ruleset it
 // targets (Manifest.ProtocolVersion); the binary refuses to boot unless it can speak that
 // ruleset. This is the language-neutral label a future non-Go banker would also carry.
-// v1 == the current post-P7.1 ruleset (validity-aware candidate proposal included).
-const SupportedProtocolVersion = 1
+// v1 == the post-P7.1 ruleset (validity-aware candidate proposal included).
+// v2 == the forquinn ruleset: guarded/vault U2 second key + either-or release rule, U2
+// proof-of-possession, attestor case commitment (case_nonce/attestation_hash folded into
+// the SEND preimage), sig2 in TxID, the D8 hard-length preimage rule, the supply-overflow
+// reject, the guarded send rate limit, Guardian staff exclusion, attestor quorum floor 2.
+const SupportedProtocolVersion = 2
 
 // networkIDDomain domain-separates the network_id preimage (magic bytes; bump only alongside
-// a preimage-layout change, which is itself a protocol_version-worthy flag day).
-const networkIDDomain = "ANOS_MANIFEST_V1:"
+// a preimage-layout change, which is itself a protocol_version-worthy flag day). V2: the
+// forquinn cutover appends timing.guarded_send_min_interval_epochs to canonicalBytes.
+const networkIDDomain = "ANOS_MANIFEST_V2:"
 
 // Manifest is the whole public network descriptor. Everything here is public (no
 // secrets): validator PRIVATE keys and the genesis seed never appear in a manifest.

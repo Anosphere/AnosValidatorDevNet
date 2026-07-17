@@ -1,7 +1,7 @@
 {
-  "version": 2,
-  "protocol_version": 1,
-  "network_id": "a1ac6e6e6d951c360b8e48bf7d6228ac8fec79e56ae66a5c202d7d8891762873",
+  "version": 3,
+  "protocol_version": 2,
+  "network_id": "305bffb513e844b51e10d2a1b3592b5327fe86970c2901fe3576f549fb331d82",
   "kat_digest": "",
   "fund_account_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   "timing": {

@@ -8,7 +8,8 @@ You download the program and the network config from GitHub. The maintainer send
 file — your key — plus a short note with your specific values. Wherever a command says `<YOUR_…>`, use the
 value from that note.
 
-The network id for this net is `20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2`.
+The network id for this net is `305bffb513e844b51e10d2a1b3592b5327fe86970c2901fe3576f549fb331d82`
+(the v0.3.0 "forquinn" net — protocol_version 2, manifest schema v3).
 
 ---
 
@@ -86,7 +87,7 @@ gcloud compute firewall-rules create anos-p2p \
 ```sh
 curl -s localhost:30303/health
 ```
-- `network_id` must equal `20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2`. If it
+- `network_id` must equal `305bffb513e844b51e10d2a1b3592b5327fe86970c2901fe3576f549fb331d82`. If it
   differs, your `testnet.json` is wrong — re‑download it (step 2).
 - Your key is the right one if `journalctl -u anos-validator | grep 'Validator Public Key'` prints
   `<YOUR_PUBKEY>`. **A wrong key still boots and shows advancing epochs but signs nothing — the pubkey
@@ -124,6 +125,24 @@ If the maintainer says the update is a **network change** (new `testnet.json`), 
 `testnet.json` into `/opt/anos/` before the restart, and expect a brief window where old and new nodes
 don't talk to each other — the maintainer will name a cutover time.
 
+If the maintainer says it is a **network reset** (a new `protocol_version` / `network_id` — the chain
+restarts from genesis; **v0.3.0 is one**), the database must also be wiped, at the named cutover time:
+```sh
+cd /opt/anos
+sudo curl -L -o validator.new "https://github.com/Anosphere/AnosValidatorDevNet/releases/download/<NEW_TAG>/validator-linux-amd64"
+sudo curl -L -o testnet.json.new "https://github.com/Anosphere/AnosValidatorDevNet/releases/download/<NEW_TAG>/testnet.json"
+curl -sL "https://github.com/Anosphere/AnosValidatorDevNet/releases/download/<NEW_TAG>/SHA256SUMS" \
+  | sed 's#validator-linux-amd64#validator.new#; s#testnet.json#testnet.json.new#' | sha256sum -c --ignore-missing -
+sudo systemctl stop anos-validator
+sudo mv validator.new validator && sudo chmod +x validator
+sudo mv testnet.json.new testnet.json
+sudo rm -f /opt/anos/validator.db
+sudo systemctl start anos-validator
+curl -s localhost:30303/health                  # network_id must show the NEW id from the release notes
+```
+Your `anos.key` is unchanged — never delete it. `latest_epoch` stays frozen until 3 of the 5 operators
+have reset; that's the §1-step-6 waiting-for-quorum state, not a fault.
+
 ---
 
 ## §3 — Maintainer: publish a release
@@ -138,8 +157,10 @@ don't talk to each other — the maintainer will name a cutover time.
    the release. Watch the **Actions** tab (~1–2 min).
 
 **Ship an update:** publish a new tag (`v0.1.1`) the same way. In the release notes say whether it's a
-**plain update** (operators just swap the binary, §2) or a **network change** (new `testnet.json` /
-`protocol_version` — operators also re‑download the manifest, and you coordinate a cutover window).
+**plain update** (operators just swap the binary, §2), a **network change** (new `testnet.json` /
+`protocol_version` — operators also re‑download the manifest, and you coordinate a cutover window), or a
+**network reset** (new `network_id`, chain restarts from genesis — operators follow the §2 reset block,
+which also wipes the database; state the new `network_id` in the notes so operators can verify).
 
 **Hand out keys:** send each operator **privately** only their `anos.key` and their personal note (VM
 number, `<YOUR_IP>`, `<YOUR_PUBKEY>`, `<PEER_IPS>`, and the `<TAG>` to download). The binary and
