@@ -307,19 +307,15 @@ func TestReleaseAttestorGate(t *testing.T) {
 		}
 	})
 
-	// AttestorQuorumM == 0 is treated as 1 defensively: 1 attestor passes, 0 fails.
-	t.Run("M=0 defensive floor", func(t *testing.T) {
+	// D11: AttestorQuorumM == 0 (a missing quorum config) FAILS CLOSED — the release is
+	// rejected even with a full, valid attestor quorum attached, never silently gated at 1.
+	t.Run("M=0 fails closed", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
 		f.snap.AttestorQuorumM = 0
-		ok := f.releaseTxCase(t, f.dest)
-		attachAttestorMultiSig(t, ok, f.a1)
-		if _, err := ValidateTxAgainstSnapshot(ok, f.snap); err != nil {
-			t.Fatalf("M=0→1 floor rejected a single attestor: %v", err)
-		}
-		none := f.releaseTxCase(t, f.dest)
-		attachAttestorMultiSig(t, none, f.a3) // non-attestor only
-		if _, err := ValidateTxAgainstSnapshot(none, f.snap); err == nil {
-			t.Error("M=0→1 floor accepted zero attestor signatures")
+		tx := f.releaseTxCase(t, f.dest)
+		attachAttestorMultiSig(t, tx, f.a1, f.a2) // both staked attestors sign — still rejected
+		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
+			t.Error("M=0 release accepted (a missing quorum config must fail closed)")
 		}
 	})
 }

@@ -87,6 +87,16 @@ func TestValidateRejectsZeroTimingField(t *testing.T) {
 	}
 }
 
+// D11 attestor floor: attestor_quorum_m == 1 is structurally valid JSON but below the floor —
+// a 1-of-N attestor gate is a single point of compromise, so Validate rejects anything < 2.
+func TestValidateRejectsAttestorQuorumBelowFloor(t *testing.T) {
+	m := validManifest()
+	m.Timing.AttestorQuorumM = 1
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate accepted attestor_quorum_m=1 (the floor is 2)")
+	}
+}
+
 // A manifest JSON that OMITS a timing key (the realistic hand-edit mistake) must not load:
 // strict parsing won't catch the omission, so Validate must.
 func TestLoadRejectsOmittedTimingKeyViaValidate(t *testing.T) {

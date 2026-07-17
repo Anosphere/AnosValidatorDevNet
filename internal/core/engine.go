@@ -91,7 +91,9 @@ type EngineConfig struct {
 	// AttestorQuorumM is the flat M-of-N Fund Attestor quorum threshold (P3.2, spec-19 §6.1): an
 	// attestor-gated TRANSFER release-to-dest needs at least this many DISTINCT verifying Fund
 	// Attestor signatures (a count, NOT a weight). CONSENSUS-CRITICAL manifest constant (set via
-	// ATTESTOR_QUORUM_M); must be >= 1. P7's network manifest must content-address it.
+	// ATTESTOR_QUORUM_M); must be >= 2 (the D11 floor — manifest.Validate and main.go both
+	// assert it), and 0 fails closed in verifyReleaseAttestorQuorum. Read by buildSnapshot (the
+	// authoritative epoch-close check) AND bestEffortReleaseCheck (the submit-time gate).
 	AttestorQuorumM uint64
 
 	// EscrowAttestationDelayEpochs is the minimum gap (in epochs) between an escrow's creation and
@@ -647,11 +649,14 @@ func (e *Engine) bestEffortFundRecoveryReject(tx *pb.Tx, snap *Snapshot) error {
 // chain head == tx.prev (the node is at the exact position this send extends, so its finalized
 // record + class + flag are the right basis); otherwise it defers (returns nil), exactly like the
 // Fund-send gate. When it can judge, a multisig is rejected unless the account is an attestor-gated
-// release-to-dest, and even then only the N>=1 floor (>=1 verifying attestor signature) is enforced
-// — never the full M (which could race attestor staking) — so a legitimately-signed release is
-// never rejected here. The attestor path additionally requires the two exact-32-byte case fields
-// (forquinn item 2 — validate enforces them at epoch close, so a fieldless variant can never
-// finalize). Returns nil immediately for any SEND that carries no multisig and no sig2.
+// release-to-dest, and even then the CONFIGURED flat M (e.cfg.AttestorQuorumM — D11 site 2, the
+// same threshold the epoch-close check applies) must be met from the node's current view. Tradeoff
+// (user-ruled acceptable): a node that cannot yet resolve >= M of the release's signers may
+// best-effort reject a legitimate release at submit — gossip and the other nodes carry it, and the
+// epoch-close check stays authoritative. The attestor path additionally requires the two
+// exact-32-byte case fields (forquinn item 2 — validate enforces them at epoch close, so a
+// fieldless variant can never finalize). Returns nil immediately for any SEND that carries no
+// multisig and no sig2.
 //
 // forquinn item 1 adds sig2 — the path-(a) second user signature — which is txid-folded and
 // third-party-attachable exactly like the multisig, so it gets the same gate: legitimate ONLY on
@@ -819,9 +824,11 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			jerr = errors.New("attestor-gated release must carry a 32-byte case_nonce and attestation_hash")
 			return nil
 		}
-		// Legit attestor-gated release: enforce the N>=1 floor (reqM=1) to reject pure garbage
-		// while never racing the authoritative flat M-of-N at epoch close. Resolve the listed
-		// signers' cached pubkeys + the finalized stake rows for the verify.
+		// Legit attestor-gated release: enforce the configured flat M (D11 site 2 — the same
+		// threshold the authoritative epoch-close check applies; best-effort, may reject a
+		// release whose signers this node cannot yet resolve — gossip and the other nodes carry
+		// it). Resolve the listed signers' cached pubkeys + the finalized stake rows for the
+		// verify.
 		snap.FundStakeRows = listStakesInTx(dbtx)
 		for _, en := range ms.Entries {
 			if en == nil || en.SignerId == nil || len(en.SignerId.V) != 32 {
@@ -833,7 +840,7 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 				snap.Accounts[id] = AccountSnap{AuthPubKey: r.AuthPubKey}
 			}
 		}
-		jerr = verifyReleaseAttestorQuorum(tx, snap, 1)
+		jerr = verifyReleaseAttestorQuorum(tx, snap, e.cfg.AttestorQuorumM)
 		return nil
 	})
 	if judged {

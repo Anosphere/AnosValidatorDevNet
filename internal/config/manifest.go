@@ -233,8 +233,10 @@ func (m *Manifest) validateTiming() error {
 	if m.Timing.EpochMs <= 0 {
 		return fmt.Errorf("timing.epoch_ms must be > 0")
 	}
-	if m.Timing.AttestorQuorumM < 1 {
-		return fmt.Errorf("timing.attestor_quorum_m must be >= 1")
+	// Floor 2 (forquinn item 3 / D11): a 1-of-N attestor gate would let a single compromised
+	// attestor co-sign guarded/vault/breakglass releases.
+	if m.Timing.AttestorQuorumM < 2 {
+		return fmt.Errorf("timing.attestor_quorum_m must be >= 2")
 	}
 	if m.Timing.BreakglassExtraEpochs < 1 {
 		return fmt.Errorf("timing.breakglass_extra_epochs must be >= 1")

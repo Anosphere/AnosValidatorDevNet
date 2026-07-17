@@ -216,14 +216,15 @@ func main() {
 	fmt.Println("Guarded/Vault transfer delay (epochs):", guardedDelayEpochs, vaultDelayEpochs)
 
 	// ATTESTOR_QUORUM_M is the flat M-of-N Fund Attestor quorum threshold gating GUARDED/VAULT (and
-	// breakglass) releases (P3.2, spec-19 §6.1). CONSENSUS-CRITICAL manifest constant; MUST be >= 1
-	// (a zero would make the attestor gate a no-op). Local test .env files set a small value (e.g. 2).
+	// breakglass) releases (P3.2, spec-19 §6.1). CONSENSUS-CRITICAL manifest constant; MUST be >= 2
+	// (forquinn item 3 / D11 floor: 0 would disable the gate, 1 would let a single compromised
+	// attestor co-sign releases). Local test .env files set the floor value 2.
 	attestorQuorumM, err := strconv.ParseUint(mustEnv("ATTESTOR_QUORUM_M"), 10, 64)
 	if err != nil {
 		log.Fatal("ATTESTOR_QUORUM_M must be a uint64 (number of attestor signatures)")
 	}
-	if attestorQuorumM < 1 {
-		log.Fatal("ATTESTOR_QUORUM_M must be >= 1 (a zero would disable the attestor release gate)")
+	if attestorQuorumM < 2 {
+		log.Fatal("ATTESTOR_QUORUM_M must be >= 2 (the attestor quorum floor; a 1-of-N gate is a single point of compromise)")
 	}
 	fmt.Println("Attestor quorum (flat M):", attestorQuorumM)
 

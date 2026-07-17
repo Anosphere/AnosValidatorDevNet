@@ -67,7 +67,8 @@ type Snapshot struct {
 	// AttestorQuorumM is the flat M-of-N Fund Attestor quorum threshold (spec-19 §6.1): an
 	// attestor-gated TRANSFER release-to-dest needs at least this many DISTINCT verifying Fund
 	// Attestor signatures (a count, NOT a weight). CONSENSUS-CRITICAL manifest constant; injected
-	// from config. Treated as >= 1 defensively (a zero would make the gate a no-op).
+	// from config; manifest floor 2 (D11). An unset 0 FAILS CLOSED — verifyReleaseAttestorQuorum
+	// rejects every attestor-gated release rather than silently gating at 1.
 	AttestorQuorumM uint64
 	// EscrowAttestationDelayEpochs is the minimum gap (in epochs) between an escrow's creation and
 	// its attestation_trigger_epoch (spec-18 §5.6.3, P3.3), injected from config. The escrow opening
@@ -669,11 +670,7 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 							len(sb.Send.GetAttestationHash()) != crypto.CaseFieldSize {
 							return [32]byte{}, errors.New("attestor-gated release must carry a 32-byte case_nonce and attestation_hash")
 						}
-						reqM := snap.AttestorQuorumM
-						if reqM == 0 {
-							reqM = 1 // defensive: a zero-configured M would make the gate a no-op
-						}
-						if err := verifyReleaseAttestorQuorum(tx, snap, reqM); err != nil {
+						if err := verifyReleaseAttestorQuorum(tx, snap, snap.AttestorQuorumM); err != nil {
 							return [32]byte{}, err
 						}
 					}
@@ -1399,8 +1396,13 @@ func verifyStakeOwnerAuth(oa *pb.StakeOwnerAuth, op byte, depositTxid, beneficia
 // count >= reqM (a flat threshold, NOT a weight). Duplicate / unknown / keyless / bad-sig /
 // non-Attestor entries are ignored, never fatal — exactly like the Guardian quorum, so a release
 // can carry extra non-attestor signatures harmlessly. reqM is the manifest ATTESTOR_QUORUM_M
-// (>= 1) for the authoritative epoch-close check, or 1 for the submit-time floor.
+// (floor 2 since D11), passed by both callers — the authoritative epoch-close validate
+// (snap.AttestorQuorumM) and the best-effort submit gate (e.cfg.AttestorQuorumM). reqM == 0
+// (a missing quorum config) FAILS CLOSED: the release is rejected, never silently gated at 1.
 func verifyReleaseAttestorQuorum(tx *pb.Tx, snap *Snapshot, reqM uint64) error {
+	if reqM == 0 {
+		return errors.New("attestor-gated release: attestor quorum M is not configured (fail closed)")
+	}
 	ms := tx.MultiSig
 	if ms == nil || len(ms.Entries) == 0 {
 		return errors.New("attestor-gated release: missing attestor multisig")

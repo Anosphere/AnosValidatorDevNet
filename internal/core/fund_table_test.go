@@ -288,31 +288,36 @@ func TestStakeTableOrderIndependentRebuild(t *testing.T) {
 }
 
 // Guardian weight = floor(Σ identity's active 1-year stake / 2000 anos); 1-month stakes
-// and other identities' stakes are excluded. Also exercises IsBanker/IsAttestor/
-// StakesByRole/BankerIdentities over a constructed row set.
+// and other identities' stakes are excluded, and every NON-STAFF tag (banker/unknown/none)
+// counts toward the sum. Also exercises IsBanker/IsAttestor/StakesByRole/BankerIdentities
+// over a constructed row set. (The forquinn item-5 staff exclusion has its own tests below.)
 func TestRoleDerivations(t *testing.T) {
 	var g, h [32]byte
 	g[0], h[0] = 0x01, 0x02
 	rows := []StakeRow{
 		{DepositTxid: [32]byte{1}, StakeRecord: StakeRecord{StakerID: g, Amount: anosUnits(30_000), TimeDelay: oneYear, StakedFor: StakedForBanker}},
-		{DepositTxid: [32]byte{2}, StakeRecord: StakeRecord{StakerID: g, Amount: anosUnits(25_000), TimeDelay: oneYear, StakedFor: StakedForAttestor}},
-		{DepositTxid: [32]byte{3}, StakeRecord: StakeRecord{StakerID: g, Amount: anosUnits(99_000), TimeDelay: oneMonth, StakedFor: StakedForAttestor}}, // 1mo: excluded from weight
-		{DepositTxid: [32]byte{4}, StakeRecord: StakeRecord{StakerID: h, Amount: anosUnits(1_000), TimeDelay: oneYear, StakedFor: "moderator"}},
+		{DepositTxid: [32]byte{2}, StakeRecord: StakeRecord{StakerID: g, Amount: anosUnits(25_000), TimeDelay: oneYear, StakedFor: "masterpod"}},
+		{DepositTxid: [32]byte{3}, StakeRecord: StakeRecord{StakerID: g, Amount: anosUnits(99_000), TimeDelay: oneMonth, StakedFor: "masterpod"}}, // 1mo: excluded from weight
+		{DepositTxid: [32]byte{4}, StakeRecord: StakeRecord{StakerID: h, Amount: anosUnits(5_000), TimeDelay: oneYear, StakedFor: StakedForAttestor}},
 	}
 
-	// floor((30000+25000)/2000) = 27; h's 1,000 → floor(1000/2000) = 0.
+	// floor((30000+25000)/2000) = 27 — the banker and unknown tags both count (only STAFF
+	// tags exclude, and banker is not staff).
 	if w := testEcon.GuardianWeight(rows, g); w != 27 {
 		t.Errorf("testEcon.GuardianWeight(g) = %d, want 27", w)
 	}
+	// h's 5,000 @ 1yr would be weight 2, but the attestor tag is staff → excluded to 0.
 	if w := testEcon.GuardianWeight(rows, h); w != 0 {
-		t.Errorf("testEcon.GuardianWeight(h) = %d, want 0", w)
+		t.Errorf("testEcon.GuardianWeight(h) = %d, want 0 (staff-tagged)", w)
 	}
-	// g: banker stake 30k < 50k floor → NOT a banker; attestor 25k >= 5k → attestor.
+	// g: banker stake 30k < 50k floor → NOT a banker; no attestor-tagged row → not an attestor.
 	if testEcon.IsBanker(rows, g) {
 		t.Error("g must NOT be a Banker (30k < 50k floor)")
 	}
-	if !testEcon.IsAttestor(rows, g) {
-		t.Error("g must be an Attestor (25k >= 5k floor)")
+	// h: the SAME staff stake that zeroes h's Guardian weight still confers the Attestor ROLE
+	// (the exclusion closes only the Fund-spend gate, never role membership).
+	if !testEcon.IsAttestor(rows, h) {
+		t.Error("h must be an Attestor (5k >= 5k floor; staff exclusion does not touch roles)")
 	}
 	if got := len(StakesByRole(rows, StakedForBanker)); got != 1 {
 		t.Errorf("StakesByRole(banker) = %d rows, want 1 (the single banker-tagged stake, floor not applied here)", got)
@@ -320,6 +325,114 @@ func TestRoleDerivations(t *testing.T) {
 	if ids := testEcon.BankerIdentities(rows); len(ids) != 0 {
 		t.Errorf("BankerIdentities = %v, want none (no banker stake meets the 50k floor)", ids)
 	}
+}
+
+// --- forquinn item 5: person-level Guardian staff exclusion (plan §2.10) ---
+
+// stakeRowFor hand-builds one stake row for the pure-derivation exclusion tests.
+func stakeRowFor(id [32]byte, dep byte, anos uint64, tier pb.StakeTimeDelay, tag string, st StakeStatus) StakeRow {
+	return StakeRow{
+		DepositTxid: [32]byte{dep},
+		StakeRecord: StakeRecord{StakerID: id, Amount: anosUnits(anos), TimeDelay: tier, StakedFor: tag, Status: st},
+	}
+}
+
+func TestIsStaffTag(t *testing.T) {
+	for _, tag := range []string{StakedForAttestor, StakedForModerator} {
+		if !isStaffTag(tag) {
+			t.Errorf("isStaffTag(%q) = false, want true", tag)
+		}
+	}
+	// Banker is deliberately NOT staff; the match is exact-verbatim like the role predicates
+	// (a differently-cased tag is an uninterpreted open-namespace tag, not staff).
+	for _, tag := range []string{StakedForBanker, "", "guardian", "masterpod", "Attestor", "Moderator"} {
+		if isStaffTag(tag) {
+			t.Errorf("isStaffTag(%q) = true, want false", tag)
+		}
+	}
+}
+
+// An identity holding ANY active staff-tagged stake (attestor or moderator — any amount, any
+// tier) has Guardian weight 0, PERSON-LEVEL: its untagged year-locked stakes are zeroed too.
+func TestGuardianWeightStaffExclusion(t *testing.T) {
+	var id [32]byte
+	id[0] = 0x0a
+
+	t.Run("attestor tag zeroes untagged 1yr weight", func(t *testing.T) {
+		rows := []StakeRow{
+			stakeRowFor(id, 1, 10_000, oneYear, "", StakeStatusActive), // weight 5 alone
+			stakeRowFor(id, 2, 5_000, oneYear, StakedForAttestor, StakeStatusActive),
+		}
+		if w := testEcon.GuardianWeight(rows, id); w != 0 {
+			t.Errorf("weight = %d, want 0 (active attestor stake is person-level exclusion)", w)
+		}
+	})
+
+	t.Run("moderator tag zeroes, any tier", func(t *testing.T) {
+		// The staff row is 1-MONTH — it would never itself confer weight, yet it still excludes.
+		rows := []StakeRow{
+			stakeRowFor(id, 1, 10_000, oneYear, "", StakeStatusActive),
+			stakeRowFor(id, 2, 5_000, oneMonth, StakedForModerator, StakeStatusActive),
+		}
+		if w := testEcon.GuardianWeight(rows, id); w != 0 {
+			t.Errorf("weight = %d, want 0 (a 1-month staff stake still excludes)", w)
+		}
+	})
+
+	t.Run("sub-floor staff stake still excludes", func(t *testing.T) {
+		// 1 anos attestor-tagged — far below the 5k attestor ROLE floor — still zeroes the
+		// identity ("any amount": the exclusion is about declared staff intent, not eligibility).
+		rows := []StakeRow{
+			stakeRowFor(id, 1, 10_000, oneYear, "", StakeStatusActive),
+			stakeRowFor(id, 2, 1, oneMonth, StakedForAttestor, StakeStatusActive),
+		}
+		if w := testEcon.GuardianWeight(rows, id); w != 0 {
+			t.Errorf("weight = %d, want 0 (sub-role-floor staff stake must still exclude)", w)
+		}
+	})
+
+	t.Run("banker tag is NOT excluded", func(t *testing.T) {
+		rows := []StakeRow{
+			stakeRowFor(id, 1, 50_000, oneYear, StakedForBanker, StakeStatusActive),
+			stakeRowFor(id, 2, 4_000, oneYear, "", StakeStatusActive),
+		}
+		if w := testEcon.GuardianWeight(rows, id); w != 27 {
+			t.Errorf("weight = %d, want 27 (banker is not a staff tag; 54k/2000)", w)
+		}
+	})
+
+	t.Run("kicked or returned staff stake un-excludes", func(t *testing.T) {
+		rows := []StakeRow{
+			stakeRowFor(id, 1, 10_000, oneYear, "", StakeStatusActive),
+			stakeRowFor(id, 2, 5_000, oneYear, StakedForAttestor, StakeStatusActive),
+		}
+		if w := testEcon.GuardianWeight(rows, id); w != 0 {
+			t.Fatalf("weight with ACTIVE staff stake = %d, want 0", w)
+		}
+		// The Guardian-quorum kick (or an ordinary return) flips the row's status — only
+		// ACTIVE staff rows exclude, so the identity's untagged weight comes back.
+		for _, st := range []StakeStatus{StakeStatusKicked, StakeStatusReturned} {
+			rows[1].Status = st
+			if w := testEcon.GuardianWeight(rows, id); w != 5 {
+				t.Errorf("weight with staff stake status=%d = %d, want 5 (inactive staff rows do not exclude)", st, w)
+			}
+		}
+	})
+
+	t.Run("exclusion is per-identity", func(t *testing.T) {
+		var other [32]byte
+		other[0] = 0x0b
+		rows := []StakeRow{
+			stakeRowFor(id, 1, 10_000, oneYear, "", StakeStatusActive),
+			stakeRowFor(other, 2, 5_000, oneYear, StakedForAttestor, StakeStatusActive),
+		}
+		if w := testEcon.GuardianWeight(rows, id); w != 5 {
+			t.Errorf("weight(id) = %d, want 5 (another identity's staff stake must not leak)", w)
+		}
+		if w := testEcon.GuardianWeight(rows, other); w != 0 {
+			t.Errorf("weight(other) = %d, want 0 (staff)", w)
+		}
+	})
 }
 
 func TestPackUnpackStakeRecordRoundTrip(t *testing.T) {

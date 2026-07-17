@@ -405,9 +405,12 @@ func TestCaseCommitmentApplyLockstep(t *testing.T) {
 
 func TestBestEffortReleaseCheckPathBCase(t *testing.T) {
 	e := newWalkTestEngine(t, []*tValidator{newTValidator(t), newTValidator(t), newTValidator(t)})
+	// The gate enforces the CONFIGURED flat M (D11 site 2); run it at the production floor.
+	e.cfg.AttestorQuorumM = 2
 	f := newReleaseFixture(t, true)
 
-	// Materialize the chain at its position + a resolvable staked attestor (for the N>=1 floor).
+	// Materialize the chain at its position + both resolvable staked attestors (the gate
+	// enforces the configured M=2, so a deferring release needs a full quorum resolvable).
 	cs := f.snap.Accounts[f.chainID]
 	if err := e.cfg.DB.Update(func(tx *bbolt.Tx) error {
 		if err := putAccountRecord(tx, f.chainID, AccountRecord{
@@ -418,13 +421,18 @@ func TestBestEffortReleaseCheckPathBCase(t *testing.T) {
 		}); err != nil {
 			return err
 		}
-		if err := putAccountRecord(tx, f.a1.id, AccountRecord{
-			Class: pb.AccountClass_ACCOUNT_CLASS_SPENDING, AuthPubKey: f.a1.pub.Encode(),
-		}); err != nil {
-			return err
+		for i, a := range []*tAttestor{f.a1, f.a2} {
+			if err := putAccountRecord(tx, a.id, AccountRecord{
+				Class: pb.AccountClass_ACCOUNT_CLASS_SPENDING, AuthPubKey: a.pub.Encode(),
+			}); err != nil {
+				return err
+			}
+			row := attestorStake(a, byte(0x31+i), 5_000)
+			if err := putStakeRecord(tx, row.DepositTxid, row.StakeRecord); err != nil {
+				return err
+			}
 		}
-		row := attestorStake(f.a1, 0x31, 5_000)
-		return putStakeRecord(tx, row.DepositTxid, row.StakeRecord)
+		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -455,9 +463,36 @@ func TestBestEffortReleaseCheckPathBCase(t *testing.T) {
 
 	t.Run("case-carrying release defers", func(t *testing.T) {
 		tx := f.releaseTxCase(t, f.dest)
-		attachAttestorMultiSig(t, tx, f.a1) // >= 1 verifying attestor — the gate's floor
+		attachAttestorMultiSig(t, tx, f.a1, f.a2) // a full configured-M quorum resolvable locally
 		if err := e.bestEffortReleaseCheck(tx); err != nil {
 			t.Fatalf("legit case-carrying release rejected at the gate: %v", err)
+		}
+	})
+
+	// D11 site 2: the gate enforces the CONFIGURED M (2), not the old hardcoded N>=1 floor —
+	// a single attestor signature no longer squeaks past submit.
+	t.Run("sub-M release rejected at the gate", func(t *testing.T) {
+		tx := f.releaseTxCase(t, f.dest)
+		attachAttestorMultiSig(t, tx, f.a1) // 1 < configured M=2
+		err := e.bestEffortReleaseCheck(tx)
+		if err == nil {
+			t.Fatal("1-of-2 attestor release deferred at the gate (must enforce the configured M)")
+		}
+		if !bytes.Contains([]byte(err.Error()), []byte("< required 2")) {
+			t.Fatalf("gate rejected with %q, want the configured-M threshold", err)
+		}
+	})
+
+	// D11 site 3 reaches the gate too: an unconfigured (0) M fails closed even with a full
+	// valid quorum attached.
+	t.Run("unconfigured M fails closed at the gate", func(t *testing.T) {
+		saved := e.cfg.AttestorQuorumM
+		e.cfg.AttestorQuorumM = 0
+		defer func() { e.cfg.AttestorQuorumM = saved }()
+		tx := f.releaseTxCase(t, f.dest)
+		attachAttestorMultiSig(t, tx, f.a1, f.a2)
+		if err := e.bestEffortReleaseCheck(tx); err == nil {
+			t.Fatal("M=0 release deferred at the gate (a missing quorum config must fail closed)")
 		}
 	})
 
