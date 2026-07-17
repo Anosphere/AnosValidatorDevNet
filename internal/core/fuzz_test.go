@@ -18,6 +18,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -153,6 +154,10 @@ func fuzzSeedTxs(tb testing.TB) [][]byte {
 	add(simkit.BuildStakeSend(sender, senderHead, senderSeq+1, fund, 50_000, testEcon.RequiredFee(50_000), "banker", pb.StakeTimeDelay_STAKE_TIME_DELAY_ONE_YEAR, nil), sender)
 	// Keyless Fund SEND shape (guardian multisig envelope; unsigned — shape seed).
 	add(simkit.BuildFundSend(fund, senderHead, 2, receiver.ID, 77, 9), nil)
+	// §2.7 regression seed: the uint64-wrap mint shape — amt=2^64-1 with its exact (wrapped)
+	// manifest fee, signed. Validate/apply must REJECT it (overflow_supply_test.go pins the
+	// rejection); the fuzz targets pin that it and its mutations never panic the chain.
+	add(simkit.BuildSend(sender, senderHead, senderSeq+1, receiver.ID, math.MaxUint64, testEcon.RequiredFee(math.MaxUint64)), sender)
 	return seeds
 }
 

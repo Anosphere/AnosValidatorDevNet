@@ -935,7 +935,16 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			if fee != exp {
 				return [32]byte{}, errors.New("bad fee")
 			}
-			if as.Balance < amt+fee {
+			// Supply cap + subtract-form balance guard (§2.7): amt is attacker-controlled and
+			// unbounded, so the old `Balance < amt+fee` could WRAP (amt=2^64-1 makes amt+fee tiny)
+			// and pass for any funded account — minting ~2^64 base units via the receivable. Cap
+			// the amount at the total supply (0 == unset skips the cap so hand-built test
+			// snapshots stay valid; buildSnapshot always sets it), then prove balance covers
+			// amt+fee without ever computing the sum.
+			if snap.GenesisSupply != 0 && amt > snap.GenesisSupply {
+				return [32]byte{}, errors.New("amount exceeds total supply")
+			}
+			if as.Balance < amt || as.Balance-amt < fee {
 				return [32]byte{}, ErrInsufficientBal
 			}
 		}
@@ -1840,10 +1849,13 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 			if fee != exp {
 				return errors.New("bad fee")
 			}
-			if bal < amt+fee {
+			// Subtract-form mirror of the validate guard (§2.7): never compute amt+fee before
+			// proving bal covers it, so a 2^64-boundary amount cannot wrap the check on the
+			// no-revalidation resync path either.
+			if bal < amt || bal-amt < fee {
 				return ErrInsufficientBal
 			}
-			bal -= (amt + fee)
+			bal -= amt + fee // no wrap: bal >= amt and bal-amt >= fee ⇒ amt+fee <= bal
 		}
 
 		// P5.5: mirror the validate guard — a transfer return-to-source (incl. a return-stake chain back to

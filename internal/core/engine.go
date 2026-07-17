@@ -136,6 +136,14 @@ type EngineConfig struct {
 	// it for the union. 0 => NewEngine substitutes defaultMaxMempoolTxs. (P7.3)
 	MaxMempoolTxs int
 
+	// FullAuditEveryEpochs is the background invariant-audit cadence (forquinn P4, §2.9): run the
+	// full six-check audit when at least this many epochs committed since the last clean pass
+	// (ANOS_FULL_AUDIT_EVERY_EPOCHS; devnet default 1 = every epoch). A LOCAL operational knob,
+	// NOT consensus-critical and deliberately NOT manifest-pinned: the audit only READS committed
+	// state, so divergent cadences cannot fork — a sparser cadence just detects corruption later.
+	// 0 => NewEngine substitutes 1.
+	FullAuditEveryEpochs uint64
+
 	// NetworkID / ProtocolVersion are this node's network identity (config.Manifest.NetworkID = the
 	// content hash + SupportedProtocolVersion). The engine stamps them as X-Anos-* headers on every
 	// outbound /peer/* + /sync/* request and verifies them on resync RESPONSES; the cmd/validator
@@ -233,6 +241,20 @@ type Engine struct {
 	// only by the loop goroutine.
 	presenceSkips int
 
+	// --- forquinn P4 invariant watchdog (invariants.go) ---
+	// Halt state, e.mu-guarded: set once by haltInvariant (first violation wins) and never
+	// cleared at runtime — recovery is an operator decision. invariantReason is the COARSE
+	// category only (safe for the ungated /health); the detail lives in the CRITICAL logs.
+	invariantHalted    bool
+	invariantReason    string
+	invariantEpoch     uint64
+	lastFullAuditEpoch uint64 // newest epoch that passed a clean full audit (/health); e.mu
+	// auditKick wakes the background audit goroutine after a commit (buffered 1; kickAudit's
+	// non-blocking send collapses bursts). lastHaltRelog paces the halted loop's reminder log —
+	// loop-goroutine-only state, like presenceSkips.
+	auditKick     chan struct{}
+	lastHaltRelog time.Time
+
 	startOnce sync.Once
 }
 
@@ -296,6 +318,10 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if cfg.MaxMempoolTxs == 0 {
 		cfg.MaxMempoolTxs = defaultMaxMempoolTxs
 	}
+	// FullAuditEveryEpochs is likewise a LOCAL knob; default to auditing every epoch.
+	if cfg.FullAuditEveryEpochs == 0 {
+		cfg.FullAuditEveryEpochs = 1
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 2 * time.Second}
 	}
@@ -323,6 +349,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		dynPeerIPs:      make(map[string]struct{}),
 		resyncBlacklist: make(map[string]time.Time),
 		dialHealth:      make(map[string]*dialHealthEntry),
+		auditKick:       make(chan struct{}, 1),
 	}
 
 	if err := cfg.DB.Update(func(tx *bbolt.Tx) error { return ensureBuckets(tx) }); err != nil {
@@ -338,6 +365,7 @@ func (e *Engine) Start(ctx context.Context) {
 	e.startOnce.Do(func() {
 		go e.loop(ctx)
 		go e.gossipLoop(ctx)
+		go e.auditLoop(ctx) // forquinn P4: background invariant watchdog (invariants.go)
 	})
 }
 
@@ -1139,6 +1167,11 @@ func (e *Engine) admissionRejectLocked(tx *pb.Tx, txid [32]byte) string {
 }
 
 func (e *Engine) SubmitTx(raw []byte) error {
+	// Invariant halt (forquinn P4): a halted node accepts no new transactions — its frozen
+	// state is forensic evidence and it will never propose/commit them anyway. Reads stay up.
+	if halted, reason, _ := e.InvariantStats(); halted {
+		return fmt.Errorf("node halted on invariant violation [%s]: not accepting transactions", reason)
+	}
 	tx, err := ParseTx(raw)
 	if err != nil {
 		return err
@@ -1938,6 +1971,24 @@ func (e *Engine) guardIteration(fn func() (stop bool)) (stop, panicked bool) {
 // context cancellation.
 func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop bool) {
 	{
+		// Invariant halt (forquinn P4): freeze finalization at the last-good epoch. No propose/
+		// vote/finalize/commit — and no resync (the state IS the evidence; triggerResync refuses
+		// too). Reads + /health keep serving from their own paths. Checked BEFORE the resync
+		// branch so a halt fired during a resync attempt also freezes the loop. Re-log ~1/min so
+		// the condition stays visible; idle in short ctx-aware sleeps.
+		if halted, reason, hEpoch := e.InvariantStats(); halted {
+			if time.Since(e.lastHaltRelog) >= haltRelogEvery {
+				e.lastHaltRelog = time.Now()
+				log.Printf("CRITICAL: node HALTED on invariant violation [%s] at epoch %d — finalization frozen; operator action required (reads + /health still serve)", reason, hEpoch)
+			}
+			select {
+			case <-ctx.Done():
+				return true
+			case <-time.After(250 * time.Millisecond):
+			}
+			return false
+		}
+
 		// If we're in resync mode, short-circuit normal epoch processing.
 		// This prevents continuing to apply epochs while we know we're divergent.
 		if e.resync.IsActive() {
@@ -2347,6 +2398,10 @@ func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop b
 					"finalized. quorum=%d/%d: (elapsed=%s) : broadcasted to %d : lists received=%d : Applied (winner_accounts=%d, candidate_txs=%d)",
 					qCount, qNeed, time.Since(start).Truncate(time.Millisecond), len(e.currentDialPeers()), len(peerLists), len(winners), len(validParsed))
 
+				// forquinn P4: poke the background invariant audit at the commit barrier (a
+				// channel send — never audit work on the loop's critical path).
+				e.kickAudit()
+
 			} else {
 				// MISMATCH: quorum agreed on something different.
 				// Instead of triggering a full resync, try to apply the quorum's winner
@@ -2410,6 +2465,8 @@ func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop b
 							log.Printf("[epoch=%d] phase:cleanup-done txPool=%d wallMs=%d", epoch, len(e.txPool), time.Now().UnixMilli())
 
 							e.elog(epoch, "applied quorum set: %d winners", len(qWinners))
+							// forquinn P4: same commit-barrier audit poke as the match path.
+							e.kickAudit()
 						}
 					}
 				} else {
@@ -3098,6 +3155,12 @@ var errCommitAborted = errors.New("commitEpoch: aborted on failed winners")
 // fetching quorum txids either way). applied is non-empty only on full success; failed carries
 // the per-tx reasons for the caller's logging.
 func (e *Engine) commitEpoch(epoch uint64, winners map[[32]byte][32]byte, txBytesByID map[[32]byte][]byte, parsed map[[32]byte]*pb.Tx) (map[[32]byte]struct{}, map[[32]byte]error, error) {
+	// Invariant halt (forquinn P4): the loop's top-of-iteration check freezes the NEXT
+	// iteration; this closes the in-flight window so a halt fired mid-iteration (the audit
+	// goroutine) cannot be followed by one more commit on top of the frozen evidence.
+	if halted, reason, _ := e.InvariantStats(); halted {
+		return nil, nil, fmt.Errorf("commit refused: node halted on invariant violation [%s]", reason)
+	}
 	applied := make(map[[32]byte]struct{})
 	failed := make(map[[32]byte]error)
 

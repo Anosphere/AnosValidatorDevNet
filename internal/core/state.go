@@ -708,30 +708,43 @@ func IterEpochFrontiers(db *bbolt.DB, epoch uint64, cursor [32]byte, limit int) 
 
 // ComputeFrontiersRoot computes SHA256 of concat(sorted(account||head)) for epoch frontiers.
 func ComputeFrontiersRoot(db *bbolt.DB, epoch uint64) ([32]byte, error) {
-	var rows []FrontierEntry
+	var out [32]byte
 	err := db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(BEpochFrontiers)
-		if b == nil {
-			return ErrNotFound
+		r, rerr := computeFrontiersRootInTx(tx, epoch)
+		if rerr != nil {
+			return rerr
 		}
-		prefix := make([]byte, 8)
-		binary.BigEndian.PutUint64(prefix, epoch)
-
-		c := b.Cursor()
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			if len(k) != 8+32 || len(v) != 32 {
-				continue
-			}
-			var acct [32]byte
-			copy(acct[:], k[8:40])
-			var head [32]byte
-			copy(head[:], v)
-			rows = append(rows, FrontierEntry{AccountID: acct, HeadHash: head})
-		}
+		out = r
 		return nil
 	})
 	if err != nil {
 		return [32]byte{}, err
+	}
+	return out, nil
+}
+
+// computeFrontiersRootInTx is the transaction-scoped body of ComputeFrontiersRoot, so the
+// invariant audit (invariants.go) can recompute an epoch's root inside the SAME read View as
+// its other checks — one MVCC-consistent snapshot, never racing a commit.
+func computeFrontiersRootInTx(tx *bbolt.Tx, epoch uint64) ([32]byte, error) {
+	b := tx.Bucket(BEpochFrontiers)
+	if b == nil {
+		return [32]byte{}, ErrNotFound
+	}
+	prefix := make([]byte, 8)
+	binary.BigEndian.PutUint64(prefix, epoch)
+
+	var rows []FrontierEntry
+	c := b.Cursor()
+	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		if len(k) != 8+32 || len(v) != 32 {
+			continue
+		}
+		var acct [32]byte
+		copy(acct[:], k[8:40])
+		var head [32]byte
+		copy(head[:], v)
+		rows = append(rows, FrontierEntry{AccountID: acct, HeadHash: head})
 	}
 
 	sort.Slice(rows, func(i, j int) bool {

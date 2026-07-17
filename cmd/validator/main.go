@@ -264,6 +264,21 @@ func main() {
 	}
 	fmt.Println("Guarded send min interval (epochs):", guardedSendMinIntervalEpochs)
 
+	// ANOS_FULL_AUDIT_EVERY_EPOCHS is the background invariant-audit cadence (forquinn P4,
+	// BUILD-PLAN §2.9): run the six-check full audit when at least this many epochs committed
+	// since the last clean pass. A LOCAL operational knob — NOT consensus-critical, NOT
+	// manifest-pinned (the audit only reads committed state; divergent cadences cannot fork).
+	// Optional; default 1 (devnet: audit every epoch).
+	fullAuditEveryEpochs := uint64(1)
+	if v := strings.TrimSpace(os.Getenv("ANOS_FULL_AUDIT_EVERY_EPOCHS")); v != "" {
+		n, perr := strconv.ParseUint(v, 10, 64)
+		if perr != nil || n < 1 {
+			log.Fatal("ANOS_FULL_AUDIT_EVERY_EPOCHS must be a uint64 >= 1 (audit cadence in epochs)")
+		}
+		fullAuditEveryEpochs = n
+	}
+	fmt.Println("Full invariant audit cadence (epochs):", fullAuditEveryEpochs)
+
 	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		log.Fatal(err)
@@ -311,6 +326,7 @@ func main() {
 		EscrowAttestationDelayEpochs: escrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        breakglassExtraEpochs,
 		GuardedSendMinIntervalEpochs: guardedSendMinIntervalEpochs,
+		FullAuditEveryEpochs:         fullAuditEveryEpochs,
 		Econ:                         econ,
 		MaxCandidateScanPerSlot:      manifest.Consensus.MaxCandidateScanPerSlot,
 		NetworkID:                    manifest.NetworkID,
@@ -1139,15 +1155,24 @@ func main() {
 	// info leak; it lives in the node's loud CRITICAL logs where the operator looks.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		panicsTotal, _ := engine.PanicStats()
+		// forquinn P4 invariant watchdog fields: invariant_reason is the COARSE category only
+		// (e.g. "supply-total") — like the panic detail, the full violation detail stays in the
+		// node's CRITICAL logs, never on this ungated endpoint.
+		invHalted, invReason, invEpoch := engine.InvariantStats()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(struct {
-			Status      string `json:"status"`
-			NetworkID   string `json:"network_id"`
-			LatestEpoch uint64 `json:"latest_epoch"`
-			EpochNow    uint64 `json:"epoch_now"`
-			Resyncing   bool   `json:"resyncing"`
-			PanicsTotal uint64 `json:"panics_total"`
-		}{"ok", manifest.NetworkID, engine.LatestFinalizedEpoch(), engine.EpochNow(), engine.ResyncActive(), panicsTotal})
+			Status             string `json:"status"`
+			NetworkID          string `json:"network_id"`
+			LatestEpoch        uint64 `json:"latest_epoch"`
+			EpochNow           uint64 `json:"epoch_now"`
+			Resyncing          bool   `json:"resyncing"`
+			PanicsTotal        uint64 `json:"panics_total"`
+			InvariantHalted    bool   `json:"invariant_halted"`
+			InvariantReason    string `json:"invariant_reason"`
+			InvariantEpoch     uint64 `json:"invariant_epoch"`
+			LastFullAuditEpoch uint64 `json:"last_full_audit_epoch"`
+		}{"ok", manifest.NetworkID, engine.LatestFinalizedEpoch(), engine.EpochNow(), engine.ResyncActive(), panicsTotal,
+			invHalted, invReason, invEpoch, engine.LastFullAuditEpoch()})
 	})
 
 	// P7.3 edge middlewares, composed OUTSIDE the P7.2 network-id middleware (outer→inner):
