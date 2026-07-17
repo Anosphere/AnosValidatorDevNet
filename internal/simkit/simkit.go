@@ -288,14 +288,18 @@ func SignFundSend(tx *pb.Tx, signers []*Account) error {
 	return nil
 }
 
-// SignAttestorRelease signs an attestor-gated TRANSFER release-to-dest (P3.2, spec-19 §6.1): the
-// chain's controlling key sets Tx.sig AND each Fund Attestor co-signs the SAME digest
-// m = SHA-256(SignBytesACTE(tx)) into Tx.MultiSig. Both halves sign m (the multisig is NOT part of
-// m), so order is irrelevant; the release needs BOTH the chain's Tx.sig and >= ATTESTOR_QUORUM_M
-// verifying attestor signatures. `chain` is the TRANSFER chain account (it shares the GUARDED/VAULT
-// source's copied key); `attestors` are the signing Attestor identities. The tx body must be final
+// SignAttestorRelease signs an attestor-gated TRANSFER release-to-dest (P3.2, spec-19 §6.1,
+// forquinn path (b)): it stamps the mandatory case commitment (forquinn item 2) onto the SEND
+// body, then the chain's controlling key sets Tx.sig AND each Fund Attestor co-signs the SAME
+// digest m = SHA-256(SignBytesACTE(tx)) into Tx.MultiSig. The case fields are set FIRST — they
+// are folded into the preimage, so m (and therefore every signature) commits to them. Both
+// halves sign m (the multisig is NOT part of m), so order is irrelevant; the release needs the
+// chain's Tx.sig, >= ATTESTOR_QUORUM_M verifying attestor signatures, AND both 32-byte case
+// fields. `chain` is the TRANSFER chain account (it shares the GUARDED/VAULT source's copied
+// key); `attestors` are the signing Attestor identities. The rest of the tx body must be final
 // before calling.
-func SignAttestorRelease(tx *pb.Tx, chain *Account, attestors []*Account) error {
+func SignAttestorRelease(tx *pb.Tx, chain *Account, attestors []*Account, caseNonce, attestationHash [32]byte) error {
+	SetCaseCommitment(tx, caseNonce, attestationHash)
 	if err := chain.Sign(tx); err != nil {
 		return err
 	}
@@ -519,12 +523,16 @@ func SignEscrowOutflowWith(tx *pb.Tx, normal, breakglass []*Account) error {
 	return nil
 }
 
-// SignBreakglassRelease signs a breakglass TRANSFER-chain release-to-dest (P5.1, spec-19 §6.4): the
-// chain's REVEALED breakglass key sets Tx.sig + tx.revealed_breakglass_pubkey (the recoverer who lost
-// the auth key), AND each Fund Attestor co-signs the same digest into Tx.MultiSig (the release gate).
-// The reveal is folded into the preimage, so both Tx.sig and the attestor sigs are over a digest that
-// already includes it. `chain` shares the source's copied breakglass key. The tx body must be final.
-func SignBreakglassRelease(tx *pb.Tx, chain *Account, attestors []*Account) error {
+// SignBreakglassRelease signs a breakglass TRANSFER-chain release-to-dest (P5.1, spec-19 §6.4): it
+// stamps the mandatory case commitment (forquinn item 2 — the breakglass hop-2 flows through the
+// same attestor path (b) as a guarded/vault release), then the chain's REVEALED breakglass key sets
+// Tx.sig + tx.revealed_breakglass_pubkey (the recoverer who lost the auth key), AND each Fund
+// Attestor co-signs the same digest into Tx.MultiSig (the release gate). The case fields and the
+// reveal are both folded into the preimage, so Tx.sig and the attestor sigs are over a digest that
+// already commits to them. `chain` shares the source's copied breakglass key. The rest of the tx
+// body must be final before calling.
+func SignBreakglassRelease(tx *pb.Tx, chain *Account, attestors []*Account, caseNonce, attestationHash [32]byte) error {
+	SetCaseCommitment(tx, caseNonce, attestationHash)
 	if err := chain.SignBreakglass(tx); err != nil {
 		return err
 	}

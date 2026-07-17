@@ -316,9 +316,14 @@ func TestBreakglassReleaseValidate(t *testing.T) {
 		},
 	}
 
-	// Release to dest, breakglass key + 2 attestors, at unlock → accepted.
+	// The mandatory case commitment (phase 3, forquinn item 2): the breakglass hop-2 is an
+	// attestor-gated path-(b) release, so SignBreakglassRelease stamps it before signing.
+	var caseNonce, caseHash [32]byte
+	caseNonce[0], caseHash[0] = 0xcb, 0xab
+
+	// Release to dest, breakglass key + 2 attestors + case commitment, at unlock → accepted.
 	rel := simkit.BuildSend(chain, chHead, 2, dest, bal, 0)
-	if err := simkit.SignBreakglassRelease(rel, chain, []*simkit.Account{a1, a2}); err != nil {
+	if err := simkit.SignBreakglassRelease(rel, chain, []*simkit.Account{a1, a2}, caseNonce, caseHash); err != nil {
 		t.Fatalf("sign release: %v", err)
 	}
 	if _, err := ValidateTxAgainstSnapshot(rel, snap); err != nil {
@@ -332,9 +337,19 @@ func TestBreakglassReleaseValidate(t *testing.T) {
 		t.Fatal("a breakglass release before unlock must be rejected")
 	}
 
-	// Release with only ONE attestor (< M=2) → rejected.
+	// A breakglass release WITHOUT the case commitment → rejected (the §2.6 breakglass row:
+	// the hop-2 flows through the same path-(b) arm as a guarded/vault release).
+	relNC := simkit.BuildSend(chain, chHead, 2, dest, bal, 0)
+	chain.MustSignBreakglass(relNC)
+	if err := simkit.SignFundSend(relNC, []*simkit.Account{a1, a2}); err != nil {
+		t.Fatalf("sign relNC quorum: %v", err)
+	}
+	_, ncErr := ValidateTxAgainstSnapshot(relNC, snap)
+	wantErrContaining(t, ncErr, "must carry a 32-byte case_nonce", "breakglass release without the case commitment")
+
+	// Release with only ONE attestor (< M=2) → rejected on the quorum (case fields present).
 	rel1 := simkit.BuildSend(chain, chHead, 2, dest, bal, 0)
-	if err := simkit.SignBreakglassRelease(rel1, chain, []*simkit.Account{a1}); err != nil {
+	if err := simkit.SignBreakglassRelease(rel1, chain, []*simkit.Account{a1}, caseNonce, caseHash); err != nil {
 		t.Fatalf("sign release1: %v", err)
 	}
 	if _, err := ValidateTxAgainstSnapshot(rel1, snap); err == nil {
@@ -354,7 +369,7 @@ func TestBreakglassReleaseValidate(t *testing.T) {
 	pc.TransferFlags = transferFlagReleaseRequiresAttestor // GUARDED/VAULT-style, NOT breakglass_origin
 	plain.Accounts = map[[32]byte]AccountSnap{chain.ID: pc, src.ID: snap.Accounts[src.ID], a1.ID: snap.Accounts[a1.ID], a2.ID: snap.Accounts[a2.ID]}
 	relP := simkit.BuildSend(chain, chHead, 2, dest, bal, 0)
-	if err := simkit.SignBreakglassRelease(relP, chain, []*simkit.Account{a1, a2}); err != nil {
+	if err := simkit.SignBreakglassRelease(relP, chain, []*simkit.Account{a1, a2}, caseNonce, caseHash); err != nil {
 		t.Fatalf("sign relP: %v", err)
 	}
 	if _, err := ValidateTxAgainstSnapshot(relP, &plain); err == nil {

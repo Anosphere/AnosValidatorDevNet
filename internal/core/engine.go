@@ -621,7 +621,9 @@ func (e *Engine) bestEffortFundRecoveryReject(tx *pb.Tx, snap *Snapshot) error {
 // Fund-send gate. When it can judge, a multisig is rejected unless the account is an attestor-gated
 // release-to-dest, and even then only the N>=1 floor (>=1 verifying attestor signature) is enforced
 // — never the full M (which could race attestor staking) — so a legitimately-signed release is
-// never rejected here. Returns nil immediately for any SEND that carries no multisig and no sig2.
+// never rejected here. The attestor path additionally requires the two exact-32-byte case fields
+// (forquinn item 2 — validate enforces them at epoch close, so a fieldless variant can never
+// finalize). Returns nil immediately for any SEND that carries no multisig and no sig2.
 //
 // forquinn item 1 adds sig2 — the path-(a) second user signature — which is txid-folded and
 // third-party-attachable exactly like the multisig, so it gets the same gate: legitimate ONLY on
@@ -780,6 +782,15 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			return nil
 		}
 		// ---- path (b): one user sig + the attestor quorum ----
+		// The case commitment (forquinn item 2): validate requires BOTH exact-32-byte fields on
+		// the attestor path at epoch close, so a variant missing them can NEVER finalize — and
+		// its multisig is attacker-attachable/grindable, so reject it here (a pure function of
+		// the tx bytes; a legit post-cutover release always carries them).
+		if len(tx.GetSend().GetCaseNonce()) != crypto.CaseFieldSize ||
+			len(tx.GetSend().GetAttestationHash()) != crypto.CaseFieldSize {
+			jerr = errors.New("attestor-gated release must carry a 32-byte case_nonce and attestation_hash")
+			return nil
+		}
 		// Legit attestor-gated release: enforce the N>=1 floor (reqM=1) to reject pure garbage
 		// while never racing the authoritative flat M-of-N at epoch close. Resolve the listed
 		// signers' cached pubkeys + the finalized stake rows for the verify.

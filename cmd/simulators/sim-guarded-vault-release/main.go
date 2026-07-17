@@ -12,7 +12,8 @@
 //  5. U2-SIGNED CANCEL: T3 returns to UG1 signed by U2 alone (any epoch, never gated), and UG1
 //     claims the return with a U2-signed RECEIVE.
 //  6. PATH (b): UG2's chain T2 releases with ONE user signature (U2!) + the M-of-N attestor
-//     quorum; UG3's chain T2b with only M-1 attestor signatures never finalizes. (UG1/UG2/UG3
+//     quorum + the mandatory 32-byte case commitment (forquinn item 2); UG3's chain T2b with only
+//     M-1 attestor signatures never finalizes despite carrying the case fields. (UG1/UG2/UG3
 //     all send within one window — the rate limit is per-account.)
 //  7. VAULT: UV (with U2) funds TV and releases via path (a) at the (longer) vault unlock.
 //
@@ -21,6 +22,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -281,25 +283,37 @@ func stakeToFund(c *simkit.Client, from *simkit.Account, fund [32]byte, amount u
 }
 
 // releaseToDest submits a path-(b) attestor-gated release-to-dest: ONE user signature (the
-// chain's copied U1, or its copied U2 when userSigU2 — D4) + the attestor multisig. It does NOT
-// wait (callers decide whether it should finalize).
+// chain's copied U1, or its copied U2 when userSigU2 — D4) + the attestor multisig + the
+// mandatory 32-byte case commitment (forquinn item 2 — set BEFORE signing, so m commits to it).
+// It does NOT wait (callers decide whether it should finalize).
 func releaseToDest(c *simkit.Client, chain *simkit.Account, to [32]byte, balance uint64, attestors []*simkit.Account, userSigU2 bool) {
 	head, seq, err := c.Head(chain.IDBytes())
 	if err != nil {
 		log.Fatalf("read transfer chain: %v", err)
 	}
 	tx := simkit.BuildSend(chain, head, seq+1, to, balance, 0)
+	caseNonce, attestationHash := caseCommitmentFor(chain)
 	if userSigU2 {
+		simkit.SetCaseCommitment(tx, caseNonce, attestationHash) // before signing — folded into m
 		if err := chain.SignWithU2(tx); err != nil {
 			log.Fatalf("U2-sign release: %v", err)
 		}
 		if err := simkit.SignFundSend(tx, attestors); err != nil { // attestor multisig over the same m
 			log.Fatalf("sign attestor quorum: %v", err)
 		}
-	} else if err := simkit.SignAttestorRelease(tx, chain, attestors); err != nil {
+	} else if err := simkit.SignAttestorRelease(tx, chain, attestors, caseNonce, attestationHash); err != nil {
 		log.Fatalf("sign attestor release: %v", err)
 	}
 	_ = c.Submit(tx)
+}
+
+// caseCommitmentFor derives the per-chain moderation case commitment a path-(b) release carries.
+// Anos treats both fields as opaque 32-byte blobs; deriving them from the chain id keeps a
+// re-submitted release byte-identical (same preimage → same txid → idempotent dup).
+func caseCommitmentFor(chain *simkit.Account) (caseNonce, attestationHash [32]byte) {
+	caseNonce = sha256.Sum256(append([]byte("sim-case-nonce:"), chain.IDBytes()...))
+	attestationHash = sha256.Sum256(append([]byte("sim-attestation-hash:"), chain.IDBytes()...))
+	return caseNonce, attestationHash
 }
 
 // pathARelease submits an attestor-FREE release-to-dest signed by BOTH user keys (Tx.sig=U1,

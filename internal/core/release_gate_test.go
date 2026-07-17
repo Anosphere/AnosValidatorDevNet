@@ -177,10 +177,10 @@ func newReleaseFixture(t *testing.T, flagSet bool) *releaseFixture {
 	}
 }
 
-// releaseTx builds a full-balance zero-fee TRANSFER drain to `to`, signed by the chain's key.
-func (f *releaseFixture) releaseTx(t *testing.T, to [32]byte) *pb.Tx {
-	t.Helper()
-	tx := &pb.Tx{
+// unsignedReleaseTx builds a full-balance zero-fee TRANSFER drain to `to` (no signature yet —
+// callers that add preimage-folded fields, e.g. the case commitment, set them before signing).
+func (f *releaseFixture) unsignedReleaseTx(to [32]byte) *pb.Tx {
+	return &pb.Tx{
 		Type:    pb.TxType_TX_TYPE_SEND,
 		Account: &pb.AccountId{V: append([]byte(nil), f.chainID[:]...)},
 		Prev:    &pb.Hash32{V: append([]byte(nil), f.head[:]...)},
@@ -192,6 +192,24 @@ func (f *releaseFixture) releaseTx(t *testing.T, to [32]byte) *pb.Tx {
 			AccountClass: pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
 		}},
 	}
+}
+
+// releaseTx builds a full-balance zero-fee TRANSFER drain to `to`, signed by the chain's key.
+func (f *releaseFixture) releaseTx(t *testing.T, to [32]byte) *pb.Tx {
+	t.Helper()
+	tx := f.unsignedReleaseTx(to)
+	if err := crypto.SignTxHybrid(tx, f.chainPriv); err != nil {
+		t.Fatalf("chain sign: %v", err)
+	}
+	return tx
+}
+
+// releaseTxCase is releaseTx plus the mandatory 32-byte case commitment (phase 3, forquinn
+// item 2) — stamped BEFORE signing, since both fields are folded into the signed preimage.
+func (f *releaseFixture) releaseTxCase(t *testing.T, to [32]byte) *pb.Tx {
+	t.Helper()
+	tx := f.unsignedReleaseTx(to)
+	setTestCaseFields(tx)
 	if err := crypto.SignTxHybrid(tx, f.chainPriv); err != nil {
 		t.Fatalf("chain sign: %v", err)
 	}
@@ -202,7 +220,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Positive: at/after unlock, chain key + M (=2) attestor sigs → accepted.
 	t.Run("accept M-of-N at unlock", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a2)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err != nil {
 			t.Fatalf("valid M-of-N release rejected: %v", err)
@@ -212,7 +230,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Extra non-attestor signer is harmless (ignored): a1+a2+a3 still counts 2.
 	t.Run("non-attestor signer ignored", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a2, f.a3)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err != nil {
 			t.Fatalf("release with an extra non-attestor signer rejected: %v", err)
@@ -222,7 +240,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Below threshold: 1 attestor < M=2 → rejected.
 	t.Run("reject below M", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("release with 1 < M attestor signatures accepted")
@@ -232,7 +250,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Only a non-attestor signs (a3): count 0 < M → rejected.
 	t.Run("reject non-attestor-only", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a3)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("release authorized only by a non-attestor accepted")
@@ -242,7 +260,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Duplicate attestor entries count once: a1,a1 → 1 < M → rejected.
 	t.Run("reject duplicate signer", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a1)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("release with a duplicated attestor counted twice")
@@ -252,7 +270,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// No multisig at all (only Tx.sig) on a gated release → rejected.
 	t.Run("reject missing multisig", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest) // no multisig attached
+		tx := f.releaseTxCase(t, f.dest) // no multisig attached
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("gated release with no attestor multisig accepted")
 		}
@@ -262,7 +280,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	t.Run("reject before unlock", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
 		f.snap.Epoch = f.unlock - 1
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a2)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("gated release accepted before unlock")
@@ -293,12 +311,12 @@ func TestReleaseAttestorGate(t *testing.T) {
 	t.Run("M=0 defensive floor", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
 		f.snap.AttestorQuorumM = 0
-		ok := f.releaseTx(t, f.dest)
+		ok := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, ok, f.a1)
 		if _, err := ValidateTxAgainstSnapshot(ok, f.snap); err != nil {
 			t.Fatalf("M=0→1 floor rejected a single attestor: %v", err)
 		}
-		none := f.releaseTx(t, f.dest)
+		none := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, none, f.a3) // non-attestor only
 		if _, err := ValidateTxAgainstSnapshot(none, f.snap); err == nil {
 			t.Error("M=0→1 floor accepted zero attestor signatures")

@@ -576,6 +576,7 @@ func TestReleaseEitherOr(t *testing.T) {
 	t.Run("accept path (b) with U1 user sig", func(t *testing.T) {
 		f := newU2ReleaseFixture(t, true, true)
 		tx := f.unsignedDrain(f.dest)
+		setTestCaseFields(tx) // phase 3: the attestor path requires the case commitment
 		if err := crypto.SignTxHybrid(tx, f.u1Priv); err != nil {
 			t.Fatalf("sign: %v", err)
 		}
@@ -589,6 +590,7 @@ func TestReleaseEitherOr(t *testing.T) {
 		// D4: "one user signature" means U1 OR U2 — the U2 holder can drive the attestor path.
 		f := newU2ReleaseFixture(t, true, true)
 		tx := f.unsignedDrain(f.dest)
+		setTestCaseFields(tx)
 		if err := crypto.SignTxHybrid(tx, f.u2Priv); err != nil {
 			t.Fatalf("sign: %v", err)
 		}

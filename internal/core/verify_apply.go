@@ -613,12 +613,12 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 				//   path (a): BOTH user keys — Tx.sig under U1 AND sig2 under U2 — no attestors.
 				//   path (b): ONE user key (U1 or U2 via the top resolution; or the revealed
 				//             breakglass key on a breakglass-origin chain) + the flat M-of-N Fund
-				//             Attestor quorum.
+				//             Attestor quorum + the 32-byte case commitment (forquinn item 2).
 				// sig2 presence selects the path; the junk combinations (sig2+multisig, sig2 with
 				// a U2/breakglass-verified Tx.sig, sig2 on a chain with no U2) all reject, so every
 				// {sig, sig2, multisig} shape in the §2.3 txid matrix has exactly one meaning.
 				// Otherwise the chain is an ordinary TIMELOCKED release and must NOT carry a
-				// multisig or a sig2.
+				// multisig, a sig2, or the case fields.
 				if as.TransferFlags&transferFlagReleaseRequiresAttestor != 0 {
 					if hasSig2 {
 						// ---- path (a): U1 + U2, attestor-free (forquinn item 1) ----
@@ -656,6 +656,19 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 						}
 					} else {
 						// ---- path (b): one user sig + the attestor quorum ----
+						// The case commitment (forquinn item 2): every attestor-gated release —
+						// guarded, vault, AND the breakglass hop-2, which flows through this same
+						// arm — must carry the 32-byte case_nonce + attestation_hash. Both are
+						// folded into the signed preimage, so the user signature and every attestor
+						// signature commit to them via m; an attestor signature with no moderation
+						// case behind it is invalid by construction. The validator never reads the
+						// contents (opaque bytes) — only presence + exact length are enforced. Only
+						// {0, 32} lengths ever reach here (SignBytesACTE hard-errors anything else,
+						// so a wrong-length field has no computable preimage/txid anywhere).
+						if len(sb.Send.GetCaseNonce()) != crypto.CaseFieldSize ||
+							len(sb.Send.GetAttestationHash()) != crypto.CaseFieldSize {
+							return [32]byte{}, errors.New("attestor-gated release must carry a 32-byte case_nonce and attestation_hash")
+						}
 						reqM := snap.AttestorQuorumM
 						if reqM == 0 {
 							reqM = 1 // defensive: a zero-configured M would make the gate a no-op
@@ -671,6 +684,9 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 					if hasSig2 {
 						return [32]byte{}, errors.New("transfer release is not attestor-gated: must not carry a second user signature (sig2)")
 					}
+					if hasCaseFields(sb.Send) {
+						return [32]byte{}, errors.New("transfer release is not attestor-gated: must not carry attestor case fields")
+					}
 				}
 			default:
 				return [32]byte{}, errors.New("transfer outbound must go to the stored source or destination")
@@ -681,6 +697,12 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			// is the weighted Guardian quorum.
 			if hasSig2 {
 				return [32]byte{}, errors.New("fund send must not carry a second user signature (sig2)")
+			}
+			// The case fields belong only to an attestor-gated TRANSFER release (forquinn item 2)
+			// — content-based reject, like the sig2/multisig discipline (they are preimage-folded,
+			// so a junk-carrying variant would be a distinct meaningless candidate).
+			if hasCaseFields(sb.Send) {
+				return [32]byte{}, errors.New("fund send must not carry attestor case fields")
 			}
 			if fee != 0 {
 				return [32]byte{}, errors.New("fund send must have zero fee")
@@ -855,6 +877,11 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			if hasSig2 {
 				return [32]byte{}, errors.New("escrow outflow must not carry a second user signature (sig2)")
 			}
+			// The case fields belong only to an attestor-gated TRANSFER release (forquinn item 2):
+			// an escrow outflow is party-authorized, never attestor-case-backed.
+			if hasCaseFields(sb.Send) {
+				return [32]byte{}, errors.New("escrow outflow must not carry attestor case fields")
+			}
 			if err := verifyEscrowOutflow(tx, sb.Send, as, snap, to, amt, fee); err != nil {
 				return [32]byte{}, err
 			}
@@ -869,15 +896,22 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			if hasSig2 {
 				return [32]byte{}, errors.New("normal send must not carry a second user signature (sig2)")
 			}
-			// Guarded/vault hop-1 rules (forquinn): the case fields belong only to an attestor-
-			// gated release, and one NEW guarded send per rate-limit window (confirm-item 2).
-			// The limit reads the finalized LastGuardedSendEpoch stamped by ApplyTx; first send
-			// (stored 0) is always allowed, and interval 0 (pre-wiring test snapshots) is no
-			// limit. Subtract form: finalized last <= snap.Epoch always holds.
-			if classRequiresU2(as.Class) {
-				if hasCaseFields(sb.Send) {
+			// The case fields belong only to an attestor-gated TRANSFER release (forquinn item 2):
+			// reject them on EVERY normal-arm send — spending/timelocked sends, stake deposits,
+			// donations, and the guarded/vault hop-1 (which routes to a transfer chain; the case
+			// commitment rides the hop-2 release, never the hop-1). Content-based, matching the
+			// preimage fold, same discipline as the multisig/sig2 rejects above.
+			if hasCaseFields(sb.Send) {
+				if classRequiresU2(as.Class) {
 					return [32]byte{}, errors.New("guarded/vault send must not carry attestor case fields")
 				}
+				return [32]byte{}, errors.New("normal send must not carry attestor case fields")
+			}
+			// Guarded/vault hop-1 rate limit (forquinn confirm-item 2): one NEW guarded send per
+			// rate-limit window. The limit reads the finalized LastGuardedSendEpoch stamped by
+			// ApplyTx; first send (stored 0) is always allowed, and interval 0 (pre-wiring test
+			// snapshots) is no limit. Subtract form: finalized last <= snap.Epoch always holds.
+			if classRequiresU2(as.Class) {
 				if last := as.LastGuardedSendEpoch; last != 0 && snap.Epoch-last < snap.GuardedSendMinIntervalEpochs {
 					return [32]byte{}, fmt.Errorf("guarded send rate limit: last send finalized at epoch %d, next allowed at %d (now %d)",
 						last, last+snap.GuardedSendMinIntervalEpochs, snap.Epoch)
@@ -1729,24 +1763,38 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 		// re-validating, so structural requirements derivable from committed data are re-enforced
 		// here — a committed tx never trips them, but they fail closed if a malformed one ever
 		// reaches apply). sig2 is legitimate ONLY on an attestor-flagged release-to-dest (the
-		// either-or gate); the case fields never ride a cancel, a guarded/vault hop-1 send, or a
-		// path-(a) release (phase-3 completes the everywhere-else matrix).
-		if len(parsed.GetSig2().GetV()) > 0 {
-			releaseShape := existingClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER &&
-				toAcct == arec.TransferDest && arec.TransferFlags&transferFlagReleaseRequiresAttestor != 0
-			if !releaseShape {
-				return errors.New("sig2 is only valid on an attestor-flagged transfer release-to-dest")
-			}
-			if hasCaseFields(sb) {
-				return errors.New("path (a) release must not carry attestor case fields")
-			}
+		// either-or gate). The case fields (forquinn item 2) are REQUIRED — exact 32-byte lengths
+		// — on the attestor path (the flag-set release WITHOUT a sig2: path (b), incl. the
+		// breakglass hop-2) and rejected on every other SEND shape, completing the §2.6 matrix.
+		// Structure only: the quorum/signature VERIFICATION stays validate-only (apply trusts the
+		// validated winner); everything here derives from committed data, so resync replays it
+		// byte-identically.
+		hasS2 := len(parsed.GetSig2().GetV()) > 0
+		// Mirrors validate's destination switch INCLUDING its order: to == TransferSource matches
+		// the return-to-source (cancel) arm FIRST, so a degenerate source==dest record (impossible
+		// via a validated opening — "destination must differ from source" — but mirrored anyway
+		// for byte-identical replay semantics) classifies as a cancel here exactly as it would in
+		// validate, never as an attestor release.
+		attestorRelease := existingClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER &&
+			toAcct == arec.TransferDest && toAcct != arec.TransferSource &&
+			arec.TransferFlags&transferFlagReleaseRequiresAttestor != 0
+		if hasS2 && !attestorRelease {
+			return errors.New("sig2 is only valid on an attestor-flagged transfer release-to-dest")
 		}
-		if hasCaseFields(sb) {
-			if existingClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER && toAcct == arec.TransferSource {
-				return errors.New("transfer return-to-source must not carry attestor case fields")
+		if attestorRelease && !hasS2 {
+			if len(sb.GetCaseNonce()) != crypto.CaseFieldSize || len(sb.GetAttestationHash()) != crypto.CaseFieldSize {
+				return errors.New("attestor-gated release must carry a 32-byte case_nonce and attestation_hash")
 			}
-			if classRequiresU2(existingClass) {
+		} else if hasCaseFields(sb) {
+			switch {
+			case attestorRelease: // hasS2 set — path (a) never carries the fields
+				return errors.New("path (a) release must not carry attestor case fields")
+			case existingClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER && toAcct == arec.TransferSource:
+				return errors.New("transfer return-to-source must not carry attestor case fields")
+			case classRequiresU2(existingClass):
 				return errors.New("guarded/vault send must not carry attestor case fields")
+			default:
+				return errors.New("send must not carry attestor case fields")
 			}
 		}
 
