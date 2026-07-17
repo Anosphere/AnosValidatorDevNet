@@ -341,7 +341,7 @@ func applyFundSend(t *testing.T, db *bbolt.DB, tx *pb.Tx, txid [32]byte) error {
 	t.Helper()
 	raw, _ := proto.Marshal(tx)
 	return db.Update(func(btx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: btx}, raw, tx, txid, testFund, testEcon)
+		return ApplyTx(&bboltTxView{tx: btx}, raw, tx, txid, testFund, testEcon, 0)
 	})
 }
 

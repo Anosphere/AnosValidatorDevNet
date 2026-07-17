@@ -49,7 +49,7 @@ func applyStakeSend(t *testing.T, db *bbolt.DB, from, fromHead [32]byte, seq uin
 	}
 	raw, _ := proto.Marshal(ptx)
 	err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon, 0)
 	})
 	return txid, err
 }

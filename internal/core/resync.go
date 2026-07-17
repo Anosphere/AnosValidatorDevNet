@@ -523,7 +523,7 @@ func (e *Engine) verifyingWalk(ctx context.Context, targetEp uint64, txByID map[
 			applyIDs = pl.txids
 		}
 
-		if err := e.applyEpochTxids(applyIDs, txByID); err != nil {
+		if err := e.applyEpochTxids(ep, applyIDs, txByID); err != nil {
 			return fmt.Errorf("apply epoch %d: %w", ep, err)
 		}
 
@@ -703,7 +703,11 @@ func (e *Engine) anyFundRelevant(ids [][32]byte, txByID map[[32]byte][]byte) boo
 // committed live, so any ApplyTx failure here is a real inconsistency and aborts the resync (no
 // deferred-retry is needed — epoch order already satisfies all cross-epoch dependencies, unlike the
 // old whole-chain replay).
-func (e *Engine) applyEpochTxids(ids [][32]byte, txByID map[[32]byte][]byte) error {
+//
+// epoch is the finalization epoch these txids were accepted at (the walk's ep) — threaded into
+// ApplyTx so replay stamps the SAME LastGuardedSendEpoch the live commit did (committed data, byte-
+// deterministic; plan D3).
+func (e *Engine) applyEpochTxids(epoch uint64, ids [][32]byte, txByID map[[32]byte][]byte) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -731,7 +735,7 @@ func (e *Engine) applyEpochTxids(ids [][32]byte, txByID map[[32]byte][]byte) err
 			if cid != id {
 				return fmt.Errorf("accepted txid does not match its bytes: want %x have %x", id[:8], cid[:8])
 			}
-			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
+			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount, e.cfg.Econ, epoch); aerr != nil {
 				return fmt.Errorf("apply accepted tx %x: %w", id[:8], aerr)
 			}
 		}

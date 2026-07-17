@@ -108,6 +108,13 @@ type EngineConfig struct {
 	// configs set a small value. P7's network manifest must content-address it.
 	BreakglassExtraEpochs uint64
 
+	// GuardedSendMinIntervalEpochs is the guarded/vault outbound rate limit (forquinn confirm-item
+	// 2: one new guarded send per 24h, epoch-denominated — 86_400_000/epoch_ms in a mainnet
+	// manifest; devnet 12). A SEND from a GUARDED/VAULT account is rejected while
+	// epoch - LastGuardedSendEpoch is below it. CONSENSUS-CRITICAL once wired (phase 2 adds the
+	// manifest timing field + env bridge; until then it is 0 == no limit).
+	GuardedSendMinIntervalEpochs uint64
+
 	// Econ carries the manifest-pinned monetary + role scalars (fee schedule, role floors, Guardian
 	// divisor/threshold, fund-send epoch slack). buildSnapshot copies it into every Snapshot, and the
 	// engine-side validator-set / Guardian derivations invoke it as e.cfg.Econ.X. CONSENSUS-CRITICAL:
@@ -2585,6 +2592,8 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 		EscrowAttestationDelayEpochs: e.cfg.EscrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        e.cfg.BreakglassExtraEpochs,
 		Econ:                         e.cfg.Econ,
+		GenesisSupply:                e.cfg.GenesisSupply,
+		GuardedSendMinIntervalEpochs: e.cfg.GuardedSendMinIntervalEpochs,
 	}
 	err := e.cfg.DB.View(func(tx *bbolt.Tx) error {
 		ab := tx.Bucket(BAccounts)
@@ -2606,6 +2615,8 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 							TransferReturnDepositTxid: r.TransferReturnDepositTxid,
 							AuthPubKey:                r.AuthPubKey,
 							BreakglassCommit:          r.BreakglassCommit,
+							U2PubKey:                  r.U2PubKey,
+							LastGuardedSendEpoch:      r.LastGuardedSendEpoch,
 							EscrowPartyLoPub:          r.EscrowPartyLoPub,
 							EscrowPartyLoBG:           r.EscrowPartyLoBG,
 							EscrowPartyHiPub:          r.EscrowPartyHiPub,
@@ -2978,7 +2989,7 @@ func (e *Engine) commitEpoch(epoch uint64, winners map[[32]byte][32]byte, txByte
 				continue
 			}
 
-			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
+			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount, e.cfg.Econ, epoch); aerr != nil {
 				failed[id] = aerr
 				continue
 			}

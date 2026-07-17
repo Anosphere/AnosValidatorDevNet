@@ -85,6 +85,18 @@ type Snapshot struct {
 	// GuardianQuorumThreshold) are invoked as snap.Econ.X, and the fee + slack checks read its
 	// fields directly. CONSENSUS-CRITICAL: identical on every validator (network_id pins it).
 	Econ Economics
+	// GenesisSupply is the fixed total supply minted to the genesis account at boot (e.cfg.
+	// GenesisSupply), injected by buildSnapshot. The normal-send balance guard rejects any
+	// amount above it BEFORE computing amt+fee, closing the uint64-wrap mint (plan §2.7); the
+	// supply-total invariant audits against it. Treated as "unset — skip the cap" when 0 so
+	// hand-built test snapshots stay valid (buildSnapshot always sets it). CONSENSUS-CRITICAL.
+	GenesisSupply uint64
+	// GuardedSendMinIntervalEpochs is the guarded/vault outbound rate limit (forquinn
+	// confirm-item 2: one new guarded send per 24h, epoch-denominated), injected from config. A
+	// SEND from a GUARDED/VAULT account is rejected while snap.Epoch - LastGuardedSendEpoch is
+	// below it (first send always allowed). 0 == no limit (pre-wiring test snapshots).
+	// CONSENSUS-CRITICAL manifest scalar once wired (phase 2).
+	GuardedSendMinIntervalEpochs uint64
 }
 
 type AccountSnap struct {
@@ -114,6 +126,15 @@ type AccountSnap struct {
 	// must copy the source's auth pubkey AND breakglass commitment (keys-spec §6.2),
 	// so the verifier checks the opening block's carried commitment against this.
 	BreakglassCommit []byte
+
+	// U2PubKey is the cached second user key (forquinn item 1): set on a GUARDED/VAULT account
+	// at its PoP-verified opening, and on a TRANSFER chain by derived copy from its key source
+	// (D2). A single user signature verifies under AuthPubKey (U1) OR U2PubKey; the attestor-free
+	// release path (a) requires Tx.sig under U1 AND sig2 under U2. Empty when unregistered.
+	U2PubKey []byte
+	// LastGuardedSendEpoch is the finalization epoch of the account's most recent SEND —
+	// meaningful only for GUARDED/VAULT accounts (the 24h rate limit); 0 == never sent.
+	LastGuardedSendEpoch uint64
 
 	// Escrow two-party metadata (ESCROW_META, spec-18 §5.6.2); only meaningful when
 	// Class == ACCOUNT_CLASS_ESCROW. The escrow's keyless 2-of-2 outflow verify reads
@@ -1440,7 +1461,13 @@ func recordGuardianActivity(tx *bbolt.Tx, parsed *pb.Tx, epoch uint64) error {
 
 // ApplyTx applies a validated tx to DB state.
 // It assumes prev/seq correctness was checked against snapshot and updates haven't happened mid-commit.
-func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAcct [32]byte, econ Economics) error {
+//
+// epoch is the FINALIZATION epoch this tx is being committed under — passed by commitEpoch (the live
+// loop) and by the resync walk's applyEpochTxids, both of which know it from committed data, so a
+// replay is byte-deterministic (plan D3). It is used ONLY to stamp LastGuardedSendEpoch on a
+// guarded/vault SEND (the 24h rate limit; stamping lands in phase 2) — no other apply logic may
+// become epoch-dependent, and it must NEVER be a wall-clock reading.
+func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAcct [32]byte, econ Economics, epoch uint64) error {
 	if parsed.Account == nil || len(parsed.Account.V) != 32 {
 		return errors.New("bad account")
 	}

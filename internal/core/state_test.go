@@ -25,7 +25,9 @@ func accountRecordEqual(a, b AccountRecord) bool {
 		a.TransferUnlock == b.TransferUnlock &&
 		a.TransferFlags == b.TransferFlags &&
 		bytes.Equal(a.AuthPubKey, b.AuthPubKey) &&
-		bytes.Equal(a.BreakglassCommit, b.BreakglassCommit)
+		bytes.Equal(a.BreakglassCommit, b.BreakglassCommit) &&
+		bytes.Equal(a.U2PubKey, b.U2PubKey) &&
+		a.LastGuardedSendEpoch == b.LastGuardedSendEpoch
 }
 
 func sampleTransferRecord() AccountRecord {
@@ -200,6 +202,95 @@ func TestAccountRecordKeyedRoundTrip(t *testing.T) {
 	copy(rec[54:], short)
 	if _, ok := unpackAccountRecord(rec); ok {
 		t.Error("accepted an AUTH_PUBKEY field with the wrong length")
+	}
+}
+
+// A guarded record carrying the forquinn fields round-trips its U2_PUBKEY (0x03) and
+// GUARDED_LAST_SEND (0x04) TLVs, emitted in fixed tag order after AUTH_PUBKEY /
+// BREAKGLASS_COMMIT; omission rules keep pre-U2 records byte-identical.
+func TestAccountRecordU2AndRateLimitRoundTrip(t *testing.T) {
+	r := AccountRecord{Balance: 9, Seq: 4, Class: pb.AccountClass_ACCOUNT_CLASS_GUARDED}
+	for i := range r.Head {
+		r.Head[i] = byte(0x30 + i)
+	}
+	r.AuthPubKey = make([]byte, authPubkeyLen)
+	for i := range r.AuthPubKey {
+		r.AuthPubKey[i] = byte(i + 1)
+	}
+	r.BreakglassCommit = make([]byte, breakglassCommitLen)
+	for i := range r.BreakglassCommit {
+		r.BreakglassCommit[i] = byte(0xC0 + i)
+	}
+	r.U2PubKey = make([]byte, authPubkeyLen)
+	for i := range r.U2PubKey {
+		r.U2PubKey[i] = byte(0x90 ^ i)
+	}
+	r.LastGuardedSendEpoch = 0xDEADBEEF
+
+	enc := packAccountRecord(r)
+	// Fixed emit order: 0x01, 0x02, 0x03, 0x04 (byte-deterministic records across nodes).
+	o := accountBaseLen + metadataLenLen
+	wantOrder := []byte{tlvAuthPubkey, tlvBreakglassCommit, tlvU2Pubkey, tlvGuardedLastSend}
+	for _, wantTag := range wantOrder {
+		if enc[o] != wantTag {
+			t.Fatalf("TLV tag at offset %d = 0x%02x, want 0x%02x", o, enc[o], wantTag)
+		}
+		flen := int(binary.BigEndian.Uint16(enc[o+1 : o+3]))
+		o += tlvHeaderLen + flen
+	}
+	back, ok := unpackAccountRecord(enc)
+	if !ok {
+		t.Fatal("unpack failed on a U2+rate-limit record")
+	}
+	if !accountRecordEqual(back, r) {
+		t.Errorf("U2/rate-limit round-trip mismatch:\n got %+v\nwant %+v", back, r)
+	}
+
+	// Omission rules: LastGuardedSendEpoch == 0 emits NO 0x04 tag and empty U2 emits NO 0x03
+	// tag — a never-sent, pre-U2 record's bytes are unchanged from before this feature.
+	r2 := r
+	r2.U2PubKey = nil
+	r2.LastGuardedSendEpoch = 0
+	enc2 := packAccountRecord(r2)
+	if bytes.Contains(enc2[accountBaseLen+metadataLenLen:], []byte{tlvGuardedLastSend, 0, 8}) {
+		t.Error("zero LastGuardedSendEpoch still emitted a GUARDED_LAST_SEND TLV")
+	}
+	wantLen := accountBaseLen + metadataLenLen +
+		tlvHeaderLen + authPubkeyLen + tlvHeaderLen + breakglassCommitLen
+	if len(enc2) != wantLen {
+		t.Errorf("pre-U2-shape record len = %d, want %d (no 0x03/0x04 tags)", len(enc2), wantLen)
+	}
+
+	// A derived-copy TRANSFER chain carries U2 alongside TRANSFER_META.
+	tr := sampleTransferRecord()
+	tr.AuthPubKey = append([]byte(nil), r.AuthPubKey...)
+	tr.BreakglassCommit = append([]byte(nil), r.BreakglassCommit...)
+	tr.U2PubKey = append([]byte(nil), r.U2PubKey...)
+	trBack, ok := unpackAccountRecord(packAccountRecord(tr))
+	if !ok {
+		t.Fatal("unpack failed on a transfer record with a copied U2")
+	}
+	if !accountRecordEqual(trBack, tr) || trBack.TransferUnlock != tr.TransferUnlock {
+		t.Errorf("transfer+U2 round-trip mismatch")
+	}
+
+	// Fail-closed lengths: a wrong-size U2_PUBKEY or GUARDED_LAST_SEND value rejects the record.
+	for _, c := range []struct {
+		name string
+		blob []byte
+	}{
+		{"short U2_PUBKEY", appendTLV(nil, tlvU2Pubkey, make([]byte, authPubkeyLen-1))},
+		{"long U2_PUBKEY", appendTLV(nil, tlvU2Pubkey, make([]byte, authPubkeyLen+1))},
+		{"short GUARDED_LAST_SEND", appendTLV(nil, tlvGuardedLastSend, make([]byte, 7))},
+		{"long GUARDED_LAST_SEND", appendTLV(nil, tlvGuardedLastSend, make([]byte, 9))},
+	} {
+		rec := make([]byte, accountBaseLen+metadataLenLen+len(c.blob))
+		binary.BigEndian.PutUint32(rec[48:52], uint32(pb.AccountClass_ACCOUNT_CLASS_GUARDED))
+		binary.BigEndian.PutUint16(rec[52:54], uint16(len(c.blob)))
+		copy(rec[54:], c.blob)
+		if _, ok := unpackAccountRecord(rec); ok {
+			t.Errorf("%s: accepted a wrong-length field", c.name)
+		}
 	}
 }
 

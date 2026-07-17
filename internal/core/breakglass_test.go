@@ -382,7 +382,7 @@ func TestBreakglassApplyForcesTransferReceivable(t *testing.T) {
 	}
 	raw, _ := proto.Marshal(bgTx)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, bgTx, txid, testFund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, bgTx, txid, testFund, testEcon, 0)
 	}); err != nil {
 		t.Fatalf("apply breakglass drain: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestBreakglassApplyForcesTransferReceivable(t *testing.T) {
 	pid, _ := crypto.TxID(plain)
 	praw, _ := proto.Marshal(plain)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, praw, plain, pid, testFund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, praw, plain, pid, testFund, testEcon, 0)
 	}); err != nil {
 		t.Fatalf("apply plain: %v", err)
 	}

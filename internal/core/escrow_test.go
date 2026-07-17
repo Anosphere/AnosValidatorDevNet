@@ -522,9 +522,10 @@ func TestEscrowAttestationTrigger(t *testing.T) {
 }
 
 // TestEscrowOutflowTxIDBindsSigners pins the keyless escrow-outflow txid: SHA256(sign_bytes ||
-// multisig_digest) (no Tx.sig folded — byte-identical to the keyless-Fund-SEND form) and it binds
-// the EXACT signer set (order-independently). Without this, two outflows with the same body but
-// different signer sets would share a txid → a multisig-swap fork.
+// frame(sig2) || multisig_digest) (no Tx.sig folded; sig2 absent folds as a zero-length uint32-LE
+// frame — the forquinn §2.3 layout, same as the keyless-Fund-SEND form) and it binds the EXACT
+// signer set (order-independently). Without this, two outflows with the same body but different
+// signer sets would share a txid → a multisig-swap fork.
 func TestEscrowOutflowTxIDBindsSigners(t *testing.T) {
 	f := newEscrowOutFixture(t, false, 0)
 	var dest [32]byte
@@ -545,9 +546,12 @@ func TestEscrowOutflowTxIDBindsSigners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	want := sha256.Sum256(append(append([]byte{}, sb...), dig...))
+	buf := append([]byte{}, sb...)
+	buf = append(buf, make([]byte, 4)...) // frame(sig2): absent → uint32-LE zero frame
+	buf = append(buf, dig...)
+	want := sha256.Sum256(buf)
 	if id != want {
-		t.Error("keyless escrow-outflow txid != SHA256(sign_bytes || multisig_digest)")
+		t.Error("keyless escrow-outflow txid != SHA256(sign_bytes || frame(sig2) || multisig_digest)")
 	}
 
 	// Reorder entries → same txid (canonical sort inside the digest).
@@ -605,7 +609,7 @@ func TestEscrowApplyOpenAndDrain(t *testing.T) {
 	openRaw, _ := proto.Marshal(opening)
 	openTxid := txidFor(escID, 1)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund, testEcon, 0)
 	}); err != nil {
 		t.Fatalf("ApplyTx opening: %v", err)
 	}
@@ -655,7 +659,7 @@ func TestEscrowApplyOpenAndDrain(t *testing.T) {
 
 	// Idempotent re-apply of the opening must not double-charge the Fund.
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, openRaw, opening, openTxid, fund, testEcon, 0)
 	}); err != nil {
 		t.Fatalf("re-apply opening: %v", err)
 	}
@@ -676,7 +680,7 @@ func TestEscrowApplyOpenAndDrain(t *testing.T) {
 	drainRaw, _ := proto.Marshal(drain)
 	drainTxid := txidFor(escID, 2)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, drainRaw, drain, drainTxid, fund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, drainRaw, drain, drainTxid, fund, testEcon, 0)
 	}); err != nil {
 		t.Fatalf("ApplyTx drain: %v", err)
 	}

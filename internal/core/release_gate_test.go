@@ -379,7 +379,9 @@ func TestReleaseTxIDBindsSigAndMultisig(t *testing.T) {
 		t.Fatalf("txid: %v", err)
 	}
 
-	// Explicit construction: txid == SHA256(sign_bytes || Tx.sig || canonical(multisig)).
+	// Explicit construction (forquinn §2.3): txid == SHA256(sign_bytes || Tx.sig || frame(sig2)
+	// || canonical(multisig)) — sig2 absent on a path-(b) release folds as a zero-length
+	// uint32-LE frame.
 	sb, err := crypto.SignBytesACTE(tx)
 	if err != nil {
 		t.Fatalf("signbytes: %v", err)
@@ -388,10 +390,11 @@ func TestReleaseTxIDBindsSigAndMultisig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	buf := append(append(append([]byte{}, sb...), tx.Sig.V...), dig...)
+	buf := append(append(append([]byte{}, sb...), tx.Sig.V...), make([]byte, 4)...)
+	buf = append(buf, dig...)
 	want := sha256.Sum256(buf)
 	if id12 != want {
-		t.Error("release txid != SHA256(sign_bytes || Tx.sig || multisig_digest)")
+		t.Error("release txid != SHA256(sign_bytes || Tx.sig || frame(sig2) || multisig_digest)")
 	}
 
 	// Reordering the entries → same txid (canonical sort).
@@ -492,7 +495,7 @@ func TestApplySetsReleaseAttestorFlag(t *testing.T) {
 			raw, _ := proto.Marshal(ptx)
 			txid := txidFor(chainID, 1)
 			if err := db.Update(func(tx *bbolt.Tx) error {
-				return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
+				return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon, 0)
 			}); err != nil {
 				t.Fatalf("ApplyTx opening RECEIVE: %v", err)
 			}
@@ -519,9 +522,10 @@ func TestApplySetsReleaseAttestorFlag(t *testing.T) {
 	}
 }
 
-// TestFundSendTxIDByteIdentity pins that the keyless Fund-SEND txid is unchanged by the P3.2
-// TxID rework: with no Tx.sig it stays SHA256(sign_bytes || multisig_digest) — nothing is folded
-// between the body and the digest.
+// TestFundSendTxIDByteIdentity pins the CURRENT canonical keyless Fund-SEND txid construction:
+// SHA256(sign_bytes || frame(sig2) || multisig_digest). (Pre-forquinn this was byte-identical to
+// the pre-P3.2 form; the forquinn §2.3 sig2 fold deliberately inserts an unconditional zero-length
+// uint32-LE frame — old txids die at the cutover reset, which is the point.)
 func TestFundSendTxIDByteIdentity(t *testing.T) {
 	g1, g2 := newGuardian(1), newGuardian(2)
 	tx := buildFundSend(testFund, [32]byte{0xaa}, 2, [32]byte{0x42}, anosUnits(10), 100, []*tGuardian{g1, g2})
@@ -537,8 +541,11 @@ func TestFundSendTxIDByteIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	want := sha256.Sum256(append(append([]byte{}, sb...), dig...))
+	buf := append([]byte{}, sb...)
+	buf = append(buf, make([]byte, 4)...) // frame(sig2): absent → zero-length frame
+	buf = append(buf, dig...)
+	want := sha256.Sum256(buf)
 	if got != want {
-		t.Error("keyless Fund-SEND txid is not SHA256(sign_bytes || multisig_digest) — byte-identity broken")
+		t.Error("keyless Fund-SEND txid is not SHA256(sign_bytes || frame(sig2) || multisig_digest)")
 	}
 }

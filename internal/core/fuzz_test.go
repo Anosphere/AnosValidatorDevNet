@@ -270,7 +270,7 @@ func FuzzApplyTx(f *testing.F) {
 			if err := ensureBuckets(btx); err != nil {
 				return err
 			}
-			_ = ApplyTx(&bboltTxView{tx: btx}, data, tx, txid, e.cfg.FundAccount, e.cfg.Econ)
+			_ = ApplyTx(&bboltTxView{tx: btx}, data, tx, txid, e.cfg.FundAccount, e.cfg.Econ, 0)
 			return rollback() // never persist — every exec sees the same seeded state
 		})
 	})

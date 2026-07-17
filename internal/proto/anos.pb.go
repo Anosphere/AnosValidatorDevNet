@@ -539,9 +539,20 @@ type TxBodySend struct {
 	// return to an account that is not the staker). It preserves "a Guardian quorum can ENACT but never
 	// REDIRECT a stake": the quorum authorizes the Fund SEND, but only the real owner's key can name a
 	// new beneficiary. A return to the staker's own account needs no owner_auth (existing behavior).
-	OwnerAuth     *StakeOwnerAuth `protobuf:"bytes,15,opt,name=owner_auth,json=ownerAuth,proto3" json:"owner_auth,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	OwnerAuth *StakeOwnerAuth `protobuf:"bytes,15,opt,name=owner_auth,json=ownerAuth,proto3" json:"owner_auth,omitempty"`
+	// Attestor case commitment (forquinn item 2, spec-19 §6.1). Present ONLY on an attestor-gated
+	// TRANSFER release-to-dest (guarded/vault path (b) and the breakglass hop-2 release): both MUST be
+	// exactly 32 bytes there and MUST be absent on every other SEND shape (incl. the U1+U2 path (a) —
+	// the reject-everywhere-not-expected / anti-txid-grind discipline). Opaque to Anos: case_nonce is
+	// the moderation case's nonce and attestation_hash the hash of the moderator attestation document;
+	// the validator enforces presence/length only, never contents. Both are folded into SignBytesACTE
+	// UNCONDITIONALLY + length-framed (empty on every other SEND), so the user signature AND every
+	// attestor signature commit to them — an attestor signature with no attestation behind it is
+	// invalid by construction, and a swapped/stripped commitment changes the preimage → the txid.
+	CaseNonce       []byte `protobuf:"bytes,16,opt,name=case_nonce,json=caseNonce,proto3" json:"case_nonce,omitempty"`                   // 32 B, attestor-gated releases only (opaque to Anos)
+	AttestationHash []byte `protobuf:"bytes,17,opt,name=attestation_hash,json=attestationHash,proto3" json:"attestation_hash,omitempty"` // 32 B, attestor-gated releases only (opaque to Anos)
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *TxBodySend) Reset() {
@@ -679,6 +690,20 @@ func (x *TxBodySend) GetOwnerAuth() *StakeOwnerAuth {
 	return nil
 }
 
+func (x *TxBodySend) GetCaseNonce() []byte {
+	if x != nil {
+		return x.CaseNonce
+	}
+	return nil
+}
+
+func (x *TxBodySend) GetAttestationHash() []byte {
+	if x != nil {
+		return x.AttestationHash
+	}
+	return nil
+}
+
 // StakeOwnerAuth carries the current stake owner's signature over the recovery binding (P5.4):
 //
 //	m_owner = SHA256( "ANOSv2-StakeOwnerAuth\0" ‖ op_byte ‖ deposit_txid(32) ‖ beneficiary(32) )
@@ -741,6 +766,72 @@ func (x *StakeOwnerAuth) GetRevealedBreakglassPubkey() *HybridPubKey {
 	return nil
 }
 
+// U2Registration registers a GUARDED/VAULT account's SECOND user key U2 on the account-opening
+// RECEIVE (forquinn item 1/4, modeled on StakeOwnerAuth). U2 is a co-equal user key: after opening,
+// a single user signature (hop-1 initiate, owner-cancel, release path (b)) verifies under U1 OR U2,
+// and the attestor-free release path (a) requires BOTH (Tx.sig under U1 AND Tx.sig2 under U2).
+// pop_sig is U2's proof-of-possession self-signature over
+//
+//	m_u2 = SHA256("ANOSv2-U2Registration\0" ‖ account_id(32) ‖ u2_pubkey(2625)),
+//
+// which forces cryptographic parseability of U2 and binds the registration to this exact account
+// (non-replayable; the standard anti-rogue-key form). U2 is NOT part of the account-id derivation —
+// it is bound via the signed opening preimage (both fields are folded into SignBytesACTE,
+// length-framed) + this PoP, verified in validate AND apply. Present ONLY on a GUARDED/VAULT opening
+// RECEIVE; rejected on every other tx shape. A TRANSFER chain never carries one — it inherits its
+// key source's stored U2 by DERIVED COPY at chain creation (ApplyTx), like srcClass/TransferSource.
+type U2Registration struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pubkey        *HybridPubKey          `protobuf:"bytes,1,opt,name=pubkey,proto3" json:"pubkey,omitempty"`               // 2625 B; the second user key U2
+	PopSig        *HybridSig             `protobuf:"bytes,2,opt,name=pop_sig,json=popSig,proto3" json:"pop_sig,omitempty"` // 4691 B; U2's self-signature over m_u2 (proof-of-possession)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *U2Registration) Reset() {
+	*x = U2Registration{}
+	mi := &file_proto_anos_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *U2Registration) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*U2Registration) ProtoMessage() {}
+
+func (x *U2Registration) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_anos_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use U2Registration.ProtoReflect.Descriptor instead.
+func (*U2Registration) Descriptor() ([]byte, []int) {
+	return file_proto_anos_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *U2Registration) GetPubkey() *HybridPubKey {
+	if x != nil {
+		return x.Pubkey
+	}
+	return nil
+}
+
+func (x *U2Registration) GetPopSig() *HybridSig {
+	if x != nil {
+		return x.PopSig
+	}
+	return nil
+}
+
 type TxBodyReceive struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
 	ReceivableId *Hash32                `protobuf:"bytes,1,opt,name=receivable_id,json=receivableId,proto3" json:"receivable_id,omitempty"`
@@ -767,14 +858,21 @@ type TxBodyReceive struct {
 	// escrow opening (each party's commitment lives inside escrow_open). All escrow_open fields are
 	// folded into SignBytesACTE on the opening block so they cannot be tampered. Ignored for any other
 	// class. spec-19 §6.3 governs the 2-of-2 outflow + the 1-of-2 → Fund attestation trigger.
-	EscrowOpen    *EscrowOpen `protobuf:"bytes,7,opt,name=escrow_open,json=escrowOpen,proto3" json:"escrow_open,omitempty"`
+	EscrowOpen *EscrowOpen `protobuf:"bytes,7,opt,name=escrow_open,json=escrowOpen,proto3" json:"escrow_open,omitempty"`
+	// Second-user-key registration (forquinn item 1/4). REQUIRED on a GUARDED/VAULT account-opening
+	// RECEIVE (both halves length-checked, U2 parseable, != auth_pubkey, PoP verified in validate AND
+	// apply); REJECTED on every other RECEIVE (any other opening class, and every non-opening block) —
+	// the reject-everywhere-not-expected / anti-txid-grind discipline. Both halves are folded into
+	// SignBytesACTE UNCONDITIONALLY + length-framed (empty frames elsewhere), so they are bound to the
+	// opening signature and the txid and cannot be stripped/swapped in flight (the P1.2 lesson).
+	U2            *U2Registration `protobuf:"bytes,8,opt,name=u2,proto3" json:"u2,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TxBodyReceive) Reset() {
 	*x = TxBodyReceive{}
-	mi := &file_proto_anos_proto_msgTypes[8]
+	mi := &file_proto_anos_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -786,7 +884,7 @@ func (x *TxBodyReceive) String() string {
 func (*TxBodyReceive) ProtoMessage() {}
 
 func (x *TxBodyReceive) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[8]
+	mi := &file_proto_anos_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -799,7 +897,7 @@ func (x *TxBodyReceive) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxBodyReceive.ProtoReflect.Descriptor instead.
 func (*TxBodyReceive) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{8}
+	return file_proto_anos_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *TxBodyReceive) GetReceivableId() *Hash32 {
@@ -851,6 +949,13 @@ func (x *TxBodyReceive) GetEscrowOpen() *EscrowOpen {
 	return nil
 }
 
+func (x *TxBodyReceive) GetU2() *U2Registration {
+	if x != nil {
+		return x.U2
+	}
+	return nil
+}
+
 // EscrowOpen carries the two-party material registered on an escrow's opening RECEIVE (spec-18
 // §5.6.2). The two parties are given in CANONICAL ORDER — party_lo's HybridPubKey is
 // lexicographically less than party_hi's — the same ordering crypto.EscrowKeyblob uses to derive
@@ -872,7 +977,7 @@ type EscrowOpen struct {
 
 func (x *EscrowOpen) Reset() {
 	*x = EscrowOpen{}
-	mi := &file_proto_anos_proto_msgTypes[9]
+	mi := &file_proto_anos_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -884,7 +989,7 @@ func (x *EscrowOpen) String() string {
 func (*EscrowOpen) ProtoMessage() {}
 
 func (x *EscrowOpen) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[9]
+	mi := &file_proto_anos_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -897,7 +1002,7 @@ func (x *EscrowOpen) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EscrowOpen.ProtoReflect.Descriptor instead.
 func (*EscrowOpen) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{9}
+	return file_proto_anos_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *EscrowOpen) GetPartyLoPubkey() *HybridPubKey {
@@ -969,7 +1074,7 @@ type HybridSigEntry struct {
 
 func (x *HybridSigEntry) Reset() {
 	*x = HybridSigEntry{}
-	mi := &file_proto_anos_proto_msgTypes[10]
+	mi := &file_proto_anos_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -981,7 +1086,7 @@ func (x *HybridSigEntry) String() string {
 func (*HybridSigEntry) ProtoMessage() {}
 
 func (x *HybridSigEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[10]
+	mi := &file_proto_anos_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -994,7 +1099,7 @@ func (x *HybridSigEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HybridSigEntry.ProtoReflect.Descriptor instead.
 func (*HybridSigEntry) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{10}
+	return file_proto_anos_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HybridSigEntry) GetSignerId() *AccountId {
@@ -1027,7 +1132,7 @@ type HybridMultiSig struct {
 
 func (x *HybridMultiSig) Reset() {
 	*x = HybridMultiSig{}
-	mi := &file_proto_anos_proto_msgTypes[11]
+	mi := &file_proto_anos_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1039,7 +1144,7 @@ func (x *HybridMultiSig) String() string {
 func (*HybridMultiSig) ProtoMessage() {}
 
 func (x *HybridMultiSig) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[11]
+	mi := &file_proto_anos_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1052,7 +1157,7 @@ func (x *HybridMultiSig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HybridMultiSig.ProtoReflect.Descriptor instead.
 func (*HybridMultiSig) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{11}
+	return file_proto_anos_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *HybridMultiSig) GetEntries() []*HybridSigEntry {
@@ -1081,7 +1186,7 @@ type TxSignable struct {
 
 func (x *TxSignable) Reset() {
 	*x = TxSignable{}
-	mi := &file_proto_anos_proto_msgTypes[12]
+	mi := &file_proto_anos_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1093,7 +1198,7 @@ func (x *TxSignable) String() string {
 func (*TxSignable) ProtoMessage() {}
 
 func (x *TxSignable) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[12]
+	mi := &file_proto_anos_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1106,7 +1211,7 @@ func (x *TxSignable) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxSignable.ProtoReflect.Descriptor instead.
 func (*TxSignable) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{12}
+	return file_proto_anos_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *TxSignable) GetType() TxType {
@@ -1207,13 +1312,25 @@ type Tx struct {
 	// / escrow outflow must NOT carry it (those are multisig-authorized; the escrow breakglass key rides
 	// on HybridSigEntry instead).
 	RevealedBreakglassPubkey *HybridPubKey `protobuf:"bytes,23,opt,name=revealed_breakglass_pubkey,json=revealedBreakglassPubkey,proto3" json:"revealed_breakglass_pubkey,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// Second user signature for the attestor-free release path (a) (forquinn item 1): on an
+	// attestor-gated TRANSFER release-to-dest, (U1 sig AND U2 sig) substitutes for the attestor
+	// quorum. Fixed roles: Tx.sig MUST verify under the chain's copied U1 and sig2 under its copied
+	// U2, both over the same digest m = SHA256(SignBytesACTE(tx)) — never the multisig slot (U2 has
+	// no account of its own to resolve by signer_id). sig2 is NOT in the signed preimage (a signature
+	// cannot sign itself); like Tx.sig it is bound via the txid — crypto.TxID folds it
+	// UNCONDITIONALLY + length-framed, so a stripped/attached/swapped sig2 is a different txid and no
+	// {sig, sig2, multisig} presence combination can alias another. Because a third party could
+	// attach one, sig2 is REJECTED on every tx shape except path (a) (multisig must be ABSENT there;
+	// a sig2 never combines with a breakglass reveal) — the same reject-everywhere-not-expected
+	// treatment as the multisig.
+	Sig2          *HybridSig `protobuf:"bytes,24,opt,name=sig2,proto3" json:"sig2,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Tx) Reset() {
 	*x = Tx{}
-	mi := &file_proto_anos_proto_msgTypes[13]
+	mi := &file_proto_anos_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1225,7 +1342,7 @@ func (x *Tx) String() string {
 func (*Tx) ProtoMessage() {}
 
 func (x *Tx) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[13]
+	mi := &file_proto_anos_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1238,7 +1355,7 @@ func (x *Tx) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Tx.ProtoReflect.Descriptor instead.
 func (*Tx) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{13}
+	return file_proto_anos_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Tx) GetType() TxType {
@@ -1311,6 +1428,13 @@ func (x *Tx) GetMultiSig() *HybridMultiSig {
 func (x *Tx) GetRevealedBreakglassPubkey() *HybridPubKey {
 	if x != nil {
 		return x.RevealedBreakglassPubkey
+	}
+	return nil
+}
+
+func (x *Tx) GetSig2() *HybridSig {
+	if x != nil {
+		return x.Sig2
 	}
 	return nil
 }
@@ -1395,7 +1519,7 @@ type Receivable struct {
 
 func (x *Receivable) Reset() {
 	*x = Receivable{}
-	mi := &file_proto_anos_proto_msgTypes[14]
+	mi := &file_proto_anos_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1407,7 +1531,7 @@ func (x *Receivable) String() string {
 func (*Receivable) ProtoMessage() {}
 
 func (x *Receivable) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[14]
+	mi := &file_proto_anos_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1420,7 +1544,7 @@ func (x *Receivable) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Receivable.ProtoReflect.Descriptor instead.
 func (*Receivable) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{14}
+	return file_proto_anos_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Receivable) GetId() *Hash32 {
@@ -1540,7 +1664,7 @@ type EpochRecord struct {
 
 func (x *EpochRecord) Reset() {
 	*x = EpochRecord{}
-	mi := &file_proto_anos_proto_msgTypes[15]
+	mi := &file_proto_anos_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1552,7 +1676,7 @@ func (x *EpochRecord) String() string {
 func (*EpochRecord) ProtoMessage() {}
 
 func (x *EpochRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[15]
+	mi := &file_proto_anos_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1565,7 +1689,7 @@ func (x *EpochRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EpochRecord.ProtoReflect.Descriptor instead.
 func (*EpochRecord) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{15}
+	return file_proto_anos_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *EpochRecord) GetEpoch() uint64 {
@@ -1608,7 +1732,7 @@ type ApiError struct {
 
 func (x *ApiError) Reset() {
 	*x = ApiError{}
-	mi := &file_proto_anos_proto_msgTypes[16]
+	mi := &file_proto_anos_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1620,7 +1744,7 @@ func (x *ApiError) String() string {
 func (*ApiError) ProtoMessage() {}
 
 func (x *ApiError) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[16]
+	mi := &file_proto_anos_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1633,7 +1757,7 @@ func (x *ApiError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApiError.ProtoReflect.Descriptor instead.
 func (*ApiError) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{16}
+	return file_proto_anos_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ApiError) GetCode() uint32 {
@@ -1667,7 +1791,7 @@ type SubmitTxRequest struct {
 
 func (x *SubmitTxRequest) Reset() {
 	*x = SubmitTxRequest{}
-	mi := &file_proto_anos_proto_msgTypes[17]
+	mi := &file_proto_anos_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1679,7 +1803,7 @@ func (x *SubmitTxRequest) String() string {
 func (*SubmitTxRequest) ProtoMessage() {}
 
 func (x *SubmitTxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[17]
+	mi := &file_proto_anos_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1692,7 +1816,7 @@ func (x *SubmitTxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitTxRequest.ProtoReflect.Descriptor instead.
 func (*SubmitTxRequest) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{17}
+	return file_proto_anos_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SubmitTxRequest) GetTx() *Tx {
@@ -1715,7 +1839,7 @@ type SubmitTxResponse struct {
 
 func (x *SubmitTxResponse) Reset() {
 	*x = SubmitTxResponse{}
-	mi := &file_proto_anos_proto_msgTypes[18]
+	mi := &file_proto_anos_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1727,7 +1851,7 @@ func (x *SubmitTxResponse) String() string {
 func (*SubmitTxResponse) ProtoMessage() {}
 
 func (x *SubmitTxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[18]
+	mi := &file_proto_anos_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1740,7 +1864,7 @@ func (x *SubmitTxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitTxResponse.ProtoReflect.Descriptor instead.
 func (*SubmitTxResponse) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{18}
+	return file_proto_anos_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *SubmitTxResponse) GetOk() bool {
@@ -1784,7 +1908,7 @@ type AccountState struct {
 
 func (x *AccountState) Reset() {
 	*x = AccountState{}
-	mi := &file_proto_anos_proto_msgTypes[19]
+	mi := &file_proto_anos_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1796,7 +1920,7 @@ func (x *AccountState) String() string {
 func (*AccountState) ProtoMessage() {}
 
 func (x *AccountState) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[19]
+	mi := &file_proto_anos_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1809,7 +1933,7 @@ func (x *AccountState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AccountState.ProtoReflect.Descriptor instead.
 func (*AccountState) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{19}
+	return file_proto_anos_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *AccountState) GetAccount() *AccountId {
@@ -1877,7 +2001,7 @@ type GetAccountRequest struct {
 
 func (x *GetAccountRequest) Reset() {
 	*x = GetAccountRequest{}
-	mi := &file_proto_anos_proto_msgTypes[20]
+	mi := &file_proto_anos_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1889,7 +2013,7 @@ func (x *GetAccountRequest) String() string {
 func (*GetAccountRequest) ProtoMessage() {}
 
 func (x *GetAccountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[20]
+	mi := &file_proto_anos_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1902,7 +2026,7 @@ func (x *GetAccountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAccountRequest.ProtoReflect.Descriptor instead.
 func (*GetAccountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{20}
+	return file_proto_anos_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *GetAccountRequest) GetAccount() *AccountId {
@@ -1923,7 +2047,7 @@ type GetAccountResponse struct {
 
 func (x *GetAccountResponse) Reset() {
 	*x = GetAccountResponse{}
-	mi := &file_proto_anos_proto_msgTypes[21]
+	mi := &file_proto_anos_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1935,7 +2059,7 @@ func (x *GetAccountResponse) String() string {
 func (*GetAccountResponse) ProtoMessage() {}
 
 func (x *GetAccountResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[21]
+	mi := &file_proto_anos_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1948,7 +2072,7 @@ func (x *GetAccountResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAccountResponse.ProtoReflect.Descriptor instead.
 func (*GetAccountResponse) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{21}
+	return file_proto_anos_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *GetAccountResponse) GetOk() bool {
@@ -1983,7 +2107,7 @@ type ListReceivablesRequest struct {
 
 func (x *ListReceivablesRequest) Reset() {
 	*x = ListReceivablesRequest{}
-	mi := &file_proto_anos_proto_msgTypes[22]
+	mi := &file_proto_anos_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1995,7 +2119,7 @@ func (x *ListReceivablesRequest) String() string {
 func (*ListReceivablesRequest) ProtoMessage() {}
 
 func (x *ListReceivablesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[22]
+	mi := &file_proto_anos_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2008,7 +2132,7 @@ func (x *ListReceivablesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReceivablesRequest.ProtoReflect.Descriptor instead.
 func (*ListReceivablesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{22}
+	return file_proto_anos_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ListReceivablesRequest) GetAccount() *AccountId {
@@ -2036,7 +2160,7 @@ type ListReceivablesResponse struct {
 
 func (x *ListReceivablesResponse) Reset() {
 	*x = ListReceivablesResponse{}
-	mi := &file_proto_anos_proto_msgTypes[23]
+	mi := &file_proto_anos_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2048,7 +2172,7 @@ func (x *ListReceivablesResponse) String() string {
 func (*ListReceivablesResponse) ProtoMessage() {}
 
 func (x *ListReceivablesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[23]
+	mi := &file_proto_anos_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2061,7 +2185,7 @@ func (x *ListReceivablesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReceivablesResponse.ProtoReflect.Descriptor instead.
 func (*ListReceivablesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{23}
+	return file_proto_anos_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ListReceivablesResponse) GetOk() bool {
@@ -2096,7 +2220,7 @@ type SigDER struct {
 
 func (x *SigDER) Reset() {
 	*x = SigDER{}
-	mi := &file_proto_anos_proto_msgTypes[24]
+	mi := &file_proto_anos_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2108,7 +2232,7 @@ func (x *SigDER) String() string {
 func (*SigDER) ProtoMessage() {}
 
 func (x *SigDER) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[24]
+	mi := &file_proto_anos_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2121,7 +2245,7 @@ func (x *SigDER) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SigDER.ProtoReflect.Descriptor instead.
 func (*SigDER) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{24}
+	return file_proto_anos_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *SigDER) GetV() []byte {
@@ -2142,7 +2266,7 @@ type TxInv struct {
 
 func (x *TxInv) Reset() {
 	*x = TxInv{}
-	mi := &file_proto_anos_proto_msgTypes[25]
+	mi := &file_proto_anos_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2154,7 +2278,7 @@ func (x *TxInv) String() string {
 func (*TxInv) ProtoMessage() {}
 
 func (x *TxInv) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[25]
+	mi := &file_proto_anos_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2167,7 +2291,7 @@ func (x *TxInv) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxInv.ProtoReflect.Descriptor instead.
 func (*TxInv) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{25}
+	return file_proto_anos_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *TxInv) GetEpoch() uint64 {
@@ -2202,7 +2326,7 @@ type TxWant struct {
 
 func (x *TxWant) Reset() {
 	*x = TxWant{}
-	mi := &file_proto_anos_proto_msgTypes[26]
+	mi := &file_proto_anos_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2214,7 +2338,7 @@ func (x *TxWant) String() string {
 func (*TxWant) ProtoMessage() {}
 
 func (x *TxWant) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[26]
+	mi := &file_proto_anos_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2227,7 +2351,7 @@ func (x *TxWant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxWant.ProtoReflect.Descriptor instead.
 func (*TxWant) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{26}
+	return file_proto_anos_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *TxWant) GetEpoch() uint64 {
@@ -2262,7 +2386,7 @@ type TxPush struct {
 
 func (x *TxPush) Reset() {
 	*x = TxPush{}
-	mi := &file_proto_anos_proto_msgTypes[27]
+	mi := &file_proto_anos_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2274,7 +2398,7 @@ func (x *TxPush) String() string {
 func (*TxPush) ProtoMessage() {}
 
 func (x *TxPush) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[27]
+	mi := &file_proto_anos_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2287,7 +2411,7 @@ func (x *TxPush) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TxPush.ProtoReflect.Descriptor instead.
 func (*TxPush) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{27}
+	return file_proto_anos_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *TxPush) GetEpoch() uint64 {
@@ -2326,7 +2450,7 @@ type CandidateListV2 struct {
 
 func (x *CandidateListV2) Reset() {
 	*x = CandidateListV2{}
-	mi := &file_proto_anos_proto_msgTypes[28]
+	mi := &file_proto_anos_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2338,7 +2462,7 @@ func (x *CandidateListV2) String() string {
 func (*CandidateListV2) ProtoMessage() {}
 
 func (x *CandidateListV2) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[28]
+	mi := &file_proto_anos_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2351,7 +2475,7 @@ func (x *CandidateListV2) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CandidateListV2.ProtoReflect.Descriptor instead.
 func (*CandidateListV2) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{28}
+	return file_proto_anos_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *CandidateListV2) GetEpoch() uint64 {
@@ -2406,7 +2530,7 @@ type EpochFinalization struct {
 
 func (x *EpochFinalization) Reset() {
 	*x = EpochFinalization{}
-	mi := &file_proto_anos_proto_msgTypes[29]
+	mi := &file_proto_anos_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2418,7 +2542,7 @@ func (x *EpochFinalization) String() string {
 func (*EpochFinalization) ProtoMessage() {}
 
 func (x *EpochFinalization) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[29]
+	mi := &file_proto_anos_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2431,7 +2555,7 @@ func (x *EpochFinalization) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EpochFinalization.ProtoReflect.Descriptor instead.
 func (*EpochFinalization) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{29}
+	return file_proto_anos_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *EpochFinalization) GetEpoch() uint64 {
@@ -2484,7 +2608,7 @@ type SyncLatestRequest struct {
 
 func (x *SyncLatestRequest) Reset() {
 	*x = SyncLatestRequest{}
-	mi := &file_proto_anos_proto_msgTypes[30]
+	mi := &file_proto_anos_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2496,7 +2620,7 @@ func (x *SyncLatestRequest) String() string {
 func (*SyncLatestRequest) ProtoMessage() {}
 
 func (x *SyncLatestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[30]
+	mi := &file_proto_anos_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2509,7 +2633,7 @@ func (x *SyncLatestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncLatestRequest.ProtoReflect.Descriptor instead.
 func (*SyncLatestRequest) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{30}
+	return file_proto_anos_proto_rawDescGZIP(), []int{31}
 }
 
 type SyncLatestResponse struct {
@@ -2521,7 +2645,7 @@ type SyncLatestResponse struct {
 
 func (x *SyncLatestResponse) Reset() {
 	*x = SyncLatestResponse{}
-	mi := &file_proto_anos_proto_msgTypes[31]
+	mi := &file_proto_anos_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2533,7 +2657,7 @@ func (x *SyncLatestResponse) String() string {
 func (*SyncLatestResponse) ProtoMessage() {}
 
 func (x *SyncLatestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[31]
+	mi := &file_proto_anos_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2546,7 +2670,7 @@ func (x *SyncLatestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncLatestResponse.ProtoReflect.Descriptor instead.
 func (*SyncLatestResponse) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{31}
+	return file_proto_anos_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *SyncLatestResponse) GetLatestEpoch() uint64 {
@@ -2565,7 +2689,7 @@ type SyncFinalizationRequest struct {
 
 func (x *SyncFinalizationRequest) Reset() {
 	*x = SyncFinalizationRequest{}
-	mi := &file_proto_anos_proto_msgTypes[32]
+	mi := &file_proto_anos_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2577,7 +2701,7 @@ func (x *SyncFinalizationRequest) String() string {
 func (*SyncFinalizationRequest) ProtoMessage() {}
 
 func (x *SyncFinalizationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[32]
+	mi := &file_proto_anos_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2590,7 +2714,7 @@ func (x *SyncFinalizationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncFinalizationRequest.ProtoReflect.Descriptor instead.
 func (*SyncFinalizationRequest) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{32}
+	return file_proto_anos_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *SyncFinalizationRequest) GetEpoch() uint64 {
@@ -2609,7 +2733,7 @@ type SyncFinalizationResponse struct {
 
 func (x *SyncFinalizationResponse) Reset() {
 	*x = SyncFinalizationResponse{}
-	mi := &file_proto_anos_proto_msgTypes[33]
+	mi := &file_proto_anos_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2621,7 +2745,7 @@ func (x *SyncFinalizationResponse) String() string {
 func (*SyncFinalizationResponse) ProtoMessage() {}
 
 func (x *SyncFinalizationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[33]
+	mi := &file_proto_anos_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2634,7 +2758,7 @@ func (x *SyncFinalizationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncFinalizationResponse.ProtoReflect.Descriptor instead.
 func (*SyncFinalizationResponse) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{33}
+	return file_proto_anos_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *SyncFinalizationResponse) GetFinalizations() []*EpochFinalization {
@@ -2654,7 +2778,7 @@ type FrontierEntry struct {
 
 func (x *FrontierEntry) Reset() {
 	*x = FrontierEntry{}
-	mi := &file_proto_anos_proto_msgTypes[34]
+	mi := &file_proto_anos_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2666,7 +2790,7 @@ func (x *FrontierEntry) String() string {
 func (*FrontierEntry) ProtoMessage() {}
 
 func (x *FrontierEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[34]
+	mi := &file_proto_anos_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2679,7 +2803,7 @@ func (x *FrontierEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FrontierEntry.ProtoReflect.Descriptor instead.
 func (*FrontierEntry) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{34}
+	return file_proto_anos_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *FrontierEntry) GetAccount() *AccountId {
@@ -2707,7 +2831,7 @@ type SyncFrontiersRequest struct {
 
 func (x *SyncFrontiersRequest) Reset() {
 	*x = SyncFrontiersRequest{}
-	mi := &file_proto_anos_proto_msgTypes[35]
+	mi := &file_proto_anos_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2719,7 +2843,7 @@ func (x *SyncFrontiersRequest) String() string {
 func (*SyncFrontiersRequest) ProtoMessage() {}
 
 func (x *SyncFrontiersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[35]
+	mi := &file_proto_anos_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2732,7 +2856,7 @@ func (x *SyncFrontiersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncFrontiersRequest.ProtoReflect.Descriptor instead.
 func (*SyncFrontiersRequest) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{35}
+	return file_proto_anos_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *SyncFrontiersRequest) GetEpoch() uint64 {
@@ -2767,7 +2891,7 @@ type SyncFrontiersResponse struct {
 
 func (x *SyncFrontiersResponse) Reset() {
 	*x = SyncFrontiersResponse{}
-	mi := &file_proto_anos_proto_msgTypes[36]
+	mi := &file_proto_anos_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2779,7 +2903,7 @@ func (x *SyncFrontiersResponse) String() string {
 func (*SyncFrontiersResponse) ProtoMessage() {}
 
 func (x *SyncFrontiersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[36]
+	mi := &file_proto_anos_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2792,7 +2916,7 @@ func (x *SyncFrontiersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncFrontiersResponse.ProtoReflect.Descriptor instead.
 func (*SyncFrontiersResponse) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{36}
+	return file_proto_anos_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *SyncFrontiersResponse) GetEpoch() uint64 {
@@ -2828,7 +2952,7 @@ type SyncChainRequest struct {
 
 func (x *SyncChainRequest) Reset() {
 	*x = SyncChainRequest{}
-	mi := &file_proto_anos_proto_msgTypes[37]
+	mi := &file_proto_anos_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2840,7 +2964,7 @@ func (x *SyncChainRequest) String() string {
 func (*SyncChainRequest) ProtoMessage() {}
 
 func (x *SyncChainRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[37]
+	mi := &file_proto_anos_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2853,7 +2977,7 @@ func (x *SyncChainRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncChainRequest.ProtoReflect.Descriptor instead.
 func (*SyncChainRequest) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{37}
+	return file_proto_anos_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *SyncChainRequest) GetAccount() *AccountId {
@@ -2894,7 +3018,7 @@ type SyncChainResponse struct {
 
 func (x *SyncChainResponse) Reset() {
 	*x = SyncChainResponse{}
-	mi := &file_proto_anos_proto_msgTypes[38]
+	mi := &file_proto_anos_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2906,7 +3030,7 @@ func (x *SyncChainResponse) String() string {
 func (*SyncChainResponse) ProtoMessage() {}
 
 func (x *SyncChainResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_anos_proto_msgTypes[38]
+	mi := &file_proto_anos_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2919,7 +3043,7 @@ func (x *SyncChainResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncChainResponse.ProtoReflect.Descriptor instead.
 func (*SyncChainResponse) Descriptor() ([]byte, []int) {
-	return file_proto_anos_proto_rawDescGZIP(), []int{38}
+	return file_proto_anos_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *SyncChainResponse) GetTx() []*Tx {
@@ -2952,7 +3076,7 @@ const file_proto_anos_proto_rawDesc = "" +
 	"\fHybridPubKey\x12\f\n" +
 	"\x01v\x18\x01 \x01(\fR\x01v\"\x19\n" +
 	"\tAccountId\x12\f\n" +
-	"\x01v\x18\x01 \x01(\fR\x01v\"\xa7\x05\n" +
+	"\x01v\x18\x01 \x01(\fR\x01v\"\xf1\x05\n" +
 	"\n" +
 	"TxBodySend\x12\"\n" +
 	"\x02to\x18\x01 \x01(\v2\x12.anos.v2.AccountIdR\x02to\x12\x16\n" +
@@ -2973,10 +3097,16 @@ const file_proto_anos_proto_rawDesc = "" +
 	"\x14recovery_beneficiary\x18\r \x01(\v2\x12.anos.v2.AccountIdR\x13recoveryBeneficiary\x12.\n" +
 	"\x13return_delay_epochs\x18\x0e \x01(\x04R\x11returnDelayEpochs\x126\n" +
 	"\n" +
-	"owner_auth\x18\x0f \x01(\v2\x17.anos.v2.StakeOwnerAuthR\townerAuth\"\x8b\x01\n" +
+	"owner_auth\x18\x0f \x01(\v2\x17.anos.v2.StakeOwnerAuthR\townerAuth\x12\x1d\n" +
+	"\n" +
+	"case_nonce\x18\x10 \x01(\fR\tcaseNonce\x12)\n" +
+	"\x10attestation_hash\x18\x11 \x01(\fR\x0fattestationHash\"\x8b\x01\n" +
 	"\x0eStakeOwnerAuth\x12$\n" +
 	"\x03sig\x18\x01 \x01(\v2\x12.anos.v2.HybridSigR\x03sig\x12S\n" +
-	"\x1arevealed_breakglass_pubkey\x18\x02 \x01(\v2\x15.anos.v2.HybridPubKeyR\x18revealedBreakglassPubkey\"\xb0\x03\n" +
+	"\x1arevealed_breakglass_pubkey\x18\x02 \x01(\v2\x15.anos.v2.HybridPubKeyR\x18revealedBreakglassPubkey\"l\n" +
+	"\x0eU2Registration\x12-\n" +
+	"\x06pubkey\x18\x01 \x01(\v2\x15.anos.v2.HybridPubKeyR\x06pubkey\x12+\n" +
+	"\apop_sig\x18\x02 \x01(\v2\x12.anos.v2.HybridSigR\x06popSig\"\xd9\x03\n" +
 	"\rTxBodyReceive\x124\n" +
 	"\rreceivable_id\x18\x01 \x01(\v2\x0f.anos.v2.Hash32R\freceivableId\x12:\n" +
 	"\raccount_class\x18\x02 \x01(\x0e2\x15.anos.v2.AccountClassR\faccountClass\x12E\n" +
@@ -2986,7 +3116,8 @@ const file_proto_anos_proto_rawDesc = "" +
 	"authPubkey\x12D\n" +
 	"\x15breakglass_commitment\x18\x06 \x01(\v2\x0f.anos.v2.Hash64R\x14breakglassCommitment\x124\n" +
 	"\vescrow_open\x18\a \x01(\v2\x13.anos.v2.EscrowOpenR\n" +
-	"escrowOpen\"\xfe\x02\n" +
+	"escrowOpen\x12'\n" +
+	"\x02u2\x18\b \x01(\v2\x17.anos.v2.U2RegistrationR\x02u2\"\xfe\x02\n" +
 	"\n" +
 	"EscrowOpen\x12=\n" +
 	"\x0fparty_lo_pubkey\x18\x01 \x01(\v2\x15.anos.v2.HybridPubKeyR\rpartyLoPubkey\x12L\n" +
@@ -3010,7 +3141,7 @@ const file_proto_anos_proto_rawDesc = "" +
 	"\x04send\x18\n" +
 	" \x01(\v2\x13.anos.v2.TxBodySendH\x00R\x04send\x122\n" +
 	"\areceive\x18\v \x01(\v2\x16.anos.v2.TxBodyReceiveH\x00R\areceiveB\x06\n" +
-	"\x04bodyJ\x04\b\f\x10\rJ\x04\b\r\x10\x0e\"\xb8\x03\n" +
+	"\x04bodyJ\x04\b\f\x10\rJ\x04\b\r\x10\x0e\"\xe0\x03\n" +
 	"\x02Tx\x12#\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x0f.anos.v2.TxTypeR\x04type\x12,\n" +
 	"\aaccount\x18\x02 \x01(\v2\x12.anos.v2.AccountIdR\aaccount\x12#\n" +
@@ -3021,7 +3152,8 @@ const file_proto_anos_proto_rawDesc = "" +
 	"\areceive\x18\v \x01(\v2\x16.anos.v2.TxBodyReceiveH\x00R\areceive\x12$\n" +
 	"\x03sig\x18\x14 \x01(\v2\x12.anos.v2.HybridSigR\x03sig\x124\n" +
 	"\tmulti_sig\x18\x15 \x01(\v2\x17.anos.v2.HybridMultiSigR\bmultiSig\x12S\n" +
-	"\x1arevealed_breakglass_pubkey\x18\x17 \x01(\v2\x15.anos.v2.HybridPubKeyR\x18revealedBreakglassPubkeyB\x06\n" +
+	"\x1arevealed_breakglass_pubkey\x18\x17 \x01(\v2\x15.anos.v2.HybridPubKeyR\x18revealedBreakglassPubkey\x12&\n" +
+	"\x04sig2\x18\x18 \x01(\v2\x12.anos.v2.HybridSigR\x04sig2B\x06\n" +
 	"\x04bodyJ\x04\b\f\x10\rJ\x04\b\r\x10\x0eJ\x04\b\x16\x10\x17\"\x95\x05\n" +
 	"\n" +
 	"Receivable\x12\x1f\n" +
@@ -3167,7 +3299,7 @@ func file_proto_anos_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_anos_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_anos_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_proto_anos_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_proto_anos_proto_goTypes = []any{
 	(TxType)(0),                      // 0: anos.v2.TxType
 	(AccountClass)(0),                // 1: anos.v2.AccountClass
@@ -3180,37 +3312,38 @@ var file_proto_anos_proto_goTypes = []any{
 	(*AccountId)(nil),                // 8: anos.v2.AccountId
 	(*TxBodySend)(nil),               // 9: anos.v2.TxBodySend
 	(*StakeOwnerAuth)(nil),           // 10: anos.v2.StakeOwnerAuth
-	(*TxBodyReceive)(nil),            // 11: anos.v2.TxBodyReceive
-	(*EscrowOpen)(nil),               // 12: anos.v2.EscrowOpen
-	(*HybridSigEntry)(nil),           // 13: anos.v2.HybridSigEntry
-	(*HybridMultiSig)(nil),           // 14: anos.v2.HybridMultiSig
-	(*TxSignable)(nil),               // 15: anos.v2.TxSignable
-	(*Tx)(nil),                       // 16: anos.v2.Tx
-	(*Receivable)(nil),               // 17: anos.v2.Receivable
-	(*EpochRecord)(nil),              // 18: anos.v2.EpochRecord
-	(*ApiError)(nil),                 // 19: anos.v2.ApiError
-	(*SubmitTxRequest)(nil),          // 20: anos.v2.SubmitTxRequest
-	(*SubmitTxResponse)(nil),         // 21: anos.v2.SubmitTxResponse
-	(*AccountState)(nil),             // 22: anos.v2.AccountState
-	(*GetAccountRequest)(nil),        // 23: anos.v2.GetAccountRequest
-	(*GetAccountResponse)(nil),       // 24: anos.v2.GetAccountResponse
-	(*ListReceivablesRequest)(nil),   // 25: anos.v2.ListReceivablesRequest
-	(*ListReceivablesResponse)(nil),  // 26: anos.v2.ListReceivablesResponse
-	(*SigDER)(nil),                   // 27: anos.v2.SigDER
-	(*TxInv)(nil),                    // 28: anos.v2.TxInv
-	(*TxWant)(nil),                   // 29: anos.v2.TxWant
-	(*TxPush)(nil),                   // 30: anos.v2.TxPush
-	(*CandidateListV2)(nil),          // 31: anos.v2.CandidateListV2
-	(*EpochFinalization)(nil),        // 32: anos.v2.EpochFinalization
-	(*SyncLatestRequest)(nil),        // 33: anos.v2.SyncLatestRequest
-	(*SyncLatestResponse)(nil),       // 34: anos.v2.SyncLatestResponse
-	(*SyncFinalizationRequest)(nil),  // 35: anos.v2.SyncFinalizationRequest
-	(*SyncFinalizationResponse)(nil), // 36: anos.v2.SyncFinalizationResponse
-	(*FrontierEntry)(nil),            // 37: anos.v2.FrontierEntry
-	(*SyncFrontiersRequest)(nil),     // 38: anos.v2.SyncFrontiersRequest
-	(*SyncFrontiersResponse)(nil),    // 39: anos.v2.SyncFrontiersResponse
-	(*SyncChainRequest)(nil),         // 40: anos.v2.SyncChainRequest
-	(*SyncChainResponse)(nil),        // 41: anos.v2.SyncChainResponse
+	(*U2Registration)(nil),           // 11: anos.v2.U2Registration
+	(*TxBodyReceive)(nil),            // 12: anos.v2.TxBodyReceive
+	(*EscrowOpen)(nil),               // 13: anos.v2.EscrowOpen
+	(*HybridSigEntry)(nil),           // 14: anos.v2.HybridSigEntry
+	(*HybridMultiSig)(nil),           // 15: anos.v2.HybridMultiSig
+	(*TxSignable)(nil),               // 16: anos.v2.TxSignable
+	(*Tx)(nil),                       // 17: anos.v2.Tx
+	(*Receivable)(nil),               // 18: anos.v2.Receivable
+	(*EpochRecord)(nil),              // 19: anos.v2.EpochRecord
+	(*ApiError)(nil),                 // 20: anos.v2.ApiError
+	(*SubmitTxRequest)(nil),          // 21: anos.v2.SubmitTxRequest
+	(*SubmitTxResponse)(nil),         // 22: anos.v2.SubmitTxResponse
+	(*AccountState)(nil),             // 23: anos.v2.AccountState
+	(*GetAccountRequest)(nil),        // 24: anos.v2.GetAccountRequest
+	(*GetAccountResponse)(nil),       // 25: anos.v2.GetAccountResponse
+	(*ListReceivablesRequest)(nil),   // 26: anos.v2.ListReceivablesRequest
+	(*ListReceivablesResponse)(nil),  // 27: anos.v2.ListReceivablesResponse
+	(*SigDER)(nil),                   // 28: anos.v2.SigDER
+	(*TxInv)(nil),                    // 29: anos.v2.TxInv
+	(*TxWant)(nil),                   // 30: anos.v2.TxWant
+	(*TxPush)(nil),                   // 31: anos.v2.TxPush
+	(*CandidateListV2)(nil),          // 32: anos.v2.CandidateListV2
+	(*EpochFinalization)(nil),        // 33: anos.v2.EpochFinalization
+	(*SyncLatestRequest)(nil),        // 34: anos.v2.SyncLatestRequest
+	(*SyncLatestResponse)(nil),       // 35: anos.v2.SyncLatestResponse
+	(*SyncFinalizationRequest)(nil),  // 36: anos.v2.SyncFinalizationRequest
+	(*SyncFinalizationResponse)(nil), // 37: anos.v2.SyncFinalizationResponse
+	(*FrontierEntry)(nil),            // 38: anos.v2.FrontierEntry
+	(*SyncFrontiersRequest)(nil),     // 39: anos.v2.SyncFrontiersRequest
+	(*SyncFrontiersResponse)(nil),    // 40: anos.v2.SyncFrontiersResponse
+	(*SyncChainRequest)(nil),         // 41: anos.v2.SyncChainRequest
+	(*SyncChainResponse)(nil),        // 42: anos.v2.SyncChainResponse
 }
 var file_proto_anos_proto_depIdxs = []int32{
 	8,  // 0: anos.v2.TxBodySend.to:type_name -> anos.v2.AccountId
@@ -3222,88 +3355,92 @@ var file_proto_anos_proto_depIdxs = []int32{
 	10, // 6: anos.v2.TxBodySend.owner_auth:type_name -> anos.v2.StakeOwnerAuth
 	6,  // 7: anos.v2.StakeOwnerAuth.sig:type_name -> anos.v2.HybridSig
 	7,  // 8: anos.v2.StakeOwnerAuth.revealed_breakglass_pubkey:type_name -> anos.v2.HybridPubKey
-	3,  // 9: anos.v2.TxBodyReceive.receivable_id:type_name -> anos.v2.Hash32
-	1,  // 10: anos.v2.TxBodyReceive.account_class:type_name -> anos.v2.AccountClass
-	8,  // 11: anos.v2.TxBodyReceive.transfer_destination:type_name -> anos.v2.AccountId
-	7,  // 12: anos.v2.TxBodyReceive.auth_pubkey:type_name -> anos.v2.HybridPubKey
-	4,  // 13: anos.v2.TxBodyReceive.breakglass_commitment:type_name -> anos.v2.Hash64
-	12, // 14: anos.v2.TxBodyReceive.escrow_open:type_name -> anos.v2.EscrowOpen
-	7,  // 15: anos.v2.EscrowOpen.party_lo_pubkey:type_name -> anos.v2.HybridPubKey
-	4,  // 16: anos.v2.EscrowOpen.party_lo_breakglass_commit:type_name -> anos.v2.Hash64
-	7,  // 17: anos.v2.EscrowOpen.party_hi_pubkey:type_name -> anos.v2.HybridPubKey
-	4,  // 18: anos.v2.EscrowOpen.party_hi_breakglass_commit:type_name -> anos.v2.Hash64
-	8,  // 19: anos.v2.HybridSigEntry.signer_id:type_name -> anos.v2.AccountId
-	6,  // 20: anos.v2.HybridSigEntry.sig:type_name -> anos.v2.HybridSig
-	7,  // 21: anos.v2.HybridSigEntry.revealed_breakglass_pubkey:type_name -> anos.v2.HybridPubKey
-	13, // 22: anos.v2.HybridMultiSig.entries:type_name -> anos.v2.HybridSigEntry
-	0,  // 23: anos.v2.TxSignable.type:type_name -> anos.v2.TxType
-	8,  // 24: anos.v2.TxSignable.account:type_name -> anos.v2.AccountId
-	3,  // 25: anos.v2.TxSignable.prev:type_name -> anos.v2.Hash32
-	9,  // 26: anos.v2.TxSignable.send:type_name -> anos.v2.TxBodySend
-	11, // 27: anos.v2.TxSignable.receive:type_name -> anos.v2.TxBodyReceive
-	0,  // 28: anos.v2.Tx.type:type_name -> anos.v2.TxType
-	8,  // 29: anos.v2.Tx.account:type_name -> anos.v2.AccountId
-	3,  // 30: anos.v2.Tx.prev:type_name -> anos.v2.Hash32
-	9,  // 31: anos.v2.Tx.send:type_name -> anos.v2.TxBodySend
-	11, // 32: anos.v2.Tx.receive:type_name -> anos.v2.TxBodyReceive
-	6,  // 33: anos.v2.Tx.sig:type_name -> anos.v2.HybridSig
-	14, // 34: anos.v2.Tx.multi_sig:type_name -> anos.v2.HybridMultiSig
-	7,  // 35: anos.v2.Tx.revealed_breakglass_pubkey:type_name -> anos.v2.HybridPubKey
-	3,  // 36: anos.v2.Receivable.id:type_name -> anos.v2.Hash32
-	8,  // 37: anos.v2.Receivable.from:type_name -> anos.v2.AccountId
-	8,  // 38: anos.v2.Receivable.to:type_name -> anos.v2.AccountId
-	3,  // 39: anos.v2.Receivable.created_by_tx:type_name -> anos.v2.Hash32
-	3,  // 40: anos.v2.Receivable.claimed_by_tx:type_name -> anos.v2.Hash32
-	1,  // 41: anos.v2.Receivable.required_dest_class:type_name -> anos.v2.AccountClass
-	8,  // 42: anos.v2.Receivable.key_source_id:type_name -> anos.v2.AccountId
-	2,  // 43: anos.v2.Receivable.return_tier:type_name -> anos.v2.StakeTimeDelay
-	3,  // 44: anos.v2.Receivable.return_deposit_txid:type_name -> anos.v2.Hash32
-	3,  // 45: anos.v2.EpochRecord.accepted_txs:type_name -> anos.v2.Hash32
-	3,  // 46: anos.v2.EpochRecord.state_root:type_name -> anos.v2.Hash32
-	3,  // 47: anos.v2.EpochRecord.prev_epoch_hash:type_name -> anos.v2.Hash32
-	16, // 48: anos.v2.SubmitTxRequest.tx:type_name -> anos.v2.Tx
-	3,  // 49: anos.v2.SubmitTxResponse.txid:type_name -> anos.v2.Hash32
-	19, // 50: anos.v2.SubmitTxResponse.error:type_name -> anos.v2.ApiError
-	8,  // 51: anos.v2.AccountState.account:type_name -> anos.v2.AccountId
-	3,  // 52: anos.v2.AccountState.head:type_name -> anos.v2.Hash32
-	1,  // 53: anos.v2.AccountState.account_class:type_name -> anos.v2.AccountClass
-	8,  // 54: anos.v2.AccountState.transfer_source:type_name -> anos.v2.AccountId
-	8,  // 55: anos.v2.AccountState.transfer_destination:type_name -> anos.v2.AccountId
-	8,  // 56: anos.v2.GetAccountRequest.account:type_name -> anos.v2.AccountId
-	22, // 57: anos.v2.GetAccountResponse.state:type_name -> anos.v2.AccountState
-	19, // 58: anos.v2.GetAccountResponse.error:type_name -> anos.v2.ApiError
-	8,  // 59: anos.v2.ListReceivablesRequest.account:type_name -> anos.v2.AccountId
-	17, // 60: anos.v2.ListReceivablesResponse.receivables:type_name -> anos.v2.Receivable
-	19, // 61: anos.v2.ListReceivablesResponse.error:type_name -> anos.v2.ApiError
-	5,  // 62: anos.v2.TxInv.from:type_name -> anos.v2.Pub32
-	3,  // 63: anos.v2.TxInv.txid:type_name -> anos.v2.Hash32
-	5,  // 64: anos.v2.TxWant.from:type_name -> anos.v2.Pub32
-	3,  // 65: anos.v2.TxWant.txid:type_name -> anos.v2.Hash32
-	5,  // 66: anos.v2.TxPush.from:type_name -> anos.v2.Pub32
-	16, // 67: anos.v2.TxPush.tx:type_name -> anos.v2.Tx
-	5,  // 68: anos.v2.CandidateListV2.proposer:type_name -> anos.v2.Pub32
-	3,  // 69: anos.v2.CandidateListV2.txid:type_name -> anos.v2.Hash32
-	3,  // 70: anos.v2.CandidateListV2.list_hash:type_name -> anos.v2.Hash32
-	27, // 71: anos.v2.CandidateListV2.sig:type_name -> anos.v2.SigDER
-	3,  // 72: anos.v2.EpochFinalization.accepted_txids_hash:type_name -> anos.v2.Hash32
-	3,  // 73: anos.v2.EpochFinalization.frontiers_root:type_name -> anos.v2.Hash32
-	5,  // 74: anos.v2.EpochFinalization.signer:type_name -> anos.v2.Pub32
-	27, // 75: anos.v2.EpochFinalization.sig:type_name -> anos.v2.SigDER
-	32, // 76: anos.v2.SyncFinalizationResponse.finalizations:type_name -> anos.v2.EpochFinalization
-	8,  // 77: anos.v2.FrontierEntry.account:type_name -> anos.v2.AccountId
-	3,  // 78: anos.v2.FrontierEntry.head:type_name -> anos.v2.Hash32
-	8,  // 79: anos.v2.SyncFrontiersRequest.cursor:type_name -> anos.v2.AccountId
-	37, // 80: anos.v2.SyncFrontiersResponse.entries:type_name -> anos.v2.FrontierEntry
-	8,  // 81: anos.v2.SyncFrontiersResponse.next_cursor:type_name -> anos.v2.AccountId
-	8,  // 82: anos.v2.SyncChainRequest.account:type_name -> anos.v2.AccountId
-	3,  // 83: anos.v2.SyncChainRequest.target_head:type_name -> anos.v2.Hash32
-	3,  // 84: anos.v2.SyncChainRequest.have:type_name -> anos.v2.Hash32
-	16, // 85: anos.v2.SyncChainResponse.tx:type_name -> anos.v2.Tx
-	86, // [86:86] is the sub-list for method output_type
-	86, // [86:86] is the sub-list for method input_type
-	86, // [86:86] is the sub-list for extension type_name
-	86, // [86:86] is the sub-list for extension extendee
-	0,  // [0:86] is the sub-list for field type_name
+	7,  // 9: anos.v2.U2Registration.pubkey:type_name -> anos.v2.HybridPubKey
+	6,  // 10: anos.v2.U2Registration.pop_sig:type_name -> anos.v2.HybridSig
+	3,  // 11: anos.v2.TxBodyReceive.receivable_id:type_name -> anos.v2.Hash32
+	1,  // 12: anos.v2.TxBodyReceive.account_class:type_name -> anos.v2.AccountClass
+	8,  // 13: anos.v2.TxBodyReceive.transfer_destination:type_name -> anos.v2.AccountId
+	7,  // 14: anos.v2.TxBodyReceive.auth_pubkey:type_name -> anos.v2.HybridPubKey
+	4,  // 15: anos.v2.TxBodyReceive.breakglass_commitment:type_name -> anos.v2.Hash64
+	13, // 16: anos.v2.TxBodyReceive.escrow_open:type_name -> anos.v2.EscrowOpen
+	11, // 17: anos.v2.TxBodyReceive.u2:type_name -> anos.v2.U2Registration
+	7,  // 18: anos.v2.EscrowOpen.party_lo_pubkey:type_name -> anos.v2.HybridPubKey
+	4,  // 19: anos.v2.EscrowOpen.party_lo_breakglass_commit:type_name -> anos.v2.Hash64
+	7,  // 20: anos.v2.EscrowOpen.party_hi_pubkey:type_name -> anos.v2.HybridPubKey
+	4,  // 21: anos.v2.EscrowOpen.party_hi_breakglass_commit:type_name -> anos.v2.Hash64
+	8,  // 22: anos.v2.HybridSigEntry.signer_id:type_name -> anos.v2.AccountId
+	6,  // 23: anos.v2.HybridSigEntry.sig:type_name -> anos.v2.HybridSig
+	7,  // 24: anos.v2.HybridSigEntry.revealed_breakglass_pubkey:type_name -> anos.v2.HybridPubKey
+	14, // 25: anos.v2.HybridMultiSig.entries:type_name -> anos.v2.HybridSigEntry
+	0,  // 26: anos.v2.TxSignable.type:type_name -> anos.v2.TxType
+	8,  // 27: anos.v2.TxSignable.account:type_name -> anos.v2.AccountId
+	3,  // 28: anos.v2.TxSignable.prev:type_name -> anos.v2.Hash32
+	9,  // 29: anos.v2.TxSignable.send:type_name -> anos.v2.TxBodySend
+	12, // 30: anos.v2.TxSignable.receive:type_name -> anos.v2.TxBodyReceive
+	0,  // 31: anos.v2.Tx.type:type_name -> anos.v2.TxType
+	8,  // 32: anos.v2.Tx.account:type_name -> anos.v2.AccountId
+	3,  // 33: anos.v2.Tx.prev:type_name -> anos.v2.Hash32
+	9,  // 34: anos.v2.Tx.send:type_name -> anos.v2.TxBodySend
+	12, // 35: anos.v2.Tx.receive:type_name -> anos.v2.TxBodyReceive
+	6,  // 36: anos.v2.Tx.sig:type_name -> anos.v2.HybridSig
+	15, // 37: anos.v2.Tx.multi_sig:type_name -> anos.v2.HybridMultiSig
+	7,  // 38: anos.v2.Tx.revealed_breakglass_pubkey:type_name -> anos.v2.HybridPubKey
+	6,  // 39: anos.v2.Tx.sig2:type_name -> anos.v2.HybridSig
+	3,  // 40: anos.v2.Receivable.id:type_name -> anos.v2.Hash32
+	8,  // 41: anos.v2.Receivable.from:type_name -> anos.v2.AccountId
+	8,  // 42: anos.v2.Receivable.to:type_name -> anos.v2.AccountId
+	3,  // 43: anos.v2.Receivable.created_by_tx:type_name -> anos.v2.Hash32
+	3,  // 44: anos.v2.Receivable.claimed_by_tx:type_name -> anos.v2.Hash32
+	1,  // 45: anos.v2.Receivable.required_dest_class:type_name -> anos.v2.AccountClass
+	8,  // 46: anos.v2.Receivable.key_source_id:type_name -> anos.v2.AccountId
+	2,  // 47: anos.v2.Receivable.return_tier:type_name -> anos.v2.StakeTimeDelay
+	3,  // 48: anos.v2.Receivable.return_deposit_txid:type_name -> anos.v2.Hash32
+	3,  // 49: anos.v2.EpochRecord.accepted_txs:type_name -> anos.v2.Hash32
+	3,  // 50: anos.v2.EpochRecord.state_root:type_name -> anos.v2.Hash32
+	3,  // 51: anos.v2.EpochRecord.prev_epoch_hash:type_name -> anos.v2.Hash32
+	17, // 52: anos.v2.SubmitTxRequest.tx:type_name -> anos.v2.Tx
+	3,  // 53: anos.v2.SubmitTxResponse.txid:type_name -> anos.v2.Hash32
+	20, // 54: anos.v2.SubmitTxResponse.error:type_name -> anos.v2.ApiError
+	8,  // 55: anos.v2.AccountState.account:type_name -> anos.v2.AccountId
+	3,  // 56: anos.v2.AccountState.head:type_name -> anos.v2.Hash32
+	1,  // 57: anos.v2.AccountState.account_class:type_name -> anos.v2.AccountClass
+	8,  // 58: anos.v2.AccountState.transfer_source:type_name -> anos.v2.AccountId
+	8,  // 59: anos.v2.AccountState.transfer_destination:type_name -> anos.v2.AccountId
+	8,  // 60: anos.v2.GetAccountRequest.account:type_name -> anos.v2.AccountId
+	23, // 61: anos.v2.GetAccountResponse.state:type_name -> anos.v2.AccountState
+	20, // 62: anos.v2.GetAccountResponse.error:type_name -> anos.v2.ApiError
+	8,  // 63: anos.v2.ListReceivablesRequest.account:type_name -> anos.v2.AccountId
+	18, // 64: anos.v2.ListReceivablesResponse.receivables:type_name -> anos.v2.Receivable
+	20, // 65: anos.v2.ListReceivablesResponse.error:type_name -> anos.v2.ApiError
+	5,  // 66: anos.v2.TxInv.from:type_name -> anos.v2.Pub32
+	3,  // 67: anos.v2.TxInv.txid:type_name -> anos.v2.Hash32
+	5,  // 68: anos.v2.TxWant.from:type_name -> anos.v2.Pub32
+	3,  // 69: anos.v2.TxWant.txid:type_name -> anos.v2.Hash32
+	5,  // 70: anos.v2.TxPush.from:type_name -> anos.v2.Pub32
+	17, // 71: anos.v2.TxPush.tx:type_name -> anos.v2.Tx
+	5,  // 72: anos.v2.CandidateListV2.proposer:type_name -> anos.v2.Pub32
+	3,  // 73: anos.v2.CandidateListV2.txid:type_name -> anos.v2.Hash32
+	3,  // 74: anos.v2.CandidateListV2.list_hash:type_name -> anos.v2.Hash32
+	28, // 75: anos.v2.CandidateListV2.sig:type_name -> anos.v2.SigDER
+	3,  // 76: anos.v2.EpochFinalization.accepted_txids_hash:type_name -> anos.v2.Hash32
+	3,  // 77: anos.v2.EpochFinalization.frontiers_root:type_name -> anos.v2.Hash32
+	5,  // 78: anos.v2.EpochFinalization.signer:type_name -> anos.v2.Pub32
+	28, // 79: anos.v2.EpochFinalization.sig:type_name -> anos.v2.SigDER
+	33, // 80: anos.v2.SyncFinalizationResponse.finalizations:type_name -> anos.v2.EpochFinalization
+	8,  // 81: anos.v2.FrontierEntry.account:type_name -> anos.v2.AccountId
+	3,  // 82: anos.v2.FrontierEntry.head:type_name -> anos.v2.Hash32
+	8,  // 83: anos.v2.SyncFrontiersRequest.cursor:type_name -> anos.v2.AccountId
+	38, // 84: anos.v2.SyncFrontiersResponse.entries:type_name -> anos.v2.FrontierEntry
+	8,  // 85: anos.v2.SyncFrontiersResponse.next_cursor:type_name -> anos.v2.AccountId
+	8,  // 86: anos.v2.SyncChainRequest.account:type_name -> anos.v2.AccountId
+	3,  // 87: anos.v2.SyncChainRequest.target_head:type_name -> anos.v2.Hash32
+	3,  // 88: anos.v2.SyncChainRequest.have:type_name -> anos.v2.Hash32
+	17, // 89: anos.v2.SyncChainResponse.tx:type_name -> anos.v2.Tx
+	90, // [90:90] is the sub-list for method output_type
+	90, // [90:90] is the sub-list for method input_type
+	90, // [90:90] is the sub-list for extension type_name
+	90, // [90:90] is the sub-list for extension extendee
+	0,  // [0:90] is the sub-list for field type_name
 }
 
 func init() { file_proto_anos_proto_init() }
@@ -3311,11 +3448,11 @@ func file_proto_anos_proto_init() {
 	if File_proto_anos_proto != nil {
 		return
 	}
-	file_proto_anos_proto_msgTypes[12].OneofWrappers = []any{
+	file_proto_anos_proto_msgTypes[13].OneofWrappers = []any{
 		(*TxSignable_Send)(nil),
 		(*TxSignable_Receive)(nil),
 	}
-	file_proto_anos_proto_msgTypes[13].OneofWrappers = []any{
+	file_proto_anos_proto_msgTypes[14].OneofWrappers = []any{
 		(*Tx_Send)(nil),
 		(*Tx_Receive)(nil),
 	}
@@ -3325,7 +3462,7 @@ func file_proto_anos_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_anos_proto_rawDesc), len(file_proto_anos_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   39,
+			NumMessages:   40,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
