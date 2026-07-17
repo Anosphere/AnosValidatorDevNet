@@ -185,6 +185,27 @@ type ReceivableSnap struct {
 	FromBreakglass bool
 }
 
+// sigKey* identify WHICH key a tx's single Tx.sig verified under (forquinn D4/D5). The generic
+// resolution at the top of ValidateTxAgainstSnapshot accepts U1 OR a registered U2 anywhere a
+// single user signature is accepted (D4: hop-1 sends, cancels, non-opening receives, the path-(b)
+// user half); the attestor-free release path (a) then requires FIXED roles — Tx.sig under U1 and
+// sig2 under U2 (D5) — so the verifier records what actually matched instead of re-deriving it.
+const (
+	sigKeyNone       = iota // keyless (Fund SEND / escrow outflow — no Tx.sig)
+	sigKeyU1                // the account's cached auth pubkey (U1)
+	sigKeyU2                // the account's registered second user key (U2)
+	sigKeyBreakglass        // the tx's revealed breakglass pubkey
+	sigKeyCarried           // an opening RECEIVE's carried auth_pubkey (becomes U1 at apply)
+)
+
+// classRequiresU2 reports whether accounts of class c register a second user key U2 at their
+// opening (forquinn item 1): GUARDED and VAULT (locked decision 2 extends forquinn's "guarded"
+// to both — they are structurally identical but for the delay). Every other class must NOT
+// carry a U2 registration; TRANSFER chains get U2 by DERIVED COPY in ApplyTx (D2), never carried.
+func classRequiresU2(c pb.AccountClass) bool {
+	return c == pb.AccountClass_ACCOUNT_CLASS_GUARDED || c == pb.AccountClass_ACCOUNT_CLASS_VAULT
+}
+
 // delayForSourceClass returns the timelock delay (in epochs) that a transfer funded by a
 // source of the given class must impose, read from the finalized snapshot's per-class
 // constants. TIMELOCKED/GUARDED/VAULT each impose their own delay (VAULT > GUARDED >
@@ -354,6 +375,14 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 	// both the signature and the txid.
 	revealedBG := tx.GetRevealedBreakglassPubkey().GetV()
 	isBreakglass := len(revealedBG) > 0
+	// sig2 — the path-(a) second user signature (forquinn item 1). Like the multisig it is NOT
+	// under the signature (a sig can't sign itself; crypto.TxID folds it), so a third party could
+	// attach one — it therefore gets the full reject-everywhere-not-expected treatment below:
+	// legitimate ONLY on an attestor-flagged TRANSFER release-to-dest (path (a)). Content-based
+	// presence, matching the TxID frame (crypto.TxID hard-errors any length outside {0, 4691}).
+	sig2 := tx.GetSig2().GetV()
+	hasSig2 := len(sig2) > 0
+	sigKey := sigKeyNone
 	if isFundSend || isEscrowOutflow {
 		// A keyless multisig SEND (Fund SEND or escrow outflow) MUST NOT carry a Tx.sig. This is
 		// consensus-critical, not cosmetic: crypto.TxID discriminates the multisig-binding txid on
@@ -380,14 +409,23 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 		if err := crypto.VerifyTxSignature(tx, revealedBG); err != nil {
 			return [32]byte{}, ErrBadSig
 		}
-	} else {
-		var authPub []byte
-		if openingAccount {
-			authPub = tx.GetReceive().GetAuthPubkey().GetV()
-		} else {
-			authPub = as.AuthPubKey
+		sigKey = sigKeyBreakglass
+	} else if openingAccount {
+		// An opening is signed by the carried key only (U1 — a U2, if any, is registered ON this
+		// block and proves possession via its PoP, never by signing the opening itself).
+		if err := crypto.VerifyTxSignature(tx, tx.GetReceive().GetAuthPubkey().GetV()); err != nil {
+			return [32]byte{}, ErrBadSig
 		}
-		if err := crypto.VerifyTxSignature(tx, authPub); err != nil {
+		sigKey = sigKeyCarried
+	} else {
+		// Single user signature: U1 OR — when the account registered one — U2 (forquinn D4,
+		// uniform at this one resolution site). U2PubKey is set only on GUARDED/VAULT accounts
+		// and TRANSFER chains that derived-copied one, so the second try is a no-op elsewhere.
+		if err := crypto.VerifyTxSignature(tx, as.AuthPubKey); err == nil {
+			sigKey = sigKeyU1
+		} else if len(as.U2PubKey) == crypto.HybridPubKeySize && crypto.VerifyTxSignature(tx, as.U2PubKey) == nil {
+			sigKey = sigKeyU2
+		} else {
 			return [32]byte{}, ErrBadSig
 		}
 	}
@@ -447,6 +485,18 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 		// is an allowed stake origin (as.Class == TRANSFER, not restricted); a direct
 		// restricted-class stake is rejected here so it never reaches apply.
 		if to == snap.FundAccount {
+			// D1 (forquinn plan): a restricted-class account may not SEND to the Fund directly AT
+			// ALL — a bare donation (empty staked_for) included. A to==Fund send mints no
+			// receivable, so the TRANSFER-routing restriction never applies and the send would be
+			// a single-sig, windowless, attestor-free, irreversible outbound — exactly the spend
+			// shape the guarded/vault protections exist to prevent (coercion/destruction vector).
+			// The routed path (drain a TRANSFER chain to the Fund) covers every legitimate need.
+			switch as.Class {
+			case pb.AccountClass_ACCOUNT_CLASS_TIMELOCKED,
+				pb.AccountClass_ACCOUNT_CLASS_GUARDED,
+				pb.AccountClass_ACCOUNT_CLASS_VAULT:
+				return [32]byte{}, errors.New("restricted-class account cannot send directly to the Fund: route through a transfer chain")
+			}
 			if err := validateFundStakeSend(as.Class, sb.Send); err != nil {
 				return [32]byte{}, err
 			}
@@ -526,6 +576,15 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 				if hasMultiSig {
 					return [32]byte{}, errors.New("transfer return-to-source must not carry a multisig")
 				}
+				// A cancel is a single-user-sig op (U1 OR U2 via the top resolution): sig2 and the
+				// attestor case fields belong only to a release — reject them here (sig2 is
+				// third-party-attachable and txid-folded, the same grind class as the multisig).
+				if hasSig2 {
+					return [32]byte{}, errors.New("transfer return-to-source must not carry a second user signature (sig2)")
+				}
+				if hasCaseFields(sb.Send) {
+					return [32]byte{}, errors.New("transfer return-to-source must not carry attestor case fields")
+				}
 				// A return-to-source is a CANCEL, never a stake deposit — reject stake-deposit fields
 				// (mirrors the P3.3 escrow-outflow guard). Load-bearing for P5.5: a return-stake chain's
 				// source IS the keyless Fund, so a return-to-Fund carrying staked_for would append a
@@ -548,21 +607,70 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 				if snap.Epoch < as.TransferUnlock {
 					return [32]byte{}, errors.New("transfer is still locked: release-to-destination not yet allowed")
 				}
-				// Attestor-gated release (spec-19 §6.1): when release_requires_attestor is set on
-				// the chain (a GUARDED/VAULT source — or a breakglass move in P5.1), the
-				// release-to-dest needs the flat M-of-N Fund Attestor quorum IN ADDITION to the
-				// chain's controlling-key Tx.sig (verified at the top of this function). Otherwise
-				// the chain is an ordinary TIMELOCKED release and must NOT carry a multisig.
+				// Attestor-gated release (spec-19 §6.1 + forquinn item 1): when
+				// release_requires_attestor is set on the chain (a GUARDED/VAULT source — or a
+				// breakglass move in P5.1), the release-to-dest is EITHER-OR:
+				//   path (a): BOTH user keys — Tx.sig under U1 AND sig2 under U2 — no attestors.
+				//   path (b): ONE user key (U1 or U2 via the top resolution; or the revealed
+				//             breakglass key on a breakglass-origin chain) + the flat M-of-N Fund
+				//             Attestor quorum.
+				// sig2 presence selects the path; the junk combinations (sig2+multisig, sig2 with
+				// a U2/breakglass-verified Tx.sig, sig2 on a chain with no U2) all reject, so every
+				// {sig, sig2, multisig} shape in the §2.3 txid matrix has exactly one meaning.
+				// Otherwise the chain is an ordinary TIMELOCKED release and must NOT carry a
+				// multisig or a sig2.
 				if as.TransferFlags&transferFlagReleaseRequiresAttestor != 0 {
-					reqM := snap.AttestorQuorumM
-					if reqM == 0 {
-						reqM = 1 // defensive: a zero-configured M would make the gate a no-op
+					if hasSig2 {
+						// ---- path (a): U1 + U2, attestor-free (forquinn item 1) ----
+						if hasMultiSig {
+							return [32]byte{}, errors.New("path (a) release must not carry a multisig (either both user keys or the attestor quorum, never mixed)")
+						}
+						if hasCaseFields(sb.Send) {
+							return [32]byte{}, errors.New("path (a) release must not carry attestor case fields (no attestation backs it)")
+						}
+						// D5 fixed roles: Tx.sig must have verified under the chain's U1 auth key —
+						// a U2- or breakglass-verified Tx.sig plus a sig2 is rejected.
+						if sigKey != sigKeyU1 {
+							return [32]byte{}, errors.New("path (a) release: Tx.sig must verify under the chain's copied U1 auth key")
+						}
+						if len(as.U2PubKey) != crypto.HybridPubKeySize {
+							return [32]byte{}, errors.New("path (a) release: chain has no registered second user key (U2)")
+						}
+						if len(sig2) != crypto.HybridSigSize {
+							return [32]byte{}, ErrBadSig // unreachable past crypto.TxID's {0,4691} rule; fail closed
+						}
+						m, _, merr := crypto.MsgHash(tx)
+						if merr != nil {
+							return [32]byte{}, ErrBadSig
+						}
+						u2pub, perr := crypto.ParseHybridPubKey(as.U2PubKey)
+						if perr != nil {
+							return [32]byte{}, errors.New("path (a) release: stored U2 pubkey not parseable")
+						}
+						s2, serr := crypto.ParseHybridSig(sig2)
+						if serr != nil {
+							return [32]byte{}, ErrBadSig
+						}
+						if !crypto.HybridVerify(u2pub, m, s2) {
+							return [32]byte{}, errors.New("path (a) release: sig2 does not verify under the chain's U2")
+						}
+					} else {
+						// ---- path (b): one user sig + the attestor quorum ----
+						reqM := snap.AttestorQuorumM
+						if reqM == 0 {
+							reqM = 1 // defensive: a zero-configured M would make the gate a no-op
+						}
+						if err := verifyReleaseAttestorQuorum(tx, snap, reqM); err != nil {
+							return [32]byte{}, err
+						}
 					}
-					if err := verifyReleaseAttestorQuorum(tx, snap, reqM); err != nil {
-						return [32]byte{}, err
+				} else {
+					if hasMultiSig {
+						return [32]byte{}, errors.New("transfer release is not attestor-gated: must not carry a multisig")
 					}
-				} else if hasMultiSig {
-					return [32]byte{}, errors.New("transfer release is not attestor-gated: must not carry a multisig")
+					if hasSig2 {
+						return [32]byte{}, errors.New("transfer release is not attestor-gated: must not carry a second user signature (sig2)")
+					}
 				}
 			default:
 				return [32]byte{}, errors.New("transfer outbound must go to the stored source or destination")
@@ -571,6 +679,9 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			// Fund SEND (spec-18 §7.3, spec-19 §6.2): the only way anos leave the keyless
 			// Fund. Zero-fee; partial-balance allowed (unlike a transfer drain). Authorization
 			// is the weighted Guardian quorum.
+			if hasSig2 {
+				return [32]byte{}, errors.New("fund send must not carry a second user signature (sig2)")
+			}
 			if fee != 0 {
 				return [32]byte{}, errors.New("fund send must have zero fee")
 			}
@@ -741,15 +852,36 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			// two stored parties. The whole authorization is the HybridMultiSig (no Tx.sig — rejected
 			// above). The destination is unrestricted (the parties choose where the funds go), so unlike
 			// a transfer chain there is no stored source/dest check here.
+			if hasSig2 {
+				return [32]byte{}, errors.New("escrow outflow must not carry a second user signature (sig2)")
+			}
 			if err := verifyEscrowOutflow(tx, sb.Send, as, snap, to, amt, fee); err != nil {
 				return [32]byte{}, err
 			}
 		} else {
 			// Normal SEND (or a hop-1 breakglass drain): enforce the fee schedule and balance. A normal
 			// send is never multisig-authorized — reject a stray multisig (it would only serve to grind
-			// the send's txid, since crypto.TxID folds any SEND multisig into the txid).
+			// the send's txid, since crypto.TxID folds any SEND multisig into the txid). sig2 is
+			// likewise release-only (and equally txid-folded/attachable) — reject it here too.
 			if hasMultiSig {
 				return [32]byte{}, errors.New("normal send must not carry a multisig")
+			}
+			if hasSig2 {
+				return [32]byte{}, errors.New("normal send must not carry a second user signature (sig2)")
+			}
+			// Guarded/vault hop-1 rules (forquinn): the case fields belong only to an attestor-
+			// gated release, and one NEW guarded send per rate-limit window (confirm-item 2).
+			// The limit reads the finalized LastGuardedSendEpoch stamped by ApplyTx; first send
+			// (stored 0) is always allowed, and interval 0 (pre-wiring test snapshots) is no
+			// limit. Subtract form: finalized last <= snap.Epoch always holds.
+			if classRequiresU2(as.Class) {
+				if hasCaseFields(sb.Send) {
+					return [32]byte{}, errors.New("guarded/vault send must not carry attestor case fields")
+				}
+				if last := as.LastGuardedSendEpoch; last != 0 && snap.Epoch-last < snap.GuardedSendMinIntervalEpochs {
+					return [32]byte{}, fmt.Errorf("guarded send rate limit: last send finalized at epoch %d, next allowed at %d (now %d)",
+						last, last+snap.GuardedSendMinIntervalEpochs, snap.Epoch)
+				}
 			}
 			// Hop-1 breakglass drain (P5.1, spec-19 §6.4): the source account spends via its dormant
 			// breakglass key. Bind the revealed key to the source's OWN stored commitment. On apply this
@@ -795,6 +927,19 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			return [32]byte{}, ErrUnknownRecv // enforces "no same-epoch receive"
 		}
 		recvClass := rb.Receive.AccountClass
+
+		// sig2 is a SEND-release-only field: never valid on any RECEIVE (it is txid-folded and
+		// third-party-attachable, so an unexpected one is the multisig grind class — reject).
+		if hasSig2 {
+			return [32]byte{}, errors.New("RECEIVE must not carry a second user signature (sig2)")
+		}
+		// The U2 registration block's ONLY legitimate home is a GUARDED/VAULT account-opening
+		// RECEIVE (forquinn item 1; required + verified below). Content-based reject everywhere
+		// else — every other opening class (incl. ESCROW, which returns early below, and TRANSFER,
+		// which gets U2 by derived copy, D2) and every non-opening RECEIVE.
+		if hasU2Registration(rb.Receive) && !(openingAccount && classRequiresU2(recvClass)) {
+			return [32]byte{}, errors.New("u2 registration is only valid on a guarded/vault account-opening RECEIVE")
+		}
 
 		// First-block key registration enforcement (keys-spec §6.4, §8.3). On the
 		// account-opening RECEIVE the auth pubkey + breakglass commitment are required
@@ -855,6 +1000,16 @@ func ValidateTxAgainstSnapshot(tx *pb.Tx, snap *Snapshot) ([32]byte, error) {
 			}
 			if wantID != acct {
 				return [32]byte{}, fmt.Errorf("opening RECEIVE: account-id %x != derivation %x", acct[:4], wantID[:4])
+			}
+			// GUARDED/VAULT opening (forquinn item 1/4): the second user key U2 is REQUIRED and
+			// its proof-of-possession must verify (m_u2 binds this account id + the pubkey, D12).
+			// The block is folded into the U1-signed preimage, so it cannot be stripped/swapped in
+			// flight; the PoP forces cryptographic parseability (an unparseable U2 would deadlock
+			// path (a) forever) and u2 != auth_pubkey keeps path (a) a real 2-key rule (D6).
+			if classRequiresU2(recvClass) {
+				if _, err := verifyU2Registration(rb.Receive, acct, ap); err != nil {
+					return [32]byte{}, err
+				}
 			}
 			// Breakglass opening (P5.1 + P5.5, spec-19 §6.4): when this RECEIVE is signed by the revealed
 			// breakglass key, it opens a stuck chain the recoverer lost the auth key for. It is valid on
@@ -1080,6 +1235,62 @@ func verifyFundSendQuorum(tx *pb.Tx, snap *Snapshot) error {
 func hasOwnerAuth(sb *pb.TxBodySend) bool {
 	oa := sb.GetOwnerAuth()
 	return len(oa.GetSig().GetV()) > 0 || len(oa.GetRevealedBreakglassPubkey().GetV()) > 0
+}
+
+// hasCaseFields reports whether a SEND carries a MEANINGFUL attestor case commitment (forquinn
+// item 2): a non-empty case_nonce or attestation_hash. CONTENT-based, matching the SignBytesACTE
+// folds (a present-but-empty field folds byte-identically to an absent one — the hasOwnerAuth
+// discipline), so the txid discriminator and the validity checks stay in lock-step. Both fields
+// are opaque to the validator; SignBytesACTE hard-errors any length outside {0, 32} (D8), so a
+// content-present field here is always exactly 32 bytes.
+func hasCaseFields(sb *pb.TxBodySend) bool {
+	return len(sb.GetCaseNonce()) > 0 || len(sb.GetAttestationHash()) > 0
+}
+
+// hasU2Registration reports whether a RECEIVE carries a MEANINGFUL U2 registration block
+// (forquinn item 1): a non-empty pubkey or PoP signature. CONTENT-based, matching the
+// SignBytesACTE folds, exactly like hasCaseFields/hasOwnerAuth — a present-but-empty
+// U2Registration{} folds identically to nil and must classify the same.
+func hasU2Registration(rb *pb.TxBodyReceive) bool {
+	return len(rb.GetU2().GetPubkey().GetV()) > 0 || len(rb.GetU2().GetPopSig().GetV()) > 0
+}
+
+// verifyU2Registration enforces a GUARDED/VAULT opening's second-user-key registration (forquinn
+// items 1+4, plan D6/D12): the U2 pubkey and its proof-of-possession signature must be present
+// and exact-length, u2 != the carried U1 auth pubkey (else path (a) is single-key theater), and
+// the PoP must AND-verify over m_u2 = U2RegistrationDigest(acct, u2_pubkey) — which also forces
+// U2's cryptographic parseability (the escrow-opening lesson: a length-valid-but-unparseable key
+// would deadlock its verification path forever). Pure function of (tx bytes, acct), so validate,
+// ApplyTx (the no-revalidation resync path), and the stateless submit gate (judgeAbsentOpening)
+// all call it and agree byte-for-byte. Returns the U2 pubkey bytes for the caller to store.
+func verifyU2Registration(rb *pb.TxBodyReceive, acct [32]byte, authPub []byte) ([]byte, error) {
+	u2pub := rb.GetU2().GetPubkey().GetV()
+	u2pop := rb.GetU2().GetPopSig().GetV()
+	if len(u2pub) != crypto.HybridPubKeySize {
+		return nil, errors.New("guarded/vault opening: u2 pubkey must be present and 2625 bytes")
+	}
+	if len(u2pop) != crypto.HybridSigSize {
+		return nil, errors.New("guarded/vault opening: u2 proof-of-possession must be present and 4691 bytes")
+	}
+	if bytes.Equal(u2pub, authPub) {
+		return nil, errors.New("guarded/vault opening: u2 pubkey must differ from the auth pubkey")
+	}
+	m, err := crypto.U2RegistrationDigest(acct, u2pub)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := crypto.ParseHybridPubKey(u2pub)
+	if err != nil {
+		return nil, fmt.Errorf("guarded/vault opening: u2 pubkey not parseable: %w", err)
+	}
+	sig, err := crypto.ParseHybridSig(u2pop)
+	if err != nil {
+		return nil, errors.New("guarded/vault opening: malformed u2 proof-of-possession signature")
+	}
+	if !crypto.HybridVerify(pub, m, sig) {
+		return nil, errors.New("guarded/vault opening: u2 proof-of-possession does not verify")
+	}
+	return u2pub, nil
 }
 
 // hasStakeRecoveryFields reports whether a SEND carries any P5.4 in-Fund-stake-recovery field
@@ -1510,6 +1721,34 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 		}
 		amt := sb.Amount
 		fee := sb.Fee
+		var toAcct [32]byte
+		copy(toAcct[:], sb.To.V)
+		toFund := toAcct == fundAcct
+
+		// Shape mirrors of the forquinn validate rules (resync replays committed winners WITHOUT
+		// re-validating, so structural requirements derivable from committed data are re-enforced
+		// here — a committed tx never trips them, but they fail closed if a malformed one ever
+		// reaches apply). sig2 is legitimate ONLY on an attestor-flagged release-to-dest (the
+		// either-or gate); the case fields never ride a cancel, a guarded/vault hop-1 send, or a
+		// path-(a) release (phase-3 completes the everywhere-else matrix).
+		if len(parsed.GetSig2().GetV()) > 0 {
+			releaseShape := existingClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER &&
+				toAcct == arec.TransferDest && arec.TransferFlags&transferFlagReleaseRequiresAttestor != 0
+			if !releaseShape {
+				return errors.New("sig2 is only valid on an attestor-flagged transfer release-to-dest")
+			}
+			if hasCaseFields(sb) {
+				return errors.New("path (a) release must not carry attestor case fields")
+			}
+		}
+		if hasCaseFields(sb) {
+			if existingClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER && toAcct == arec.TransferSource {
+				return errors.New("transfer return-to-source must not carry attestor case fields")
+			}
+			if classRequiresU2(existingClass) {
+				return errors.New("guarded/vault send must not carry attestor case fields")
+			}
+		}
 
 		if existingClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER {
 			// Outbound from a transfer chain: zero-fee, full-balance drain (all-or-nothing).
@@ -1559,10 +1798,6 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 			bal -= (amt + fee)
 		}
 
-		var toAcct [32]byte
-		copy(toAcct[:], sb.To.V)
-		toFund := toAcct == fundAcct
-
 		// P5.5: mirror the validate guard — a transfer return-to-source (incl. a return-stake chain back to
 		// its keyless Fund source) is a CANCEL, never a stake deposit. Reject stake-deposit fields; without
 		// this a return-stake chain returning to the Fund would mint a PHANTOM Fund-attributed stake row via
@@ -1578,6 +1813,16 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 		// fail-closes a malformed stake should one ever reach apply. existingClass is the
 		// sender's stored (immutable) class, matching the snapshot class validate used.
 		if toFund {
+			// D1 mirror: a restricted-class account may not SEND to the Fund directly at all
+			// (donation included) — the single-sig windowless outbound the guarded/vault
+			// protections exist to prevent. The routed path (TRANSFER-chain drain) is unaffected
+			// (its class is TRANSFER).
+			switch existingClass {
+			case pb.AccountClass_ACCOUNT_CLASS_TIMELOCKED,
+				pb.AccountClass_ACCOUNT_CLASS_GUARDED,
+				pb.AccountClass_ACCOUNT_CLASS_VAULT:
+				return errors.New("restricted-class account cannot send directly to the Fund: route through a transfer chain")
+			}
 			if err := validateFundStakeSend(existingClass, sb); err != nil {
 				return err
 			}
@@ -1780,6 +2025,13 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 		arec.Balance = bal
 		arec.Seq = seq
 		arec.Class = existingClass
+		// Guarded/vault rate-limit stamp (§2.8): record the FINALIZATION epoch of this SEND —
+		// the epoch parameter is committed data (commitEpoch / the resync walk both know it), so
+		// replay stamps the identical value. The interval check itself runs in validate against
+		// the finalized snapshot (like the transfer-unlock window); apply's job is the stamp.
+		if classRequiresU2(existingClass) {
+			arec.LastGuardedSendEpoch = epoch
+		}
 		if err := putAccountRecord(view.tx, acct, arec); err != nil {
 			return err
 		}
@@ -1907,6 +2159,11 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 		if rb == nil || rb.ReceivableId == nil || len(rb.ReceivableId.V) != 32 {
 			return ErrWrongType
 		}
+		// Shape mirror (resync replays without validate): sig2 is a SEND-release-only field,
+		// never valid on any RECEIVE.
+		if len(parsed.GetSig2().GetV()) > 0 {
+			return errors.New("RECEIVE must not carry a second user signature (sig2)")
+		}
 		var rid [32]byte
 		copy(rid[:], rb.ReceivableId.V)
 
@@ -1949,6 +2206,13 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 				return errors.New("FUND is a reserved keyless class: cannot be created by a RECEIVE")
 			}
 		}
+		// U2-registration shape mirror (forquinn item 1): its only legitimate home is a
+		// GUARDED/VAULT account-opening RECEIVE — required + PoP-verified in the creating branch
+		// below; content-based reject on every other shape (non-opening receives here, escrow /
+		// non-guarded openings in their branches).
+		if !creating && hasU2Registration(rb) {
+			return errors.New("u2 registration is only valid on a guarded/vault account-opening RECEIVE")
+		}
 
 		seq = parsed.Seq
 		head = txid
@@ -1973,6 +2237,10 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 			eo := rb.GetEscrowOpen()
 			if eo == nil {
 				return errors.New("escrow opening: missing escrow_open")
+			}
+			// Mirror the validate reject: a keyless two-party escrow never registers a U2.
+			if hasU2Registration(rb) {
+				return errors.New("u2 registration is only valid on a guarded/vault account-opening RECEIVE")
 			}
 			loPub := eo.GetPartyLoPubkey().GetV()
 			hiPub := eo.GetPartyHiPubkey().GetV()
@@ -2075,6 +2343,16 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 					return fmt.Errorf("%w: TRANSFER receive key source %x not found", ErrUnknownStake, keySrcID[:4])
 				}
 				srcAuthPub, srcBg = ksRec.AuthPubKey, ksRec.BreakglassCommit
+				// D2 DERIVED COPY (forquinn item 1): the chain inherits the key source's stored
+				// U2 alongside the copied auth key + breakglass commitment — from COMMITTED data,
+				// never carried on the opening tx (nothing carried ⇒ nothing strippable), so a
+				// resync replay re-derives the identical record. The single-sig resolution then
+				// accepts U1 OR U2 on the chain, and the path-(a) release verifies sig2 against
+				// this copy. Empty for a U2-less key source (a TIMELOCKED source or a return-stake
+				// staker), leaving those chains byte-identical to pre-forquinn.
+				if len(ksRec.U2PubKey) == crypto.HybridPubKeySize {
+					out.U2PubKey = append([]byte(nil), ksRec.U2PubKey...)
+				}
 				// The attestor flag keys off the FUNDING SOURCE's (rec.From) class, NOT the key
 				// source's: for an ordinary transfer they coincide (so reuse ksRec); for a
 				// Guardian-returned stake the source is the keyless Fund (class FUND → flag unset)
@@ -2098,6 +2376,20 @@ func ApplyTx(view *bboltTxView, raw []byte, parsed *pb.Tx, txid [32]byte, fundAc
 			}
 			if want != acct {
 				return fmt.Errorf("opening RECEIVE: account-id %x != derivation %x", acct[:4], want[:4])
+			}
+			// GUARDED/VAULT opening mirror (forquinn item 1): re-verify the FULL U2 registration
+			// (lengths, != U1, PoP over m_u2) from the committed tx bytes and cache the key —
+			// resync replays without validate, so the registered-U2 invariant must be
+			// self-standing here, exactly like the id re-derivation above. Every other base
+			// class rejects a carried U2 block (content-based).
+			if classRequiresU2(classToStore) {
+				u2pub, uerr := verifyU2Registration(rb, acct, ap)
+				if uerr != nil {
+					return uerr
+				}
+				out.U2PubKey = append([]byte(nil), u2pub...)
+			} else if hasU2Registration(rb) {
+				return errors.New("u2 registration is only valid on a guarded/vault account-opening RECEIVE")
 			}
 			out.AuthPubKey = append([]byte(nil), ap...)
 			out.BreakglassCommit = append([]byte(nil), bg...)

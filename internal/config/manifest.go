@@ -92,6 +92,12 @@ type Timing struct {
 	AttestorQuorumM              uint64 `json:"attestor_quorum_m"`
 	EscrowAttestationDelayEpochs uint64 `json:"escrow_attestation_delay_epochs"`
 	BreakglassExtraEpochs        uint64 `json:"breakglass_extra_epochs"`
+	// GuardedSendMinIntervalEpochs is the guarded/vault outbound rate limit (forquinn
+	// confirm-item 2: one NEW guarded send per 24h, epoch-denominated — authoring rule
+	// 86_400_000 / epoch_ms; devnet 12). A SEND from a GUARDED/VAULT account is rejected while
+	// epoch - LastGuardedSendEpoch is below it. CONSENSUS-CRITICAL; appended LAST in
+	// canonicalBytes' timing block (a preimage-layout change — part of the forquinn cutover).
+	GuardedSendMinIntervalEpochs uint64 `json:"guarded_send_min_interval_epochs"`
 }
 
 // Economics holds the consensus-critical monetary/role scalars that used to be hardcoded Go
@@ -244,6 +250,7 @@ func (m *Manifest) validateTiming() error {
 		{"timing.guarded_delay_epochs", m.Timing.GuardedDelayEpochs},
 		{"timing.vault_delay_epochs", m.Timing.VaultDelayEpochs},
 		{"timing.escrow_attestation_delay_epochs", m.Timing.EscrowAttestationDelayEpochs},
+		{"timing.guarded_send_min_interval_epochs", m.Timing.GuardedSendMinIntervalEpochs},
 	} {
 		if f.val == 0 {
 			return fmt.Errorf("%s must be > 0 (a missing or zero value would silently fork consensus)", f.name)
@@ -402,6 +409,7 @@ func (m *Manifest) canonicalBytes() ([]byte, error) {
 	putU64(&b, m.Timing.AttestorQuorumM)
 	putU64(&b, m.Timing.EscrowAttestationDelayEpochs)
 	putU64(&b, m.Timing.BreakglassExtraEpochs)
+	putU64(&b, m.Timing.GuardedSendMinIntervalEpochs) // forquinn: appended LAST in the timing block
 
 	// economics (fixed order)
 	putU64(&b, m.Economics.MinFee)

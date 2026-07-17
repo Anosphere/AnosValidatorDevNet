@@ -484,8 +484,9 @@ func TestBestEffortBreakglassGate(t *testing.T) {
 		t.Fatal("an UNSPECIFIED-typed tx carrying a reveal must be rejected at the gate")
 	}
 	// resolveAuthPubKeyDB must NOT resolve the reveal for a non-SEND/RECEIVE type — it falls through to
-	// the victim's CACHED auth key, so the attacker-keyed junk fails the signature check.
-	if pub, rok := e.resolveAuthPubKeyDB(junkType); !rok || !bytes.Equal(pub, victim.AuthPubKeyBytes()) {
+	// the victim's CACHED auth key (candidate list; the victim has no U2, so exactly one entry), so
+	// the attacker-keyed junk fails the signature check.
+	if pubs, rok := e.resolveAuthPubKeyDB(junkType); !rok || len(pubs) != 1 || !bytes.Equal(pubs[0], victim.AuthPubKeyBytes()) {
 		t.Fatal("resolveAuthPubKeyDB must resolve the cached auth key (not the reveal) for a non-SEND/RECEIVE tx")
 	}
 }

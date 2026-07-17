@@ -23,6 +23,7 @@ func validManifest() Manifest {
 			AttestorQuorumM:              2,
 			EscrowAttestationDelayEpochs: 6,
 			BreakglassExtraEpochs:        5,
+			GuardedSendMinIntervalEpochs: 6,
 		},
 		Economics: Economics{
 			MinFee:                           1_000,
@@ -65,16 +66,17 @@ func TestValidateAcceptsComplete(t *testing.T) {
 // future field can't quietly escape the check.
 func TestValidateRejectsZeroTimingField(t *testing.T) {
 	cases := map[string]func(*Timing){
-		"epoch_ms":                        func(t *Timing) { t.EpochMs = 0 },
-		"timelocked_delay_epochs":         func(t *Timing) { t.TimelockedDelayEpochs = 0 },
-		"guardian_active_window_epochs":   func(t *Timing) { t.GuardianActiveWindowEpochs = 0 },
-		"stake_lock_1mo_epochs":           func(t *Timing) { t.StakeLock1moEpochs = 0 },
-		"stake_lock_1yr_epochs":           func(t *Timing) { t.StakeLock1yrEpochs = 0 },
-		"guarded_delay_epochs":            func(t *Timing) { t.GuardedDelayEpochs = 0 },
-		"vault_delay_epochs":              func(t *Timing) { t.VaultDelayEpochs = 0 },
-		"attestor_quorum_m":               func(t *Timing) { t.AttestorQuorumM = 0 },
-		"escrow_attestation_delay_epochs": func(t *Timing) { t.EscrowAttestationDelayEpochs = 0 },
-		"breakglass_extra_epochs":         func(t *Timing) { t.BreakglassExtraEpochs = 0 },
+		"epoch_ms":                         func(t *Timing) { t.EpochMs = 0 },
+		"timelocked_delay_epochs":          func(t *Timing) { t.TimelockedDelayEpochs = 0 },
+		"guardian_active_window_epochs":    func(t *Timing) { t.GuardianActiveWindowEpochs = 0 },
+		"stake_lock_1mo_epochs":            func(t *Timing) { t.StakeLock1moEpochs = 0 },
+		"stake_lock_1yr_epochs":            func(t *Timing) { t.StakeLock1yrEpochs = 0 },
+		"guarded_delay_epochs":             func(t *Timing) { t.GuardedDelayEpochs = 0 },
+		"vault_delay_epochs":               func(t *Timing) { t.VaultDelayEpochs = 0 },
+		"attestor_quorum_m":                func(t *Timing) { t.AttestorQuorumM = 0 },
+		"escrow_attestation_delay_epochs":  func(t *Timing) { t.EscrowAttestationDelayEpochs = 0 },
+		"breakglass_extra_epochs":          func(t *Timing) { t.BreakglassExtraEpochs = 0 },
+		"guarded_send_min_interval_epochs": func(t *Timing) { t.GuardedSendMinIntervalEpochs = 0 },
 	}
 	for name, zero := range cases {
 		m := validManifest()

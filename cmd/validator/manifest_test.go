@@ -53,6 +53,7 @@ func writeTestManifest(t *testing.T, dir string, rosterPubs []string) string {
 			EpochMs: 2000, TimelockedDelayEpochs: 6, GuardianActiveWindowEpochs: 20,
 			StakeLock1moEpochs: 4, StakeLock1yrEpochs: 8, GuardedDelayEpochs: 8, VaultDelayEpochs: 12,
 			AttestorQuorumM: 2, EscrowAttestationDelayEpochs: 6, BreakglassExtraEpochs: 5,
+			GuardedSendMinIntervalEpochs: 6,
 		},
 		Economics: config.Economics{
 			MinFee: 1_000, MaxFee: 3_000_000, AttestedEscrowFee: 100_000, FeeBps: 50,

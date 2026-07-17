@@ -412,12 +412,29 @@ func TestValidateStakeRequiresRouting(t *testing.T) {
 		}
 	}
 
-	// Restricted-class PLAIN pool contribution (no staked_for): still allowed (P2.1 behavior).
-	f := newStakeValidateFixture(t, pb.AccountClass_ACCOUNT_CLASS_TIMELOCKED, 3)
+	// Restricted-class PLAIN pool contribution (no staked_for): REJECTED since forquinn D1 —
+	// a to==Fund send mints no receivable, so the TRANSFER-routing restriction never applied and
+	// a bare donation was a single-sig, windowless, irreversible outbound bypassing exactly the
+	// guarded/vault (and timelocked) spend protections. (Pre-D1 / P2.1 behavior allowed it.)
+	for _, cls := range []pb.AccountClass{
+		pb.AccountClass_ACCOUNT_CLASS_TIMELOCKED,
+		pb.AccountClass_ACCOUNT_CLASS_GUARDED,
+		pb.AccountClass_ACCOUNT_CLASS_VAULT,
+	} {
+		f := newStakeValidateFixture(t, cls, 3)
+		amt := anosUnits(100)
+		tx := f.stakeSend(t, testFund, amt, ExpectedFee(amt), cls, "", pb.StakeTimeDelay_STAKE_TIME_DELAY_UNSPECIFIED)
+		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
+			t.Errorf("%v plain pool contribution accepted (D1: restricted classes cannot send directly to the Fund)", cls)
+		}
+	}
+
+	// A SPENDING plain pool contribution stays allowed (unrestricted class, no routing rule).
+	f := newStakeValidateFixture(t, pb.AccountClass_ACCOUNT_CLASS_SPENDING, 4)
 	amt := anosUnits(100)
-	tx := f.stakeSend(t, testFund, amt, ExpectedFee(amt), pb.AccountClass_ACCOUNT_CLASS_TIMELOCKED, "", pb.StakeTimeDelay_STAKE_TIME_DELAY_UNSPECIFIED)
+	tx := f.stakeSend(t, testFund, amt, ExpectedFee(amt), pb.AccountClass_ACCOUNT_CLASS_SPENDING, "", pb.StakeTimeDelay_STAKE_TIME_DELAY_UNSPECIFIED)
 	if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err != nil {
-		t.Errorf("restricted-class plain pool contribution rejected: %v", err)
+		t.Errorf("SPENDING plain pool contribution rejected: %v", err)
 	}
 }
 

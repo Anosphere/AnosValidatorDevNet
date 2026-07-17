@@ -251,6 +251,19 @@ func main() {
 	}
 	fmt.Println("Breakglass extra delay (epochs):", breakglassExtraEpochs)
 
+	// GUARDED_SEND_MIN_INTERVAL_EPOCHS is the guarded/vault outbound rate limit (forquinn
+	// confirm-item 2: one NEW guarded send per 24h, epoch-denominated — 86_400_000/epoch_ms in a
+	// mainnet manifest; devnet 12). CONSENSUS-CRITICAL: byte-identical on every validator. Must be
+	// >= 1 (a zero would silently disable the limit — the manifest enforces > 0 too).
+	guardedSendMinIntervalEpochs, err := strconv.ParseUint(mustEnv("GUARDED_SEND_MIN_INTERVAL_EPOCHS"), 10, 64)
+	if err != nil {
+		log.Fatal("GUARDED_SEND_MIN_INTERVAL_EPOCHS must be a uint64 (number of epochs)")
+	}
+	if guardedSendMinIntervalEpochs < 1 {
+		log.Fatal("GUARDED_SEND_MIN_INTERVAL_EPOCHS must be >= 1 (a zero would disable the guarded send rate limit)")
+	}
+	fmt.Println("Guarded send min interval (epochs):", guardedSendMinIntervalEpochs)
+
 	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		log.Fatal(err)
@@ -297,6 +310,7 @@ func main() {
 		AttestorQuorumM:              attestorQuorumM,
 		EscrowAttestationDelayEpochs: escrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        breakglassExtraEpochs,
+		GuardedSendMinIntervalEpochs: guardedSendMinIntervalEpochs,
 		Econ:                         econ,
 		MaxCandidateScanPerSlot:      manifest.Consensus.MaxCandidateScanPerSlot,
 		NetworkID:                    manifest.NetworkID,

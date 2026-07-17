@@ -1,18 +1,23 @@
-// sim-guarded-vault-release demonstrates the P3.2 GUARDED/VAULT attestor-gated release
-// lifecycle end to end on hybrid keys (spec-18 §5.3/§5.4, spec-19 §6.1):
+// sim-guarded-vault-release demonstrates the GUARDED/VAULT lifecycle end to end on hybrid keys
+// with the forquinn second user key U2 (spec-18 §5.3/§5.4, spec-19 §6.1, forquinn item 1):
 //
-//  1. Stake ATTESTOR_QUORUM_M attestors: M SPENDING accounts each stake >= 5,000 anos to the
-//     Fund tagged "attestor" (a direct stake; SPENDING may stake directly).
-//  2. A GUARDED account UG is funded and sends to a derived transfer chain; because the source
-//     is GUARDED the spawned chain carries release_requires_attestor (verified via the read API).
-//  3. POSITIVE: after the GUARDED unlock, release-to-dest signed by the chain's controlling key
-//     PLUS the M-of-N attestor multisig finalizes (and before unlock it does not).
-//  4. NEGATIVE: a sibling chain's release with only M-1 attestor signatures never finalizes.
-//  5. UNGATED: a third sibling chain returns to its source (UG) with no attestors at any epoch.
-//  6. VAULT: the same positive release works for a VAULT source at its (longer) unlock.
+//  1. Stake ATTESTOR_QUORUM_M attestors (SPENDING accounts staking "attestor" directly).
+//  2. A GUARDED account UG1 opens WITH a U2 registration (PoP-verified at the opening) and funds a
+//     transfer chain T1 with a U2-SIGNED hop-1 (D4: a single user signature is U1 OR U2). The
+//     spawned chain reports release_requires_attestor and inherits U2 by derived copy (D2).
+//  3. RATE LIMIT (forquinn confirm-item 2): UG1's immediate second hop-1 does NOT finalize inside
+//     GUARDED_SEND_MIN_INTERVAL_EPOCHS, then finalizes once the window passes (funding T3).
+//  4. PATH (a): T1's release-to-dest signed by BOTH user keys (Tx.sig=U1 + sig2=U2, NO attestors)
+//     does not finalize before unlock, then finalizes at unlock. D receives the funds.
+//  5. U2-SIGNED CANCEL: T3 returns to UG1 signed by U2 alone (any epoch, never gated), and UG1
+//     claims the return with a U2-signed RECEIVE.
+//  6. PATH (b): UG2's chain T2 releases with ONE user signature (U2!) + the M-of-N attestor
+//     quorum; UG3's chain T2b with only M-1 attestor signatures never finalizes. (UG1/UG2/UG3
+//     all send within one window — the rate limit is per-account.)
+//  7. VAULT: UV (with U2) funds TV and releases via path (a) at the (longer) vault unlock.
 //
 // Env: VALIDATOR_URL_LIST, GENESIS_SEED_HEX, GENESIS_HEX, GENESIS_UNIX_MS, EPOCH_MS,
-// GUARDED_DELAY_EPOCHS, VAULT_DELAY_EPOCHS, ATTESTOR_QUORUM_M.
+// GUARDED_DELAY_EPOCHS, VAULT_DELAY_EPOCHS, ATTESTOR_QUORUM_M, GUARDED_SEND_MIN_INTERVAL_EPOCHS.
 package main
 
 import (
@@ -48,14 +53,15 @@ func main() {
 	guardedDelay := getenvUint64("GUARDED_DELAY_EPOCHS", 8)
 	vaultDelay := getenvUint64("VAULT_DELAY_EPOCHS", 12)
 	quorumM := int(getenvUint64("ATTESTOR_QUORUM_M", 2))
+	sendInterval := getenvUint64("GUARDED_SEND_MIN_INTERVAL_EPOCHS", 6)
 	if genesisMs == 0 {
 		log.Fatal("GENESIS_UNIX_MS is required")
 	}
 	if quorumM < 1 {
 		log.Fatal("ATTESTOR_QUORUM_M must be >= 1")
 	}
-	log.Printf("epoch params: genesisMs=%d epochMs=%d guardedDelay=%d vaultDelay=%d attestorM=%d (epoch=%d)",
-		genesisMs, epochMs, guardedDelay, vaultDelay, quorumM, currentEpoch(genesisMs, epochMs))
+	log.Printf("epoch params: genesisMs=%d epochMs=%d guardedDelay=%d vaultDelay=%d attestorM=%d sendInterval=%d (epoch=%d)",
+		genesisMs, epochMs, guardedDelay, vaultDelay, quorumM, sendInterval, currentEpoch(genesisMs, epochMs))
 
 	const (
 		attestorStake = uint64(6_000) * core.UnitsPerAnos // > the 5,000-anos attestor floor
@@ -84,100 +90,143 @@ func main() {
 	settle(genesisMs, epochMs, 3)
 
 	// ---------------------------------------------------------------
-	// STEP 2: fund a GUARDED account and spawn three transfer chains.
+	// STEP 2: open a GUARDED account UG1 WITH U2 and fund T1 via a U2-signed hop-1.
 	// ---------------------------------------------------------------
-	banner("STEP 2: fund a GUARDED account UG and open transfer chains")
-	UG := simkit.RandomAccount(pb.AccountClass_ACCOUNT_CLASS_GUARDED)
+	banner("STEP 2: guarded UG1 opens with a U2 registration; U2-signed hop-1 funds T1")
+	UG1 := simkit.RandomAccount(pb.AccountClass_ACCOUNT_CLASS_GUARDED).AttachU2(simkit.RandSeed())
 	D := simkit.RandomAccount(pb.AccountClass_ACCOUNT_CLASS_SPENDING)
-	normalSend(c, genesis, UG.ID, fundAmount)
-	ridUG := c.WaitForReceivable(UG.IDBytes(), nil, 1*time.Second, 120*time.Second)
-	openReceive(c, UG, ridUG, nil, 0)
-	ugSt := mustAccount(c, UG.IDBytes())
-	assert(ugSt.AccountClass == pb.AccountClass_ACCOUNT_CLASS_GUARDED, "UG should be GUARDED")
-	log.Printf("OK: UG is GUARDED with %d units; D(dest)=%x", ugSt.Balance, D.IDBytes()[:4])
+	normalSend(c, genesis, UG1.ID, fundAmount)
+	ridUG1 := c.WaitForReceivable(UG1.IDBytes(), nil, 1*time.Second, 120*time.Second)
+	openGuardedReceive(c, UG1, ridUG1)
+	ug1St := mustAccount(c, UG1.IDBytes())
+	assert(ug1St.AccountClass == pb.AccountClass_ACCOUNT_CLASS_GUARDED, "UG1 should be GUARDED")
+	log.Printf("OK: UG1 is GUARDED (U2 registered at opening) with %d units; D(dest)=%x", ug1St.Balance, D.IDBytes()[:4])
 
-	// T1 = positive release; T2 = negative (<M); T3 = return-to-source (ungated).
-	T1, t1Seq := fundTransferChain(c, UG, moveAmount)
-	T2, _ := fundTransferChain(c, UG, moveAmount)
-	T3, _ := fundTransferChain(c, UG, moveAmount)
-	log.Printf("T1=%x T2=%x T3=%x (derived from UG; t1 send seq %d)", T1.IDBytes()[:4], T2.IDBytes()[:4], T3.IDBytes()[:4], t1Seq)
-
-	unlock := currentEpoch(genesisMs, epochMs) + guardedDelay + 3
-	openTransfer(c, T1, D.ID, unlock)
-	openTransfer(c, T2, D.ID, unlock)
-	openTransfer(c, T3, D.ID, unlock)
-
-	// The read API must report release_requires_attestor on a GUARDED-sourced chain.
-	assertAttestorGated(c, T1.IDBytes(), true)
-	log.Printf("OK: T1 reports release_requires_attestor (GUARDED source)")
+	T1, t1Seq := fundTransferChain(c, UG1, moveAmount, true /* U2-signed hop-1 (D4) */)
+	t1SendEpoch := currentEpoch(genesisMs, epochMs) // ≈ the finalization epoch the rate limit stamps
+	log.Printf("OK: U2-signed hop-1 finalized (seq %d, ~epoch %d); T1=%x", t1Seq, t1SendEpoch, T1.IDBytes()[:4])
 
 	// ---------------------------------------------------------------
-	// STEP 3: release-before-unlock with a full quorum must not finalize.
+	// STEP 3: RATE LIMIT — an immediate second hop-1 must NOT finalize inside the window.
 	// ---------------------------------------------------------------
-	banner("STEP 3: release T1 -> D BEFORE unlock must be rejected (even with a full quorum)")
-	releaseToDest(c, T1, D.ID, moveAmount, attestors[:quorumM]) // submitted early
-	if waitSeqOrTimeout(c, T1.IDBytes(), 2, 3, genesisMs, epochMs) {
-		log.Fatal("FAIL: release-before-unlock finalized (timelock not enforced)")
+	banner("STEP 3: rate limit — UG1's immediate second send is blocked, then passes")
+	head, seq, err := c.Head(UG1.IDBytes())
+	if err != nil {
+		log.Fatalf("read UG1: %v", err)
 	}
-	log.Printf("OK: release-before-unlock did not finalize (epoch=%d < unlock=%d)", currentEpoch(genesisMs, epochMs), unlock)
+	t3Seq := seq + 1
+	T3 := simkit.DerivedTransferAccount(UG1, t3Seq)
+	t3Fund := simkit.BuildSend(UG1, head, t3Seq, T3.ID, moveAmount, core.ExpectedFee(moveAmount))
+	UG1.MustSign(t3Fund) // U1-signed this time — both keys are rate-limited alike
+	_ = c.Submit(t3Fund)
+	blockEpochs := uint64(1)
+	if sendInterval > 4 {
+		blockEpochs = sendInterval - 3 // assert well inside the window (margin for the stamp/observation skew)
+	}
+	if waitSeqOrTimeout(c, UG1.IDBytes(), t3Seq, blockEpochs, genesisMs, epochMs) {
+		log.Fatal("FAIL: second guarded send finalized inside the rate-limit window")
+	}
+	log.Printf("OK: second send blocked for %d epochs (window %d)", blockEpochs, sendInterval)
+
+	// Open T1 and submit its (path-a) release EARLY while the window runs — the release must not
+	// finalize before unlock (STEP 5 confirms it lands at unlock).
+	t1Unlock := currentEpoch(genesisMs, epochMs) + guardedDelay + 3
+	openTransfer(c, T1, D.ID, t1Unlock)
+	assertAttestorGated(c, T1.IDBytes(), true)
+	log.Printf("OK: T1 opened (unlock=%d) and reports release_requires_attestor", t1Unlock)
+	pathARelease(c, T1, D.ID, moveAmount)
+	if waitSeqOrTimeout(c, T1.IDBytes(), 2, 3, genesisMs, epochMs) {
+		log.Fatal("FAIL: path (a) release finalized before unlock (timelock not enforced)")
+	}
+	log.Printf("OK: pre-unlock path (a) release did not finalize (epoch=%d < unlock=%d)", currentEpoch(genesisMs, epochMs), t1Unlock)
+
+	// Window over → the SAME queued funding send must now finalize (resubmit is an idempotent dup).
+	waitUntilEpoch(t1SendEpoch+sendInterval+2, genesisMs, epochMs)
+	_ = c.Submit(t3Fund)
+	c.WaitForSeqAtLeast(UG1.IDBytes(), t3Seq, 500*time.Millisecond, 120*time.Second)
+	log.Printf("OK: second send finalized after the window (epoch=%d)", currentEpoch(genesisMs, epochMs))
+	t3Unlock := currentEpoch(genesisMs, epochMs) + guardedDelay + 3
+	openTransfer(c, T3, D.ID, t3Unlock)
 
 	// ---------------------------------------------------------------
-	// STEP 4: NEGATIVE — below-quorum release never finalizes.
+	// STEP 4: U2-SIGNED CANCEL — T3 returns to UG1 with U2 alone, any epoch, never gated.
 	// ---------------------------------------------------------------
-	banner("STEP 4: NEGATIVE — release T2 with M-1 attestor sigs must not finalize")
-	waitUntilEpoch(unlock+1, genesisMs, epochMs)
+	banner("STEP 4: U2-signed cancel of T3 (return-to-source, ungated)")
+	transferReturn(c, T3, UG1.ID, moveAmount, true /* U2-signed */)
+	c.WaitForSeqAtLeast(T3.IDBytes(), 2, 500*time.Millisecond, 120*time.Second)
+	assert(mustAccount(c, T3.IDBytes()).Balance == 0, "T3 should be drained after the cancel")
+	retRID := c.WaitForReceivable(UG1.IDBytes(), nil, 1*time.Second, 120*time.Second)
+	plainReceive(c, UG1, retRID, true /* U2-signed claim (D4 on a non-opening RECEIVE) */)
+	log.Printf("OK: U2-signed cancel + U2-signed claim finalized (no attestors, before unlock)")
+
+	// ---------------------------------------------------------------
+	// STEP 5: PATH (a) — the pending U1+U2 release finalizes at unlock, with NO attestors.
+	// ---------------------------------------------------------------
+	banner("STEP 5: PATH (a) — T1 releases to D with BOTH user keys, no attestor quorum")
+	waitUntilEpoch(t1Unlock+1, genesisMs, epochMs)
+	pathARelease(c, T1, D.ID, moveAmount) // idempotent re-submit (same txid as the queued one)
+	c.WaitForSeqAtLeast(T1.IDBytes(), 2, 500*time.Millisecond, 120*time.Second)
+	assert(mustAccount(c, T1.IDBytes()).Balance == 0, "T1 should be drained after the path (a) release")
+	relRID := c.WaitForReceivable(D.IDBytes(), nil, 1*time.Second, 120*time.Second)
+	openReceive(c, D, relRID, nil, 0)
+	assert(mustAccount(c, D.IDBytes()).Balance == moveAmount, "D should have received the released amount")
+	log.Printf("OK: path (a) release finalized with zero attestor signatures; D received %d units", moveAmount)
+
+	// ---------------------------------------------------------------
+	// STEP 6: PATH (b) — one user sig (U2) + the M-of-N quorum; below-quorum never finalizes.
+	// ---------------------------------------------------------------
+	banner("STEP 6: PATH (b) — U2 user sig + attestor quorum on T2; M-1 sigs on T2b never finalize")
+	UG2 := simkit.RandomAccount(pb.AccountClass_ACCOUNT_CLASS_GUARDED).AttachU2(simkit.RandSeed())
+	normalSend(c, genesis, UG2.ID, fundAmount)
+	ridUG2 := c.WaitForReceivable(UG2.IDBytes(), nil, 1*time.Second, 120*time.Second)
+	openGuardedReceive(c, UG2, ridUG2)
+	T2, _ := fundTransferChain(c, UG2, moveAmount, false /* U1-signed hop-1 */)
+	t2Unlock := currentEpoch(genesisMs, epochMs) + guardedDelay + 3
+	openTransfer(c, T2, D.ID, t2Unlock)
+
+	UG3 := simkit.RandomAccount(pb.AccountClass_ACCOUNT_CLASS_GUARDED).AttachU2(simkit.RandSeed())
+	normalSend(c, genesis, UG3.ID, fundAmount)
+	ridUG3 := c.WaitForReceivable(UG3.IDBytes(), nil, 1*time.Second, 120*time.Second)
+	openGuardedReceive(c, UG3, ridUG3)
+	T2b, _ := fundTransferChain(c, UG3, moveAmount, false)
+	t2bUnlock := currentEpoch(genesisMs, epochMs) + guardedDelay + 3
+	openTransfer(c, T2b, D.ID, t2bUnlock)
+	log.Printf("UG1/UG2/UG3 all sent within one window — the rate limit is per-account")
+
+	waitUntilEpoch(t2bUnlock+1, genesisMs, epochMs)
 	if quorumM >= 2 {
-		releaseToDest(c, T2, D.ID, moveAmount, attestors[:quorumM-1]) // one short of M
-		if waitSeqOrTimeout(c, T2.IDBytes(), 2, 4, genesisMs, epochMs) {
+		releaseToDest(c, T2b, D.ID, moveAmount, attestors[:quorumM-1], false) // one short of M
+		if waitSeqOrTimeout(c, T2b.IDBytes(), 2, 4, genesisMs, epochMs) {
 			log.Fatal("FAIL: below-quorum release finalized (attestor gate not enforced)")
 		}
 		log.Printf("OK: below-quorum (M-1=%d) release did not finalize", quorumM-1)
 	} else {
 		log.Printf("SKIP: ATTESTOR_QUORUM_M=1 has no below-quorum case")
 	}
+	releaseToDest(c, T2, D.ID, moveAmount, attestors[:quorumM], true /* U2 user sig (D4) */)
+	c.WaitForSeqAtLeast(T2.IDBytes(), 2, 500*time.Millisecond, 120*time.Second)
+	assert(mustAccount(c, T2.IDBytes()).Balance == 0, "T2 should be drained after the path (b) release")
+	log.Printf("OK: path (b) release (U2 user sig + %d attestors) finalized", quorumM)
 
 	// ---------------------------------------------------------------
-	// STEP 5: POSITIVE — full-quorum release at/after unlock finalizes.
+	// STEP 7: VAULT — same U2 scheme, path (a), at the longer vault unlock.
 	// ---------------------------------------------------------------
-	banner("STEP 5: POSITIVE — release T1 -> D with the full M-of-N quorum")
-	releaseToDest(c, T1, D.ID, moveAmount, attestors[:quorumM]) // idempotent re-submit (same txid)
-	c.WaitForSeqAtLeast(T1.IDBytes(), 2, 500*time.Millisecond, 120*time.Second)
-	assert(mustAccount(c, T1.IDBytes()).Balance == 0, "T1 should be drained after release")
-	relRID := c.WaitForReceivable(D.IDBytes(), nil, 1*time.Second, 120*time.Second)
-	openReceive(c, D, relRID, nil, 0)
-	assert(mustAccount(c, D.IDBytes()).Balance == moveAmount, "D should have received the released amount")
-	log.Printf("OK: GUARDED release with %d attestors finalized; D received %d units", quorumM, moveAmount)
-
-	// ---------------------------------------------------------------
-	// STEP 6: UNGATED — return-to-source needs no attestors, any epoch.
-	// ---------------------------------------------------------------
-	banner("STEP 6: UNGATED — return T3 -> UG with no attestors")
-	transferReturn(c, T3, UG.ID, moveAmount) // no multisig
-	c.WaitForSeqAtLeast(T3.IDBytes(), 2, 500*time.Millisecond, 120*time.Second)
-	assert(mustAccount(c, T3.IDBytes()).Balance == 0, "T3 should be drained after return")
-	retRID := c.WaitForReceivable(UG.IDBytes(), nil, 1*time.Second, 120*time.Second)
-	plainReceive(c, UG, retRID)
-	log.Printf("OK: return-to-source finalized with no attestor signatures (ungated)")
-
-	// ---------------------------------------------------------------
-	// STEP 7: VAULT — the same gate works for a VAULT source.
-	// ---------------------------------------------------------------
-	banner("STEP 7: VAULT source release with the M-of-N quorum")
-	UV := simkit.RandomAccount(pb.AccountClass_ACCOUNT_CLASS_VAULT)
+	banner("STEP 7: VAULT source with U2 releases via path (a)")
+	UV := simkit.RandomAccount(pb.AccountClass_ACCOUNT_CLASS_VAULT).AttachU2(simkit.RandSeed())
 	normalSend(c, genesis, UV.ID, fundAmount)
 	ridUV := c.WaitForReceivable(UV.IDBytes(), nil, 1*time.Second, 120*time.Second)
-	openReceive(c, UV, ridUV, nil, 0)
+	openGuardedReceive(c, UV, ridUV)
 	assert(mustAccount(c, UV.IDBytes()).AccountClass == pb.AccountClass_ACCOUNT_CLASS_VAULT, "UV should be VAULT")
-	TV, _ := fundTransferChain(c, UV, moveAmount)
+	TV, _ := fundTransferChain(c, UV, moveAmount, false)
 	vUnlock := currentEpoch(genesisMs, epochMs) + vaultDelay + 3
 	openTransfer(c, TV, D.ID, vUnlock)
 	assertAttestorGated(c, TV.IDBytes(), true)
 	log.Printf("TV=%x reports release_requires_attestor (VAULT source); unlock=%d", TV.IDBytes()[:4], vUnlock)
 	waitUntilEpoch(vUnlock+1, genesisMs, epochMs)
-	releaseToDest(c, TV, D.ID, moveAmount, attestors[:quorumM])
+	pathARelease(c, TV, D.ID, moveAmount)
 	c.WaitForSeqAtLeast(TV.IDBytes(), 2, 500*time.Millisecond, 120*time.Second)
-	assert(mustAccount(c, TV.IDBytes()).Balance == 0, "TV should be drained after release")
-	log.Printf("OK: VAULT release with %d attestors finalized", quorumM)
+	assert(mustAccount(c, TV.IDBytes()).Balance == 0, "TV should be drained after the vault path (a) release")
+	log.Printf("OK: VAULT path (a) release finalized")
 
 	banner("ALL CHECKS PASSED")
 }
@@ -185,8 +234,9 @@ func main() {
 // --- flow helpers ---
 
 // fundTransferChain sends moveAmount from a GUARDED/VAULT source to the derived transfer chain
-// that exact SEND spawns, returning the chain account and the send seq (its creation nonce).
-func fundTransferChain(c *simkit.Client, source *simkit.Account, moveAmount uint64) (*simkit.Account, uint64) {
+// that exact SEND spawns (U2-signed when useU2 — D4), returning the chain account and the send
+// seq (its creation nonce). The chain inherits the source's U2 by derived copy (D2).
+func fundTransferChain(c *simkit.Client, source *simkit.Account, moveAmount uint64, useU2 bool) (*simkit.Account, uint64) {
 	head, seq, err := c.Head(source.IDBytes())
 	if err != nil {
 		log.Fatalf("read source: %v", err)
@@ -194,7 +244,13 @@ func fundTransferChain(c *simkit.Client, source *simkit.Account, moveAmount uint
 	sendSeq := seq + 1
 	chain := simkit.DerivedTransferAccount(source, sendSeq)
 	tx := simkit.BuildSend(source, head, sendSeq, chain.ID, moveAmount, core.ExpectedFee(moveAmount))
-	source.MustSign(tx)
+	if useU2 {
+		if err := source.SignWithU2(tx); err != nil {
+			log.Fatalf("U2-sign hop-1: %v", err)
+		}
+	} else {
+		source.MustSign(tx)
+	}
 	c.MustSubmit(tx)
 	c.WaitForSeqAtLeast(source.IDBytes(), sendSeq, 500*time.Millisecond, 120*time.Second)
 	return chain, sendSeq
@@ -224,33 +280,73 @@ func stakeToFund(c *simkit.Client, from *simkit.Account, fund [32]byte, amount u
 	c.WaitForSeqAtLeast(from.IDBytes(), seq+1, 500*time.Millisecond, 120*time.Second)
 }
 
-// releaseToDest submits an attestor-gated release-to-dest: chain key Tx.sig + M-of-N attestor
-// multisig. It does NOT wait (callers decide whether it should finalize).
-func releaseToDest(c *simkit.Client, chain *simkit.Account, to [32]byte, balance uint64, attestors []*simkit.Account) {
+// releaseToDest submits a path-(b) attestor-gated release-to-dest: ONE user signature (the
+// chain's copied U1, or its copied U2 when userSigU2 — D4) + the attestor multisig. It does NOT
+// wait (callers decide whether it should finalize).
+func releaseToDest(c *simkit.Client, chain *simkit.Account, to [32]byte, balance uint64, attestors []*simkit.Account, userSigU2 bool) {
 	head, seq, err := c.Head(chain.IDBytes())
 	if err != nil {
 		log.Fatalf("read transfer chain: %v", err)
 	}
 	tx := simkit.BuildSend(chain, head, seq+1, to, balance, 0)
-	if err := simkit.SignAttestorRelease(tx, chain, attestors); err != nil {
+	if userSigU2 {
+		if err := chain.SignWithU2(tx); err != nil {
+			log.Fatalf("U2-sign release: %v", err)
+		}
+		if err := simkit.SignFundSend(tx, attestors); err != nil { // attestor multisig over the same m
+			log.Fatalf("sign attestor quorum: %v", err)
+		}
+	} else if err := simkit.SignAttestorRelease(tx, chain, attestors); err != nil {
 		log.Fatalf("sign attestor release: %v", err)
 	}
 	_ = c.Submit(tx)
 }
 
-// transferReturn submits a zero-fee return-to-source drain (no attestors).
-func transferReturn(c *simkit.Client, chain *simkit.Account, to [32]byte, balance uint64) {
+// pathARelease submits an attestor-FREE release-to-dest signed by BOTH user keys (Tx.sig=U1,
+// sig2=U2 — forquinn path (a), fixed roles D5). It does NOT wait.
+func pathARelease(c *simkit.Client, chain *simkit.Account, to [32]byte, balance uint64) {
 	head, seq, err := c.Head(chain.IDBytes())
 	if err != nil {
 		log.Fatalf("read transfer chain: %v", err)
 	}
 	tx := simkit.BuildSend(chain, head, seq+1, to, balance, 0)
-	chain.MustSign(tx)
+	if err := simkit.SignPathARelease(tx, chain); err != nil {
+		log.Fatalf("sign path (a) release: %v", err)
+	}
+	_ = c.Submit(tx)
+}
+
+// transferReturn submits a zero-fee return-to-source drain (no attestors; U2-signed when useU2).
+func transferReturn(c *simkit.Client, chain *simkit.Account, to [32]byte, balance uint64, useU2 bool) {
+	head, seq, err := c.Head(chain.IDBytes())
+	if err != nil {
+		log.Fatalf("read transfer chain: %v", err)
+	}
+	tx := simkit.BuildSend(chain, head, seq+1, to, balance, 0)
+	if useU2 {
+		if err := chain.SignWithU2(tx); err != nil {
+			log.Fatalf("U2-sign cancel: %v", err)
+		}
+	} else {
+		chain.MustSign(tx)
+	}
 	_ = c.Submit(tx)
 }
 
 func openReceive(c *simkit.Client, acct *simkit.Account, rid [32]byte, transferDest *[32]byte, unlock uint64) {
 	tx := simkit.BuildOpeningReceive(acct, rid, transferDest, unlock)
+	acct.MustSign(tx)
+	c.MustSubmit(tx)
+	c.WaitForSeqAtLeast(acct.IDBytes(), 1, 500*time.Millisecond, 120*time.Second)
+}
+
+// openGuardedReceive opens a GUARDED/VAULT account registering its U2 (+PoP) on the opening
+// block (forquinn item 1; AttachU2 must have been called). The opening itself is U1-signed.
+func openGuardedReceive(c *simkit.Client, acct *simkit.Account, rid [32]byte) {
+	tx, err := simkit.BuildGuardedOpeningReceive(acct, rid)
+	if err != nil {
+		log.Fatalf("build guarded opening: %v", err)
+	}
 	acct.MustSign(tx)
 	c.MustSubmit(tx)
 	c.WaitForSeqAtLeast(acct.IDBytes(), 1, 500*time.Millisecond, 120*time.Second)
@@ -264,13 +360,21 @@ func openTransfer(c *simkit.Client, chain *simkit.Account, dest [32]byte, unlock
 	assert(st.AccountClass == pb.AccountClass_ACCOUNT_CLASS_TRANSFER, "chain should be TRANSFER")
 }
 
-func plainReceive(c *simkit.Client, acct *simkit.Account, rid [32]byte) {
+// plainReceive claims a receivable on an established account (U2-signed when useU2 — D4 accepts
+// U1 OR U2 on a non-opening RECEIVE).
+func plainReceive(c *simkit.Client, acct *simkit.Account, rid [32]byte, useU2 bool) {
 	head, seq, err := c.Head(acct.IDBytes())
 	if err != nil {
 		log.Fatalf("read account: %v", err)
 	}
 	tx := simkit.BuildReceive(acct, head, seq+1, rid)
-	acct.MustSign(tx)
+	if useU2 {
+		if err := acct.SignWithU2(tx); err != nil {
+			log.Fatalf("U2-sign receive: %v", err)
+		}
+	} else {
+		acct.MustSign(tx)
+	}
 	c.MustSubmit(tx)
 	c.WaitForSeqAtLeast(acct.IDBytes(), seq+1, 500*time.Millisecond, 120*time.Second)
 }

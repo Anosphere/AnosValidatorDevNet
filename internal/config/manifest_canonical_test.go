@@ -11,7 +11,12 @@ import (
 // id shifts, peers on the old layout are rejected). Re-pin it ONLY when that is intended, and
 // bump SupportedProtocolVersion alongside. A surprise diff here means an accidental,
 // fork-inducing change to canonicalBytes().
-const wantCanonicalNetworkID = "2e728861ca1930a3a51487ec8299bcef80ccd07ef6cfcdecb8e4f3e42256e994"
+//
+// forquinn INTERIM re-pin (phase 2): the timing block gained guarded_send_min_interval_epochs
+// (appended last), an intended preimage-layout change. The paired version/domain bumps (D10:
+// SupportedProtocolVersion 1→2, schema 2→3, ANOS_MANIFEST_V2 domain) land together in the
+// phase-6 cutover, which re-pins this once more — nothing ships between phases.
+const wantCanonicalNetworkID = "fe7bb2d3f8b54435a01780374e724a9355a49ac8376ba3be700146c1caf20e04"
 
 func TestNetworkIDPinned(t *testing.T) {
 	m := validManifest()

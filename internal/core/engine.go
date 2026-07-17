@@ -342,16 +342,18 @@ func (e *Engine) Start(ctx context.Context) {
 }
 
 // SubmitTx enqueues raw tx bytes for this epoch; it only checks signature and basic parse.
-// resolveAuthPubKeyDB resolves the auth pubkey to verify a tx's hybrid signature
-// at gossip/submit time, where no epoch snapshot is available. An account-opening
-// RECEIVE (the account is not yet persisted) carries its own pubkey on the tx;
-// every other account tx verifies against the pubkey cached on the persisted
-// account record. Returns (pub, true) when resolvable. Returns (nil, false) when
-// the account is referenced but not yet persisted (e.g. an out-of-order SEND whose
-// opening RECEIVE has not finalized): the caller then accepts the tx and lets the
-// authoritative hybrid verify run at epoch close (ValidateTxAgainstSnapshot), which
-// no winner can skip.
-func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
+// resolveAuthPubKeyDB resolves the CANDIDATE auth pubkeys a tx's hybrid signature may verify
+// against at gossip/submit time, where no epoch snapshot is available. An account-opening
+// RECEIVE (the account is not yet persisted) carries its own pubkey on the tx; every other
+// account tx verifies against the pubkey cached on the persisted account record — PLUS, when
+// the record registered a second user key (forquinn D4), U2: a single user signature is U1 OR
+// U2 everywhere one is accepted, so the gate must try both or a legit U2-signed tx would be
+// dropped at submit. Returns (candidates, true) when resolvable (the caller accepts if ANY
+// candidate verifies — verifyTxSigAnyKey). Returns (nil, false) when the account is referenced
+// but not yet persisted (e.g. an out-of-order SEND whose opening RECEIVE has not finalized):
+// the caller then accepts the tx and lets the authoritative hybrid verify run at epoch close
+// (ValidateTxAgainstSnapshot), which no winner can skip.
+func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([][]byte, bool) {
 	if tx.Account == nil || len(tx.Account.V) != 32 {
 		return nil, false
 	}
@@ -377,7 +379,7 @@ func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
 	// tx.Type). For those types we fall through to the cached-auth-key check, which the junk fails.
 	if tx.Type == pb.TxType_TX_TYPE_SEND || tx.Type == pb.TxType_TX_TYPE_RECEIVE {
 		if bg := tx.GetRevealedBreakglassPubkey().GetV(); len(bg) == crypto.HybridPubKeySize {
-			return bg, true
+			return [][]byte{bg}, true
 		}
 	}
 	var rec AccountRecord
@@ -394,9 +396,10 @@ func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
 		// tx.Type) is what stops a legit lagging-node 2nd-RECEIVE from being dropped
 		// and needlessly triggering a resync; the authoritative verify at epoch close
 		// keys "opening" off snapshot presence and cannot be skipped by any winner.
+		// (An opening is always U1-signed — a U2, if any, registers via its PoP.)
 		if tx.Type == pb.TxType_TX_TYPE_RECEIVE {
 			if ap := tx.GetReceive().GetAuthPubkey().GetV(); len(ap) > 0 {
-				return ap, true // opening block: pubkey carried on the tx
+				return [][]byte{ap}, true // opening block: pubkey carried on the tx
 			}
 		}
 		return nil, false // SEND, or non-opening RECEIVE on an unsynced account: defer
@@ -407,7 +410,30 @@ func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
 	if tx.Type == pb.TxType_TX_TYPE_SEND && rec.Class == pb.AccountClass_ACCOUNT_CLASS_ESCROW {
 		return nil, false
 	}
-	return rec.AuthPubKey, true
+	keys := [][]byte{rec.AuthPubKey}
+	if len(rec.U2PubKey) == crypto.HybridPubKeySize {
+		keys = append(keys, rec.U2PubKey) // registered U2 (guarded/vault or a derived-copy chain)
+	}
+	return keys, true
+}
+
+// verifyTxSigAnyKey verifies a tx's single hybrid signature against each candidate key in order
+// (U1 first, then a registered U2 — forquinn D4), accepting on the first match. Mirrors the
+// authoritative U1-or-U2 resolution in ValidateTxAgainstSnapshot so the submit/gossip gate never
+// drops a tx the epoch-close verify would accept.
+func verifyTxSigAnyKey(tx *pb.Tx, pubs [][]byte) error {
+	var lastErr error
+	for _, pub := range pubs {
+		if err := crypto.VerifyTxSignature(tx, pub); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	if lastErr == nil {
+		lastErr = crypto.ErrMissingField // no candidate keys resolved (defensive; callers pass >= 1)
+	}
+	return lastErr
 }
 
 // isFundSendTx reports whether tx is a SEND extending the Fund's own chain (the keyless,
@@ -595,16 +621,35 @@ func (e *Engine) bestEffortFundRecoveryReject(tx *pb.Tx, snap *Snapshot) error {
 // Fund-send gate. When it can judge, a multisig is rejected unless the account is an attestor-gated
 // release-to-dest, and even then only the N>=1 floor (>=1 verifying attestor signature) is enforced
 // — never the full M (which could race attestor staking) — so a legitimately-signed release is
-// never rejected here. Returns nil immediately for any SEND that carries no multisig.
+// never rejected here. Returns nil immediately for any SEND that carries no multisig and no sig2.
+//
+// forquinn item 1 adds sig2 — the path-(a) second user signature — which is txid-folded and
+// third-party-attachable exactly like the multisig, so it gets the same gate: legitimate ONLY on
+// an attestor-flagged TRANSFER release-to-dest, where the path-(a) shape is judged at-position
+// (no multisig, no case fields, chain HAS a U2, Tx.sig verifies under the chain's U1 [D5 fixed
+// roles] and sig2 under its U2 — all against the immutable chain record, so a legit path-(a)
+// release is never rejected). A sig2 anywhere else can never finalize → rejected statelessly.
 func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
+	sig2 := tx.GetSig2().GetV()
+	hasSig2 := len(sig2) > 0
 	if tx.Type != pb.TxType_TX_TYPE_SEND {
+		if hasSig2 {
+			// Pure function of the tx bytes: no RECEIVE (or unknown-typed tx) ever carries a
+			// sig2 (validate rejects unconditionally), so a sig2-ground variant can never
+			// finalize — keep it out of the conflict pool.
+			return errors.New("sig2 is only valid on an attestor-flagged transfer release-to-dest")
+		}
 		return nil
 	}
 	ms := tx.MultiSig
-	if ms == nil || len(ms.Entries) == 0 {
-		return nil // no multisig → ordinary single-sig send, nothing to judge here
+	hasMS := ms != nil && len(ms.Entries) > 0
+	if !hasMS && !hasSig2 {
+		return nil // ordinary single-sig send, nothing to judge here
 	}
 	if e.isFundSendTx(tx) {
+		if hasSig2 {
+			return errors.New("fund send must not carry a second user signature (sig2)") // stateless (validate mirrors)
+		}
 		return nil // a Fund SEND's multisig is judged by bestEffortFundSendCheck
 	}
 	if tx.Account == nil || len(tx.Account.V) != 32 {
@@ -633,6 +678,14 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			return nil // not at this position — can't confidently judge → defer
 		}
 		judged = true
+		// sig2 is legitimate ONLY on an attestor-flagged TRANSFER release-to-dest (the path-(a)
+		// branch below). At the exact position, every other shape carrying one — an escrow
+		// outflow, a plain account's send, a cancel, a non-gated release — can never finalize.
+		if hasSig2 && (rec.Class != pb.AccountClass_ACCOUNT_CLASS_TRANSFER ||
+			to != rec.TransferDest || rec.TransferFlags&transferFlagReleaseRequiresAttestor == 0) {
+			jerr = errors.New("sig2 is only valid on an attestor-flagged transfer release-to-dest")
+			return nil
+		}
 		// A keyless escrow outflow also carries a multisig (the 2-of-2 / 1-of-2). crypto.TxID folds
 		// it (and any Tx.sig) into the txid, so it is equally txid-grindable — the gate must reject
 		// every variant that can NEVER finalize, or a ground-low permanently-invalid variant occupies
@@ -669,7 +722,8 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			return nil
 		}
 		// At the chain's exact position: a multisig is legitimate ONLY on an attestor-gated
-		// TRANSFER release-to-dest. Reject it anywhere else.
+		// TRANSFER release-to-dest. Reject it anywhere else. (A sig2 on these shapes was
+		// already rejected above.)
 		if rec.Class != pb.AccountClass_ACCOUNT_CLASS_TRANSFER {
 			jerr = errors.New("send must not carry a multisig")
 			return nil
@@ -682,6 +736,50 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			jerr = errors.New("transfer release is not attestor-gated: must not carry a multisig")
 			return nil
 		}
+		if hasSig2 {
+			// ---- path (a) (forquinn item 1): U1 + U2, attestor-free ----
+			// Judged fully against the chain's IMMUTABLE record (keys copied at creation), so a
+			// legit path-(a) release is never rejected; every reject below is a shape validate
+			// will reject identically at epoch close.
+			if hasMS {
+				jerr = errors.New("path (a) release must not carry a multisig")
+				return nil
+			}
+			if len(tx.GetSend().GetCaseNonce()) > 0 || len(tx.GetSend().GetAttestationHash()) > 0 {
+				jerr = errors.New("path (a) release must not carry attestor case fields")
+				return nil
+			}
+			if len(rec.U2PubKey) != crypto.HybridPubKeySize {
+				jerr = errors.New("path (a) release: chain has no registered second user key (U2)")
+				return nil
+			}
+			// D5 fixed roles: Tx.sig under the chain's copied U1, sig2 under its copied U2 —
+			// both over the same digest m.
+			if err := crypto.VerifyTxSignature(tx, rec.AuthPubKey); err != nil {
+				jerr = errors.New("path (a) release: Tx.sig must verify under the chain's copied U1 auth key")
+				return nil
+			}
+			m, _, merr := crypto.MsgHash(tx)
+			if merr != nil {
+				jerr = merr
+				return nil
+			}
+			u2pub, perr := crypto.ParseHybridPubKey(rec.U2PubKey)
+			if perr != nil {
+				jerr = errors.New("path (a) release: stored U2 pubkey not parseable")
+				return nil
+			}
+			s2, serr := crypto.ParseHybridSig(sig2)
+			if serr != nil {
+				jerr = errors.New("path (a) release: malformed sig2")
+				return nil
+			}
+			if !crypto.HybridVerify(u2pub, m, s2) {
+				jerr = errors.New("path (a) release: sig2 does not verify under the chain's U2")
+			}
+			return nil
+		}
+		// ---- path (b): one user sig + the attestor quorum ----
 		// Legit attestor-gated release: enforce the N>=1 floor (reqM=1) to reject pure garbage
 		// while never racing the authoritative flat M-of-N at epoch close. Resolve the listed
 		// signers' cached pubkeys + the finalized stake rows for the verify.
@@ -893,8 +991,21 @@ func judgeAbsentOpening(tx *pb.Tx, acct [32]byte) error {
 	}
 	rb := tx.GetReceive()
 	class := rb.GetAccountClass()
+	// sig2 (forquinn item 1) is a SEND-release-only field: no RECEIVE — an opening included —
+	// can ever finalize with one (validate rejects it unconditionally), and it is txid-folded +
+	// third-party-attachable, so a stateless reject here keeps a sig2-ground variant out of the
+	// opening conflict slot. Pure function of the tx bytes.
+	if len(tx.GetSig2().GetV()) > 0 {
+		return errors.New("opening RECEIVE: sig2 is never valid on a RECEIVE")
+	}
 	switch class {
 	case pb.AccountClass_ACCOUNT_CLASS_TRANSFER, pb.AccountClass_ACCOUNT_CLASS_ESCROW:
+		// A TRANSFER chain gets U2 by DERIVED COPY at apply (forquinn D2) and an escrow is
+		// keyless — neither opening may CARRY a U2 registration block, so that shape can never
+		// finalize regardless of unsynced state: reject it statelessly.
+		if hasU2Registration(rb) {
+			return errors.New("opening RECEIVE: a TRANSFER/ESCROW opening never carries a u2 registration")
+		}
 		// The id derives from the funding receivable (rs.From / rs.FromSeq) and the key source's
 		// stored keys, which may not be synced here → defer (ambiguous). This residual (a junk opening
 		// relabelled TRANSFER/ESCROW still occupies the conflict slot) is closed downstream by the
@@ -923,6 +1034,19 @@ func judgeAbsentOpening(tx *pb.Tx, acct [32]byte) error {
 		}
 		if crypto.BaseAccountID(crypto.AccountTypeByteForClass(class), ap) != acct {
 			return errors.New("opening RECEIVE: account-id does not derive from the carried auth_pubkey")
+		}
+		// U2 registration shape (forquinn item 1) — still a pure function of the tx bytes: a
+		// GUARDED/VAULT opening REQUIRES a well-formed, PoP-verifying U2 block (the PoP binds
+		// acct + the pubkey, both on the tx, so it is fully checkable statelessly), and every
+		// other base/unknown class must not carry one. Either failure can never finalize
+		// (validate enforces the identical rule), so rejecting keeps a malformed-U2 variant out
+		// of the opening conflict slot.
+		if classRequiresU2(class) {
+			if _, err := verifyU2Registration(rb, acct, ap); err != nil {
+				return err
+			}
+		} else if hasU2Registration(rb) {
+			return errors.New("opening RECEIVE: u2 registration is only valid on a guarded/vault opening")
 		}
 		return nil
 	}
@@ -1008,8 +1132,8 @@ func (e *Engine) SubmitTx(raw []byte) error {
 	if err != nil {
 		return err
 	}
-	if pub, ok := e.resolveAuthPubKeyDB(tx); ok {
-		if err := crypto.VerifyTxSignature(tx, pub); err != nil {
+	if pubs, ok := e.resolveAuthPubKeyDB(tx); ok {
+		if err := verifyTxSigAnyKey(tx, pubs); err != nil {
 			return err
 		}
 	} else if e.isFundSendTx(tx) {
@@ -1435,8 +1559,8 @@ func (e *Engine) receiveGossipedTx(raw []byte, solicited bool) error {
 	// close against the snapshot. We can verify immediately when the auth pubkey is
 	// resolvable (opening RECEIVE carries it; existing accounts cache it); otherwise
 	// we accept and defer (see resolveAuthPubKeyDB).
-	if pub, ok := e.resolveAuthPubKeyDB(tx); ok {
-		if err := crypto.VerifyTxSignature(tx, pub); err != nil {
+	if pubs, ok := e.resolveAuthPubKeyDB(tx); ok {
+		if err := verifyTxSigAnyKey(tx, pubs); err != nil {
 			return err
 		}
 	} else if e.isFundSendTx(tx) {

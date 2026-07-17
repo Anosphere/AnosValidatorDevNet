@@ -63,6 +63,7 @@ func main() {
 	attestorM := flag.Uint64("attestor-quorum-m", 2, "")
 	escrowDelay := flag.Uint64("escrow-attestation-delay-epochs", 6, "")
 	breakglass := flag.Uint64("breakglass-extra-epochs", 5, "")
+	guardedSendMin := flag.Uint64("guarded-send-min-interval-epochs", 12, "guarded/vault send rate limit (forquinn D9; mainnet authoring rule 86_400_000/epoch_ms)")
 	flag.Parse()
 
 	eps := splitTrim(*endpoints)
@@ -136,6 +137,7 @@ func main() {
 			AttestorQuorumM:              *attestorM,
 			EscrowAttestationDelayEpochs: *escrowDelay,
 			BreakglassExtraEpochs:        *breakglass,
+			GuardedSendMinIntervalEpochs: *guardedSendMin,
 		},
 		// Canonical production economics + consensus tuning (network-invariant; matches the core
 		// client-side consts so a sim's fee matches a validator's).
@@ -214,6 +216,7 @@ func buildSimEnv(m *config.Manifest, seedHex string) string {
 		{"ATTESTOR_QUORUM_M", fmt.Sprintf("%d", m.Timing.AttestorQuorumM)},
 		{"ESCROW_ATTESTATION_DELAY_EPOCHS", fmt.Sprintf("%d", m.Timing.EscrowAttestationDelayEpochs)},
 		{"BREAKGLASS_EXTRA_EPOCHS", fmt.Sprintf("%d", m.Timing.BreakglassExtraEpochs)},
+		{"GUARDED_SEND_MIN_INTERVAL_EPOCHS", fmt.Sprintf("%d", m.Timing.GuardedSendMinIntervalEpochs)},
 	}
 	var b strings.Builder
 	b.WriteString("# Anos TEST sim env — SECRET (holds GENESIS_SEED_HEX). Never commit. Source before running sims:\n")
