@@ -147,6 +147,21 @@ type AccountRecord struct {
 	AuthPubKey       []byte // 2625 B canonical HybridPubKey, or nil
 	BreakglassCommit []byte // 64 B SHA-512 commitment, or nil
 
+	// U2PubKey is the cached second user key (U2_PUBKEY TLV, forquinn item 1): registered on a
+	// GUARDED/VAULT account's opening RECEIVE (PoP-verified) and immutable thereafter, or COPIED
+	// from the key source's stored record when a TRANSFER chain is created (the D2 derived copy —
+	// never carried on a chain opening, so nothing is strippable). A single user signature then
+	// verifies under AuthPubKey (U1) OR U2PubKey; the attestor-free release path (a) needs both.
+	// nil on every other class and on pre-U2 records.
+	U2PubKey []byte // 2625 B canonical HybridPubKey, or nil
+
+	// LastGuardedSendEpoch is the finalization epoch of this account's most recent SEND
+	// (GUARDED_LAST_SEND TLV, forquinn confirm-item 2) — meaningful only on GUARDED/VAULT
+	// accounts, stamped by ApplyTx from the epoch parameter (committed data, resync-deterministic).
+	// The hop-1 rate limit rejects a SEND while epoch - this < GuardedSendMinIntervalEpochs.
+	// 0 == never sent (first send always allowed).
+	LastGuardedSendEpoch uint64
+
 	// Escrow two-party metadata (ESCROW_META TLV, spec-18 §5.6.2); only meaningful
 	// when Class == ACCOUNT_CLASS_ESCROW. The two parties' hybrid pubkeys + breakglass
 	// commitments are stored BY VALUE in canonical order (PartyLoPub < PartyHiPub
@@ -172,6 +187,8 @@ const (
 const (
 	tlvAuthPubkey          byte = 0x01 // 2625 B HybridPubKey
 	tlvBreakglassCommit    byte = 0x02 // 64 B SHA-512 commitment
+	tlvU2Pubkey            byte = 0x03 // 2625 B HybridPubKey — second user key U2 (guarded/vault + derived-copy transfer chains)
+	tlvGuardedLastSend     byte = 0x04 // 8 B BE finalization epoch of the last guarded/vault SEND (rate limit)
 	tlvTransferMeta        byte = 0x10 // source(32)|dest(32)|unlock(8 BE)|flags(1)
 	tlvTransferReturnDepos byte = 0x11 // return_deposit_txid(32) — return-stake chains only (P5.5)
 	tlvEscrowMeta          byte = 0x20 // partyLo_pub|partyLo_bg|partyHi_pub|partyHi_bg|trigger(8 BE)|flags(1)
@@ -230,10 +247,11 @@ func packAccountRecord(r AccountRecord) []byte {
 }
 
 // buildMetadataBlob assembles the class-specific TLV blob for a record. Fields are
-// emitted in a fixed tag order (AUTH_PUBKEY, BREAKGLASS_COMMIT, TRANSFER_META) so
-// the packed record is byte-deterministic across nodes — important for resync
-// rebuilding byte-identical records (the consensus frontier root hashes only the
-// head, but the local DB should still converge).
+// emitted in a fixed tag order (AUTH_PUBKEY, BREAKGLASS_COMMIT, U2_PUBKEY,
+// GUARDED_LAST_SEND, then TRANSFER/ESCROW meta) so the packed record is
+// byte-deterministic across nodes — important for resync rebuilding byte-identical
+// records (the consensus frontier root hashes only the head, but the local DB
+// should still converge).
 func buildMetadataBlob(r AccountRecord) []byte {
 	var blob []byte
 	if len(r.AuthPubKey) > 0 {
@@ -241,6 +259,16 @@ func buildMetadataBlob(r AccountRecord) []byte {
 	}
 	if len(r.BreakglassCommit) > 0 {
 		blob = appendTLV(blob, tlvBreakglassCommit, r.BreakglassCommit)
+	}
+	if len(r.U2PubKey) > 0 {
+		blob = appendTLV(blob, tlvU2Pubkey, r.U2PubKey)
+	}
+	// GUARDED_LAST_SEND is emitted only when non-zero, so an account that never sent (and every
+	// record written before its first guarded send) stays byte-identical to a record without the tag.
+	if r.LastGuardedSendEpoch != 0 {
+		var v [8]byte
+		binary.BigEndian.PutUint64(v[:], r.LastGuardedSendEpoch)
+		blob = appendTLV(blob, tlvGuardedLastSend, v[:])
 	}
 	if r.Class == pb.AccountClass_ACCOUNT_CLASS_TRANSFER {
 		var v [transferMetaLen]byte
@@ -336,6 +364,16 @@ func parseMetadataBlob(r *AccountRecord, blob []byte) bool {
 				return false
 			}
 			r.BreakglassCommit = append([]byte(nil), val...)
+		case tlvU2Pubkey:
+			if flen != authPubkeyLen {
+				return false
+			}
+			r.U2PubKey = append([]byte(nil), val...)
+		case tlvGuardedLastSend:
+			if flen != 8 {
+				return false
+			}
+			r.LastGuardedSendEpoch = binary.BigEndian.Uint64(val)
 		case tlvTransferMeta:
 			if flen != transferMetaLen {
 				return false
@@ -670,30 +708,43 @@ func IterEpochFrontiers(db *bbolt.DB, epoch uint64, cursor [32]byte, limit int) 
 
 // ComputeFrontiersRoot computes SHA256 of concat(sorted(account||head)) for epoch frontiers.
 func ComputeFrontiersRoot(db *bbolt.DB, epoch uint64) ([32]byte, error) {
-	var rows []FrontierEntry
+	var out [32]byte
 	err := db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(BEpochFrontiers)
-		if b == nil {
-			return ErrNotFound
+		r, rerr := computeFrontiersRootInTx(tx, epoch)
+		if rerr != nil {
+			return rerr
 		}
-		prefix := make([]byte, 8)
-		binary.BigEndian.PutUint64(prefix, epoch)
-
-		c := b.Cursor()
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			if len(k) != 8+32 || len(v) != 32 {
-				continue
-			}
-			var acct [32]byte
-			copy(acct[:], k[8:40])
-			var head [32]byte
-			copy(head[:], v)
-			rows = append(rows, FrontierEntry{AccountID: acct, HeadHash: head})
-		}
+		out = r
 		return nil
 	})
 	if err != nil {
 		return [32]byte{}, err
+	}
+	return out, nil
+}
+
+// computeFrontiersRootInTx is the transaction-scoped body of ComputeFrontiersRoot, so the
+// invariant audit (invariants.go) can recompute an epoch's root inside the SAME read View as
+// its other checks — one MVCC-consistent snapshot, never racing a commit.
+func computeFrontiersRootInTx(tx *bbolt.Tx, epoch uint64) ([32]byte, error) {
+	b := tx.Bucket(BEpochFrontiers)
+	if b == nil {
+		return [32]byte{}, ErrNotFound
+	}
+	prefix := make([]byte, 8)
+	binary.BigEndian.PutUint64(prefix, epoch)
+
+	var rows []FrontierEntry
+	c := b.Cursor()
+	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		if len(k) != 8+32 || len(v) != 32 {
+			continue
+		}
+		var acct [32]byte
+		copy(acct[:], k[8:40])
+		var head [32]byte
+		copy(head[:], v)
+		rows = append(rows, FrontierEntry{AccountID: acct, HeadHash: head})
 	}
 
 	sort.Slice(rows, func(i, j int) bool {

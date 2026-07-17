@@ -29,8 +29,8 @@ import (
 // the JSON (which fields exist). A manifest carrying any other version is rejected
 // (refuse-to-boot) rather than silently mis-parsed. Bumped whenever the manifest gains or
 // loses a field. P7.2 bumps it 1 -> 2 (adds protocol_version, kat_digest, economics,
-// consensus).
-const SupportedVersion = 2
+// consensus). forquinn bumps it 2 -> 3 (adds timing.guarded_send_min_interval_epochs).
+const SupportedVersion = 3
 
 // SupportedProtocolVersion is the consensus RULESET version this binary implements — the
 // structural rules that are algorithms/byte-formats, NOT config scalars (the SignBytesACTE
@@ -40,12 +40,17 @@ const SupportedVersion = 2
 // whenever any of those structural rules changes. The manifest declares the ruleset it
 // targets (Manifest.ProtocolVersion); the binary refuses to boot unless it can speak that
 // ruleset. This is the language-neutral label a future non-Go banker would also carry.
-// v1 == the current post-P7.1 ruleset (validity-aware candidate proposal included).
-const SupportedProtocolVersion = 1
+// v1 == the post-P7.1 ruleset (validity-aware candidate proposal included).
+// v2 == the forquinn ruleset: guarded/vault U2 second key + either-or release rule, U2
+// proof-of-possession, attestor case commitment (case_nonce/attestation_hash folded into
+// the SEND preimage), sig2 in TxID, the D8 hard-length preimage rule, the supply-overflow
+// reject, the guarded send rate limit, Guardian staff exclusion, attestor quorum floor 2.
+const SupportedProtocolVersion = 2
 
 // networkIDDomain domain-separates the network_id preimage (magic bytes; bump only alongside
-// a preimage-layout change, which is itself a protocol_version-worthy flag day).
-const networkIDDomain = "ANOS_MANIFEST_V1:"
+// a preimage-layout change, which is itself a protocol_version-worthy flag day). V2: the
+// forquinn cutover appends timing.guarded_send_min_interval_epochs to canonicalBytes.
+const networkIDDomain = "ANOS_MANIFEST_V2:"
 
 // Manifest is the whole public network descriptor. Everything here is public (no
 // secrets): validator PRIVATE keys and the genesis seed never appear in a manifest.
@@ -92,6 +97,12 @@ type Timing struct {
 	AttestorQuorumM              uint64 `json:"attestor_quorum_m"`
 	EscrowAttestationDelayEpochs uint64 `json:"escrow_attestation_delay_epochs"`
 	BreakglassExtraEpochs        uint64 `json:"breakglass_extra_epochs"`
+	// GuardedSendMinIntervalEpochs is the guarded/vault outbound rate limit (forquinn
+	// confirm-item 2: one NEW guarded send per 24h, epoch-denominated — authoring rule
+	// 86_400_000 / epoch_ms; devnet 12). A SEND from a GUARDED/VAULT account is rejected while
+	// epoch - LastGuardedSendEpoch is below it. CONSENSUS-CRITICAL; appended LAST in
+	// canonicalBytes' timing block (a preimage-layout change — part of the forquinn cutover).
+	GuardedSendMinIntervalEpochs uint64 `json:"guarded_send_min_interval_epochs"`
 }
 
 // Economics holds the consensus-critical monetary/role scalars that used to be hardcoded Go
@@ -227,8 +238,10 @@ func (m *Manifest) validateTiming() error {
 	if m.Timing.EpochMs <= 0 {
 		return fmt.Errorf("timing.epoch_ms must be > 0")
 	}
-	if m.Timing.AttestorQuorumM < 1 {
-		return fmt.Errorf("timing.attestor_quorum_m must be >= 1")
+	// Floor 2 (forquinn item 3 / D11): a 1-of-N attestor gate would let a single compromised
+	// attestor co-sign guarded/vault/breakglass releases.
+	if m.Timing.AttestorQuorumM < 2 {
+		return fmt.Errorf("timing.attestor_quorum_m must be >= 2")
 	}
 	if m.Timing.BreakglassExtraEpochs < 1 {
 		return fmt.Errorf("timing.breakglass_extra_epochs must be >= 1")
@@ -244,6 +257,7 @@ func (m *Manifest) validateTiming() error {
 		{"timing.guarded_delay_epochs", m.Timing.GuardedDelayEpochs},
 		{"timing.vault_delay_epochs", m.Timing.VaultDelayEpochs},
 		{"timing.escrow_attestation_delay_epochs", m.Timing.EscrowAttestationDelayEpochs},
+		{"timing.guarded_send_min_interval_epochs", m.Timing.GuardedSendMinIntervalEpochs},
 	} {
 		if f.val == 0 {
 			return fmt.Errorf("%s must be > 0 (a missing or zero value would silently fork consensus)", f.name)
@@ -402,6 +416,7 @@ func (m *Manifest) canonicalBytes() ([]byte, error) {
 	putU64(&b, m.Timing.AttestorQuorumM)
 	putU64(&b, m.Timing.EscrowAttestationDelayEpochs)
 	putU64(&b, m.Timing.BreakglassExtraEpochs)
+	putU64(&b, m.Timing.GuardedSendMinIntervalEpochs) // forquinn: appended LAST in the timing block
 
 	// economics (fixed order)
 	putU64(&b, m.Economics.MinFee)

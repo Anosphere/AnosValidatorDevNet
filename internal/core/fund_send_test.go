@@ -151,6 +151,24 @@ func TestActiveGuardianWeight(t *testing.T) {
 	}
 }
 
+// forquinn item 5, the quorum DENOMINATOR: ActiveGuardianWeight flows through GuardianWeight,
+// so an in-window identity holding an active staff-tagged stake contributes 0 to M.
+func TestActiveGuardianWeightStaffExclusion(t *testing.T) {
+	g1, g2 := newGuardian(1), newGuardian(2)
+	rows := []StakeRow{
+		guardianStake(g1, 0x10, 8_000), // would be weight 4...
+		stakeRowFor(g1.id, 0x11, 100, oneMonth, StakedForModerator, StakeStatusActive), // ...but g1 is staff → 0
+		guardianStake(g2, 0x20, 6_000), // weight 3
+	}
+	active := []GuardianActiveRow{
+		{GuardianID: g1.id, LastActiveEpoch: 100},
+		{GuardianID: g2.id, LastActiveEpoch: 100},
+	}
+	if got := testEcon.ActiveGuardianWeight(rows, active, 100, 20); got != 3 {
+		t.Errorf("ActiveGuardianWeight = %d, want 3 (staff g1 contributes 0; only g2 counts)", got)
+	}
+}
+
 func TestIsGuardianActiveBoundary(t *testing.T) {
 	if !isGuardianActive(80, 100, 20) {
 		t.Error("gap == window must be active (inclusive)")
@@ -187,6 +205,74 @@ func TestFundSendBootstrapNonGuardianFails(t *testing.T) {
 	tx := buildFundSend(fund, [32]byte{0xaa}, 2, [32]byte{0x42}, anosUnits(10), snap.Epoch, []*tGuardian{g})
 	if err := verifyFundSendQuorum(tx, snap); err == nil {
 		t.Fatal("Fund SEND signed only by a non-eligible identity (N=0) must fail the N>=1 floor")
+	}
+}
+
+// forquinn item 5, the quorum NUMERATOR: a signer holding an active staff-tagged stake
+// contributes weight 0 to a Fund SEND, even though its year-locked "guardian" stake alone
+// would carry the send. The counterfactual (same send, staff row dropped) passes — proving
+// the exclusion, not signature/threshold mechanics, is what rejects.
+func TestFundSendStaffSignerExcluded(t *testing.T) {
+	g1, g2 := newGuardian(1), newGuardian(2)
+	fund := testFund
+	rows := []StakeRow{
+		guardianStake(g1, 0x10, 8_000), // would be weight 4...
+		stakeRowFor(g1.id, 0x11, 5_000, oneYear, StakedForAttestor, StakeStatusActive), // ...but g1 is staff → 0
+		guardianStake(g2, 0x20, 6_000), // weight 3
+	}
+
+	// g1 alone (M=0 → threshold 0): N = 0 → the N>=1 floor rejects.
+	snap := snapWithGuardians(fund, [32]byte{0xaa}, 1, rows, 0, g1, g2)
+	tx := buildFundSend(fund, [32]byte{0xaa}, 2, [32]byte{0x42}, anosUnits(10), snap.Epoch, []*tGuardian{g1})
+	if err := verifyFundSendQuorum(tx, snap); err == nil {
+		t.Fatal("fund send signed only by a staff-tagged identity passed (its weight must be 0)")
+	}
+
+	// g1+g2 with M=6 (threshold ceil(0.7*6)=5): approved = 0+3 = 3 < 5 → rejected.
+	snap = snapWithGuardians(fund, [32]byte{0xaa}, 1, rows, 6, g1, g2)
+	tx = buildFundSend(fund, [32]byte{0xaa}, 2, [32]byte{0x42}, anosUnits(10), snap.Epoch, []*tGuardian{g1, g2})
+	if err := verifyFundSendQuorum(tx, snap); err == nil {
+		t.Fatal("staff co-signer's zeroed weight still counted toward the threshold")
+	}
+
+	// Counterfactual: no staff row → g1 counts 4 again; 4+3 = 7 >= 5 → passes.
+	clean := []StakeRow{rows[0], rows[2]}
+	snap = snapWithGuardians(fund, [32]byte{0xaa}, 1, clean, 6, g1, g2)
+	tx = buildFundSend(fund, [32]byte{0xaa}, 2, [32]byte{0x42}, anosUnits(10), snap.Epoch, []*tGuardian{g1, g2})
+	if err := verifyFundSendQuorum(tx, snap); err != nil {
+		t.Fatalf("counterfactual (no staff row) fund send rejected: %v", err)
+	}
+}
+
+// DOCUMENTED, deliberately not "fixed" (plan §3 phase 5): if EVERY weight-holding identity is
+// staff-tagged, total Guardian weight is 0, the threshold collapses to the N>=1 floor, and no
+// signer can satisfy even that — the Fund freezes until a non-staff identity stakes >= the
+// divisor @ 1yr. That freeze is the intended fail-safe (better a frozen Fund than staff spend
+// power); the phase-6 deploy preflight verifies the bootstrap tags bankers only, so the live
+// net never ships in this state.
+func TestFundSendAllWeightStaffFreezes(t *testing.T) {
+	g1, g2 := newGuardian(1), newGuardian(2)
+	fund := testFund
+	rows := []StakeRow{
+		guardianStake(g1, 0x10, 8_000),
+		stakeRowFor(g1.id, 0x11, 5_000, oneYear, StakedForAttestor, StakeStatusActive),
+		guardianStake(g2, 0x20, 6_000),
+		stakeRowFor(g2.id, 0x21, 5_000, oneMonth, StakedForModerator, StakeStatusActive),
+	}
+	// The recomputed active denominator is 0 even with both identities in-window...
+	active := []GuardianActiveRow{
+		{GuardianID: g1.id, LastActiveEpoch: 100},
+		{GuardianID: g2.id, LastActiveEpoch: 100},
+	}
+	if got := testEcon.ActiveGuardianWeight(rows, active, 100, 20); got != 0 {
+		t.Fatalf("all-staff ActiveGuardianWeight = %d, want 0", got)
+	}
+	// ...so threshold(0) = 0 and only the N>=1 floor governs — which nobody can meet: even
+	// every weight-holder co-signing yields N = 0 → rejected. The Fund is frozen by design.
+	snap := snapWithGuardians(fund, [32]byte{0xaa}, 1, rows, 0, g1, g2)
+	tx := buildFundSend(fund, [32]byte{0xaa}, 2, [32]byte{0x42}, anosUnits(10), snap.Epoch, []*tGuardian{g1, g2})
+	if err := verifyFundSendQuorum(tx, snap); err == nil {
+		t.Fatal("all-weight-staff fund send passed (must fail the N>=1 floor — the documented freeze)")
 	}
 }
 
@@ -341,7 +427,7 @@ func applyFundSend(t *testing.T, db *bbolt.DB, tx *pb.Tx, txid [32]byte) error {
 	t.Helper()
 	raw, _ := proto.Marshal(tx)
 	return db.Update(func(btx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: btx}, raw, tx, txid, testFund, testEcon)
+		return ApplyTx(&bboltTxView{tx: btx}, raw, tx, txid, testFund, testEcon, 0)
 	})
 }
 

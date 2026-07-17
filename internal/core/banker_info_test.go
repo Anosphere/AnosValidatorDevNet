@@ -174,7 +174,7 @@ func TestRoutedBankerStakeRecordsNoDescriptor(t *testing.T) {
 	}
 	raw, _ := proto.Marshal(ptx)
 	mustUpdate(t, db, func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txidFor(chain, 2), fund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txidFor(chain, 2), fund, testEcon, 0)
 	})
 
 	// The STAKE row IS recorded under the source identity (weight/voting attribution).
@@ -369,7 +369,7 @@ func applyBankerStakeThrough(t *testing.T, db *bbolt.DB, from, fromHead [32]byte
 	}
 	raw, _ := proto.Marshal(ptx)
 	if err := db.Update(func(tx *bbolt.Tx) error {
-		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
+		return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon, 0)
 	}); err != nil {
 		t.Fatalf("apply banker stake seq=%d: %v", seq, err)
 	}

@@ -8,7 +8,8 @@
 //  3. OWNER CANCEL: a second breakglass drain B2 is cancelled via return-to-source signed by the
 //     AUTH key (the owner still holds it) — free, any epoch, no attestors.
 //  4. RELEASE: after the +window unlock, B releases to recovery dest D, authorized by the REVEALED
-//     breakglass key + the M-of-N attestor quorum; D receives the funds.
+//     breakglass key + the M-of-N attestor quorum + the mandatory 32-byte case commitment
+//     (forquinn item 2); D receives the funds.
 //  5. NEGATIVE: a forged breakglass drain (a stranger's revealed key over S's chain) never finalizes.
 //  6. ESCROW: a two-party escrow drains 2-of-2 where ONE party signs with its revealed breakglass key.
 //
@@ -17,6 +18,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -237,14 +239,19 @@ func openBreakglassChain(c *simkit.Client, chain *simkit.Account, dest [32]byte,
 }
 
 // breakglassRelease submits a release-to-dest authorized by the chain's REVEALED breakglass key
-// (Tx.sig) + the M-of-N attestor multisig. It does NOT wait (callers decide).
+// (Tx.sig) + the M-of-N attestor multisig + the mandatory 32-byte case commitment (forquinn
+// item 2 — the breakglass hop-2 is an attestor-gated release like any other). The commitment is
+// derived from the chain id so the pre-unlock submit and the post-unlock re-submit are
+// byte-identical (same preimage → same txid → idempotent dup). It does NOT wait (callers decide).
 func breakglassRelease(c *simkit.Client, chain *simkit.Account, to [32]byte, balance uint64, attestors []*simkit.Account) {
 	head, seq, err := c.Head(chain.IDBytes())
 	if err != nil {
 		log.Fatalf("read chain: %v", err)
 	}
 	tx := simkit.BuildSend(chain, head, seq+1, to, balance, 0)
-	if err := simkit.SignBreakglassRelease(tx, chain, attestors); err != nil {
+	caseNonce := sha256.Sum256(append([]byte("sim-case-nonce:"), chain.IDBytes()...))
+	attestationHash := sha256.Sum256(append([]byte("sim-attestation-hash:"), chain.IDBytes()...))
+	if err := simkit.SignBreakglassRelease(tx, chain, attestors, caseNonce, attestationHash); err != nil {
 		log.Fatalf("sign breakglass release: %v", err)
 	}
 	_ = c.Submit(tx)

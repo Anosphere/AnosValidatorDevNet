@@ -177,10 +177,10 @@ func newReleaseFixture(t *testing.T, flagSet bool) *releaseFixture {
 	}
 }
 
-// releaseTx builds a full-balance zero-fee TRANSFER drain to `to`, signed by the chain's key.
-func (f *releaseFixture) releaseTx(t *testing.T, to [32]byte) *pb.Tx {
-	t.Helper()
-	tx := &pb.Tx{
+// unsignedReleaseTx builds a full-balance zero-fee TRANSFER drain to `to` (no signature yet —
+// callers that add preimage-folded fields, e.g. the case commitment, set them before signing).
+func (f *releaseFixture) unsignedReleaseTx(to [32]byte) *pb.Tx {
+	return &pb.Tx{
 		Type:    pb.TxType_TX_TYPE_SEND,
 		Account: &pb.AccountId{V: append([]byte(nil), f.chainID[:]...)},
 		Prev:    &pb.Hash32{V: append([]byte(nil), f.head[:]...)},
@@ -192,6 +192,24 @@ func (f *releaseFixture) releaseTx(t *testing.T, to [32]byte) *pb.Tx {
 			AccountClass: pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
 		}},
 	}
+}
+
+// releaseTx builds a full-balance zero-fee TRANSFER drain to `to`, signed by the chain's key.
+func (f *releaseFixture) releaseTx(t *testing.T, to [32]byte) *pb.Tx {
+	t.Helper()
+	tx := f.unsignedReleaseTx(to)
+	if err := crypto.SignTxHybrid(tx, f.chainPriv); err != nil {
+		t.Fatalf("chain sign: %v", err)
+	}
+	return tx
+}
+
+// releaseTxCase is releaseTx plus the mandatory 32-byte case commitment (phase 3, forquinn
+// item 2) — stamped BEFORE signing, since both fields are folded into the signed preimage.
+func (f *releaseFixture) releaseTxCase(t *testing.T, to [32]byte) *pb.Tx {
+	t.Helper()
+	tx := f.unsignedReleaseTx(to)
+	setTestCaseFields(tx)
 	if err := crypto.SignTxHybrid(tx, f.chainPriv); err != nil {
 		t.Fatalf("chain sign: %v", err)
 	}
@@ -202,7 +220,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Positive: at/after unlock, chain key + M (=2) attestor sigs → accepted.
 	t.Run("accept M-of-N at unlock", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a2)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err != nil {
 			t.Fatalf("valid M-of-N release rejected: %v", err)
@@ -212,7 +230,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Extra non-attestor signer is harmless (ignored): a1+a2+a3 still counts 2.
 	t.Run("non-attestor signer ignored", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a2, f.a3)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err != nil {
 			t.Fatalf("release with an extra non-attestor signer rejected: %v", err)
@@ -222,7 +240,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Below threshold: 1 attestor < M=2 → rejected.
 	t.Run("reject below M", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("release with 1 < M attestor signatures accepted")
@@ -232,7 +250,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Only a non-attestor signs (a3): count 0 < M → rejected.
 	t.Run("reject non-attestor-only", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a3)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("release authorized only by a non-attestor accepted")
@@ -242,7 +260,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// Duplicate attestor entries count once: a1,a1 → 1 < M → rejected.
 	t.Run("reject duplicate signer", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a1)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("release with a duplicated attestor counted twice")
@@ -252,7 +270,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	// No multisig at all (only Tx.sig) on a gated release → rejected.
 	t.Run("reject missing multisig", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
-		tx := f.releaseTx(t, f.dest) // no multisig attached
+		tx := f.releaseTxCase(t, f.dest) // no multisig attached
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("gated release with no attestor multisig accepted")
 		}
@@ -262,7 +280,7 @@ func TestReleaseAttestorGate(t *testing.T) {
 	t.Run("reject before unlock", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
 		f.snap.Epoch = f.unlock - 1
-		tx := f.releaseTx(t, f.dest)
+		tx := f.releaseTxCase(t, f.dest)
 		attachAttestorMultiSig(t, tx, f.a1, f.a2)
 		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
 			t.Error("gated release accepted before unlock")
@@ -289,19 +307,15 @@ func TestReleaseAttestorGate(t *testing.T) {
 		}
 	})
 
-	// AttestorQuorumM == 0 is treated as 1 defensively: 1 attestor passes, 0 fails.
-	t.Run("M=0 defensive floor", func(t *testing.T) {
+	// D11: AttestorQuorumM == 0 (a missing quorum config) FAILS CLOSED — the release is
+	// rejected even with a full, valid attestor quorum attached, never silently gated at 1.
+	t.Run("M=0 fails closed", func(t *testing.T) {
 		f := newReleaseFixture(t, true)
 		f.snap.AttestorQuorumM = 0
-		ok := f.releaseTx(t, f.dest)
-		attachAttestorMultiSig(t, ok, f.a1)
-		if _, err := ValidateTxAgainstSnapshot(ok, f.snap); err != nil {
-			t.Fatalf("M=0→1 floor rejected a single attestor: %v", err)
-		}
-		none := f.releaseTx(t, f.dest)
-		attachAttestorMultiSig(t, none, f.a3) // non-attestor only
-		if _, err := ValidateTxAgainstSnapshot(none, f.snap); err == nil {
-			t.Error("M=0→1 floor accepted zero attestor signatures")
+		tx := f.releaseTxCase(t, f.dest)
+		attachAttestorMultiSig(t, tx, f.a1, f.a2) // both staked attestors sign — still rejected
+		if _, err := ValidateTxAgainstSnapshot(tx, f.snap); err == nil {
+			t.Error("M=0 release accepted (a missing quorum config must fail closed)")
 		}
 	})
 }
@@ -379,7 +393,9 @@ func TestReleaseTxIDBindsSigAndMultisig(t *testing.T) {
 		t.Fatalf("txid: %v", err)
 	}
 
-	// Explicit construction: txid == SHA256(sign_bytes || Tx.sig || canonical(multisig)).
+	// Explicit construction (forquinn §2.3): txid == SHA256(sign_bytes || Tx.sig || frame(sig2)
+	// || canonical(multisig)) — sig2 absent on a path-(b) release folds as a zero-length
+	// uint32-LE frame.
 	sb, err := crypto.SignBytesACTE(tx)
 	if err != nil {
 		t.Fatalf("signbytes: %v", err)
@@ -388,10 +404,11 @@ func TestReleaseTxIDBindsSigAndMultisig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	buf := append(append(append([]byte{}, sb...), tx.Sig.V...), dig...)
+	buf := append(append(append([]byte{}, sb...), tx.Sig.V...), make([]byte, 4)...)
+	buf = append(buf, dig...)
 	want := sha256.Sum256(buf)
 	if id12 != want {
-		t.Error("release txid != SHA256(sign_bytes || Tx.sig || multisig_digest)")
+		t.Error("release txid != SHA256(sign_bytes || Tx.sig || frame(sig2) || multisig_digest)")
 	}
 
 	// Reordering the entries → same txid (canonical sort).
@@ -492,7 +509,7 @@ func TestApplySetsReleaseAttestorFlag(t *testing.T) {
 			raw, _ := proto.Marshal(ptx)
 			txid := txidFor(chainID, 1)
 			if err := db.Update(func(tx *bbolt.Tx) error {
-				return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon)
+				return ApplyTx(&bboltTxView{tx: tx}, raw, ptx, txid, fund, testEcon, 0)
 			}); err != nil {
 				t.Fatalf("ApplyTx opening RECEIVE: %v", err)
 			}
@@ -519,9 +536,10 @@ func TestApplySetsReleaseAttestorFlag(t *testing.T) {
 	}
 }
 
-// TestFundSendTxIDByteIdentity pins that the keyless Fund-SEND txid is unchanged by the P3.2
-// TxID rework: with no Tx.sig it stays SHA256(sign_bytes || multisig_digest) — nothing is folded
-// between the body and the digest.
+// TestFundSendTxIDByteIdentity pins the CURRENT canonical keyless Fund-SEND txid construction:
+// SHA256(sign_bytes || frame(sig2) || multisig_digest). (Pre-forquinn this was byte-identical to
+// the pre-P3.2 form; the forquinn §2.3 sig2 fold deliberately inserts an unconditional zero-length
+// uint32-LE frame — old txids die at the cutover reset, which is the point.)
 func TestFundSendTxIDByteIdentity(t *testing.T) {
 	g1, g2 := newGuardian(1), newGuardian(2)
 	tx := buildFundSend(testFund, [32]byte{0xaa}, 2, [32]byte{0x42}, anosUnits(10), 100, []*tGuardian{g1, g2})
@@ -537,8 +555,11 @@ func TestFundSendTxIDByteIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	want := sha256.Sum256(append(append([]byte{}, sb...), dig...))
+	buf := append([]byte{}, sb...)
+	buf = append(buf, make([]byte, 4)...) // frame(sig2): absent → zero-length frame
+	buf = append(buf, dig...)
+	want := sha256.Sum256(buf)
 	if got != want {
-		t.Error("keyless Fund-SEND txid is not SHA256(sign_bytes || multisig_digest) — byte-identity broken")
+		t.Error("keyless Fund-SEND txid is not SHA256(sign_bytes || frame(sig2) || multisig_digest)")
 	}
 }

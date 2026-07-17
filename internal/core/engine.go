@@ -91,7 +91,9 @@ type EngineConfig struct {
 	// AttestorQuorumM is the flat M-of-N Fund Attestor quorum threshold (P3.2, spec-19 §6.1): an
 	// attestor-gated TRANSFER release-to-dest needs at least this many DISTINCT verifying Fund
 	// Attestor signatures (a count, NOT a weight). CONSENSUS-CRITICAL manifest constant (set via
-	// ATTESTOR_QUORUM_M); must be >= 1. P7's network manifest must content-address it.
+	// ATTESTOR_QUORUM_M); must be >= 2 (the D11 floor — manifest.Validate and main.go both
+	// assert it), and 0 fails closed in verifyReleaseAttestorQuorum. Read by buildSnapshot (the
+	// authoritative epoch-close check) AND bestEffortReleaseCheck (the submit-time gate).
 	AttestorQuorumM uint64
 
 	// EscrowAttestationDelayEpochs is the minimum gap (in epochs) between an escrow's creation and
@@ -107,6 +109,13 @@ type EngineConfig struct {
 	// CONSENSUS-CRITICAL: identical on every validator (set via BREAKGLASS_EXTRA_EPOCHS); local test
 	// configs set a small value. P7's network manifest must content-address it.
 	BreakglassExtraEpochs uint64
+
+	// GuardedSendMinIntervalEpochs is the guarded/vault outbound rate limit (forquinn confirm-item
+	// 2: one new guarded send per 24h, epoch-denominated — 86_400_000/epoch_ms in a mainnet
+	// manifest; devnet 12). A SEND from a GUARDED/VAULT account is rejected while
+	// epoch - LastGuardedSendEpoch is below it. CONSENSUS-CRITICAL once wired (phase 2 adds the
+	// manifest timing field + env bridge; until then it is 0 == no limit).
+	GuardedSendMinIntervalEpochs uint64
 
 	// Econ carries the manifest-pinned monetary + role scalars (fee schedule, role floors, Guardian
 	// divisor/threshold, fund-send epoch slack). buildSnapshot copies it into every Snapshot, and the
@@ -128,6 +137,14 @@ type EngineConfig struct {
 	// one full pool is still held/proposed by other nodes and fetched on demand by any node that needs
 	// it for the union. 0 => NewEngine substitutes defaultMaxMempoolTxs. (P7.3)
 	MaxMempoolTxs int
+
+	// FullAuditEveryEpochs is the background invariant-audit cadence (forquinn P4, §2.9): run the
+	// full six-check audit when at least this many epochs committed since the last clean pass
+	// (ANOS_FULL_AUDIT_EVERY_EPOCHS; devnet default 1 = every epoch). A LOCAL operational knob,
+	// NOT consensus-critical and deliberately NOT manifest-pinned: the audit only READS committed
+	// state, so divergent cadences cannot fork — a sparser cadence just detects corruption later.
+	// 0 => NewEngine substitutes 1.
+	FullAuditEveryEpochs uint64
 
 	// NetworkID / ProtocolVersion are this node's network identity (config.Manifest.NetworkID = the
 	// content hash + SupportedProtocolVersion). The engine stamps them as X-Anos-* headers on every
@@ -226,6 +243,20 @@ type Engine struct {
 	// only by the loop goroutine.
 	presenceSkips int
 
+	// --- forquinn P4 invariant watchdog (invariants.go) ---
+	// Halt state, e.mu-guarded: set once by haltInvariant (first violation wins) and never
+	// cleared at runtime — recovery is an operator decision. invariantReason is the COARSE
+	// category only (safe for the ungated /health); the detail lives in the CRITICAL logs.
+	invariantHalted    bool
+	invariantReason    string
+	invariantEpoch     uint64
+	lastFullAuditEpoch uint64 // newest epoch that passed a clean full audit (/health); e.mu
+	// auditKick wakes the background audit goroutine after a commit (buffered 1; kickAudit's
+	// non-blocking send collapses bursts). lastHaltRelog paces the halted loop's reminder log —
+	// loop-goroutine-only state, like presenceSkips.
+	auditKick     chan struct{}
+	lastHaltRelog time.Time
+
 	startOnce sync.Once
 }
 
@@ -289,6 +320,10 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if cfg.MaxMempoolTxs == 0 {
 		cfg.MaxMempoolTxs = defaultMaxMempoolTxs
 	}
+	// FullAuditEveryEpochs is likewise a LOCAL knob; default to auditing every epoch.
+	if cfg.FullAuditEveryEpochs == 0 {
+		cfg.FullAuditEveryEpochs = 1
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 2 * time.Second}
 	}
@@ -316,6 +351,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		dynPeerIPs:      make(map[string]struct{}),
 		resyncBlacklist: make(map[string]time.Time),
 		dialHealth:      make(map[string]*dialHealthEntry),
+		auditKick:       make(chan struct{}, 1),
 	}
 
 	if err := cfg.DB.Update(func(tx *bbolt.Tx) error { return ensureBuckets(tx) }); err != nil {
@@ -331,20 +367,23 @@ func (e *Engine) Start(ctx context.Context) {
 	e.startOnce.Do(func() {
 		go e.loop(ctx)
 		go e.gossipLoop(ctx)
+		go e.auditLoop(ctx) // forquinn P4: background invariant watchdog (invariants.go)
 	})
 }
 
 // SubmitTx enqueues raw tx bytes for this epoch; it only checks signature and basic parse.
-// resolveAuthPubKeyDB resolves the auth pubkey to verify a tx's hybrid signature
-// at gossip/submit time, where no epoch snapshot is available. An account-opening
-// RECEIVE (the account is not yet persisted) carries its own pubkey on the tx;
-// every other account tx verifies against the pubkey cached on the persisted
-// account record. Returns (pub, true) when resolvable. Returns (nil, false) when
-// the account is referenced but not yet persisted (e.g. an out-of-order SEND whose
-// opening RECEIVE has not finalized): the caller then accepts the tx and lets the
-// authoritative hybrid verify run at epoch close (ValidateTxAgainstSnapshot), which
-// no winner can skip.
-func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
+// resolveAuthPubKeyDB resolves the CANDIDATE auth pubkeys a tx's hybrid signature may verify
+// against at gossip/submit time, where no epoch snapshot is available. An account-opening
+// RECEIVE (the account is not yet persisted) carries its own pubkey on the tx; every other
+// account tx verifies against the pubkey cached on the persisted account record — PLUS, when
+// the record registered a second user key (forquinn D4), U2: a single user signature is U1 OR
+// U2 everywhere one is accepted, so the gate must try both or a legit U2-signed tx would be
+// dropped at submit. Returns (candidates, true) when resolvable (the caller accepts if ANY
+// candidate verifies — verifyTxSigAnyKey). Returns (nil, false) when the account is referenced
+// but not yet persisted (e.g. an out-of-order SEND whose opening RECEIVE has not finalized):
+// the caller then accepts the tx and lets the authoritative hybrid verify run at epoch close
+// (ValidateTxAgainstSnapshot), which no winner can skip.
+func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([][]byte, bool) {
 	if tx.Account == nil || len(tx.Account.V) != 32 {
 		return nil, false
 	}
@@ -370,7 +409,7 @@ func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
 	// tx.Type). For those types we fall through to the cached-auth-key check, which the junk fails.
 	if tx.Type == pb.TxType_TX_TYPE_SEND || tx.Type == pb.TxType_TX_TYPE_RECEIVE {
 		if bg := tx.GetRevealedBreakglassPubkey().GetV(); len(bg) == crypto.HybridPubKeySize {
-			return bg, true
+			return [][]byte{bg}, true
 		}
 	}
 	var rec AccountRecord
@@ -387,9 +426,10 @@ func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
 		// tx.Type) is what stops a legit lagging-node 2nd-RECEIVE from being dropped
 		// and needlessly triggering a resync; the authoritative verify at epoch close
 		// keys "opening" off snapshot presence and cannot be skipped by any winner.
+		// (An opening is always U1-signed — a U2, if any, registers via its PoP.)
 		if tx.Type == pb.TxType_TX_TYPE_RECEIVE {
 			if ap := tx.GetReceive().GetAuthPubkey().GetV(); len(ap) > 0 {
-				return ap, true // opening block: pubkey carried on the tx
+				return [][]byte{ap}, true // opening block: pubkey carried on the tx
 			}
 		}
 		return nil, false // SEND, or non-opening RECEIVE on an unsynced account: defer
@@ -400,7 +440,30 @@ func (e *Engine) resolveAuthPubKeyDB(tx *pb.Tx) ([]byte, bool) {
 	if tx.Type == pb.TxType_TX_TYPE_SEND && rec.Class == pb.AccountClass_ACCOUNT_CLASS_ESCROW {
 		return nil, false
 	}
-	return rec.AuthPubKey, true
+	keys := [][]byte{rec.AuthPubKey}
+	if len(rec.U2PubKey) == crypto.HybridPubKeySize {
+		keys = append(keys, rec.U2PubKey) // registered U2 (guarded/vault or a derived-copy chain)
+	}
+	return keys, true
+}
+
+// verifyTxSigAnyKey verifies a tx's single hybrid signature against each candidate key in order
+// (U1 first, then a registered U2 — forquinn D4), accepting on the first match. Mirrors the
+// authoritative U1-or-U2 resolution in ValidateTxAgainstSnapshot so the submit/gossip gate never
+// drops a tx the epoch-close verify would accept.
+func verifyTxSigAnyKey(tx *pb.Tx, pubs [][]byte) error {
+	var lastErr error
+	for _, pub := range pubs {
+		if err := crypto.VerifyTxSignature(tx, pub); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	if lastErr == nil {
+		lastErr = crypto.ErrMissingField // no candidate keys resolved (defensive; callers pass >= 1)
+	}
+	return lastErr
 }
 
 // isFundSendTx reports whether tx is a SEND extending the Fund's own chain (the keyless,
@@ -586,18 +649,42 @@ func (e *Engine) bestEffortFundRecoveryReject(tx *pb.Tx, snap *Snapshot) error {
 // chain head == tx.prev (the node is at the exact position this send extends, so its finalized
 // record + class + flag are the right basis); otherwise it defers (returns nil), exactly like the
 // Fund-send gate. When it can judge, a multisig is rejected unless the account is an attestor-gated
-// release-to-dest, and even then only the N>=1 floor (>=1 verifying attestor signature) is enforced
-// — never the full M (which could race attestor staking) — so a legitimately-signed release is
-// never rejected here. Returns nil immediately for any SEND that carries no multisig.
+// release-to-dest, and even then the CONFIGURED flat M (e.cfg.AttestorQuorumM — D11 site 2, the
+// same threshold the epoch-close check applies) must be met from the node's current view. Tradeoff
+// (user-ruled acceptable): a node that cannot yet resolve >= M of the release's signers may
+// best-effort reject a legitimate release at submit — gossip and the other nodes carry it, and the
+// epoch-close check stays authoritative. The attestor path additionally requires the two
+// exact-32-byte case fields (forquinn item 2 — validate enforces them at epoch close, so a
+// fieldless variant can never finalize). Returns nil immediately for any SEND that carries no
+// multisig and no sig2.
+//
+// forquinn item 1 adds sig2 — the path-(a) second user signature — which is txid-folded and
+// third-party-attachable exactly like the multisig, so it gets the same gate: legitimate ONLY on
+// an attestor-flagged TRANSFER release-to-dest, where the path-(a) shape is judged at-position
+// (no multisig, no case fields, chain HAS a U2, Tx.sig verifies under the chain's U1 [D5 fixed
+// roles] and sig2 under its U2 — all against the immutable chain record, so a legit path-(a)
+// release is never rejected). A sig2 anywhere else can never finalize → rejected statelessly.
 func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
+	sig2 := tx.GetSig2().GetV()
+	hasSig2 := len(sig2) > 0
 	if tx.Type != pb.TxType_TX_TYPE_SEND {
+		if hasSig2 {
+			// Pure function of the tx bytes: no RECEIVE (or unknown-typed tx) ever carries a
+			// sig2 (validate rejects unconditionally), so a sig2-ground variant can never
+			// finalize — keep it out of the conflict pool.
+			return errors.New("sig2 is only valid on an attestor-flagged transfer release-to-dest")
+		}
 		return nil
 	}
 	ms := tx.MultiSig
-	if ms == nil || len(ms.Entries) == 0 {
-		return nil // no multisig → ordinary single-sig send, nothing to judge here
+	hasMS := ms != nil && len(ms.Entries) > 0
+	if !hasMS && !hasSig2 {
+		return nil // ordinary single-sig send, nothing to judge here
 	}
 	if e.isFundSendTx(tx) {
+		if hasSig2 {
+			return errors.New("fund send must not carry a second user signature (sig2)") // stateless (validate mirrors)
+		}
 		return nil // a Fund SEND's multisig is judged by bestEffortFundSendCheck
 	}
 	if tx.Account == nil || len(tx.Account.V) != 32 {
@@ -626,6 +713,14 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			return nil // not at this position — can't confidently judge → defer
 		}
 		judged = true
+		// sig2 is legitimate ONLY on an attestor-flagged TRANSFER release-to-dest (the path-(a)
+		// branch below). At the exact position, every other shape carrying one — an escrow
+		// outflow, a plain account's send, a cancel, a non-gated release — can never finalize.
+		if hasSig2 && (rec.Class != pb.AccountClass_ACCOUNT_CLASS_TRANSFER ||
+			to != rec.TransferDest || rec.TransferFlags&transferFlagReleaseRequiresAttestor == 0) {
+			jerr = errors.New("sig2 is only valid on an attestor-flagged transfer release-to-dest")
+			return nil
+		}
 		// A keyless escrow outflow also carries a multisig (the 2-of-2 / 1-of-2). crypto.TxID folds
 		// it (and any Tx.sig) into the txid, so it is equally txid-grindable — the gate must reject
 		// every variant that can NEVER finalize, or a ground-low permanently-invalid variant occupies
@@ -662,7 +757,8 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			return nil
 		}
 		// At the chain's exact position: a multisig is legitimate ONLY on an attestor-gated
-		// TRANSFER release-to-dest. Reject it anywhere else.
+		// TRANSFER release-to-dest. Reject it anywhere else. (A sig2 on these shapes was
+		// already rejected above.)
 		if rec.Class != pb.AccountClass_ACCOUNT_CLASS_TRANSFER {
 			jerr = errors.New("send must not carry a multisig")
 			return nil
@@ -675,9 +771,64 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 			jerr = errors.New("transfer release is not attestor-gated: must not carry a multisig")
 			return nil
 		}
-		// Legit attestor-gated release: enforce the N>=1 floor (reqM=1) to reject pure garbage
-		// while never racing the authoritative flat M-of-N at epoch close. Resolve the listed
-		// signers' cached pubkeys + the finalized stake rows for the verify.
+		if hasSig2 {
+			// ---- path (a) (forquinn item 1): U1 + U2, attestor-free ----
+			// Judged fully against the chain's IMMUTABLE record (keys copied at creation), so a
+			// legit path-(a) release is never rejected; every reject below is a shape validate
+			// will reject identically at epoch close.
+			if hasMS {
+				jerr = errors.New("path (a) release must not carry a multisig")
+				return nil
+			}
+			if len(tx.GetSend().GetCaseNonce()) > 0 || len(tx.GetSend().GetAttestationHash()) > 0 {
+				jerr = errors.New("path (a) release must not carry attestor case fields")
+				return nil
+			}
+			if len(rec.U2PubKey) != crypto.HybridPubKeySize {
+				jerr = errors.New("path (a) release: chain has no registered second user key (U2)")
+				return nil
+			}
+			// D5 fixed roles: Tx.sig under the chain's copied U1, sig2 under its copied U2 —
+			// both over the same digest m.
+			if err := crypto.VerifyTxSignature(tx, rec.AuthPubKey); err != nil {
+				jerr = errors.New("path (a) release: Tx.sig must verify under the chain's copied U1 auth key")
+				return nil
+			}
+			m, _, merr := crypto.MsgHash(tx)
+			if merr != nil {
+				jerr = merr
+				return nil
+			}
+			u2pub, perr := crypto.ParseHybridPubKey(rec.U2PubKey)
+			if perr != nil {
+				jerr = errors.New("path (a) release: stored U2 pubkey not parseable")
+				return nil
+			}
+			s2, serr := crypto.ParseHybridSig(sig2)
+			if serr != nil {
+				jerr = errors.New("path (a) release: malformed sig2")
+				return nil
+			}
+			if !crypto.HybridVerify(u2pub, m, s2) {
+				jerr = errors.New("path (a) release: sig2 does not verify under the chain's U2")
+			}
+			return nil
+		}
+		// ---- path (b): one user sig + the attestor quorum ----
+		// The case commitment (forquinn item 2): validate requires BOTH exact-32-byte fields on
+		// the attestor path at epoch close, so a variant missing them can NEVER finalize — and
+		// its multisig is attacker-attachable/grindable, so reject it here (a pure function of
+		// the tx bytes; a legit post-cutover release always carries them).
+		if len(tx.GetSend().GetCaseNonce()) != crypto.CaseFieldSize ||
+			len(tx.GetSend().GetAttestationHash()) != crypto.CaseFieldSize {
+			jerr = errors.New("attestor-gated release must carry a 32-byte case_nonce and attestation_hash")
+			return nil
+		}
+		// Legit attestor-gated release: enforce the configured flat M (D11 site 2 — the same
+		// threshold the authoritative epoch-close check applies; best-effort, may reject a
+		// release whose signers this node cannot yet resolve — gossip and the other nodes carry
+		// it). Resolve the listed signers' cached pubkeys + the finalized stake rows for the
+		// verify.
 		snap.FundStakeRows = listStakesInTx(dbtx)
 		for _, en := range ms.Entries {
 			if en == nil || en.SignerId == nil || len(en.SignerId.V) != 32 {
@@ -689,7 +840,7 @@ func (e *Engine) bestEffortReleaseCheck(tx *pb.Tx) error {
 				snap.Accounts[id] = AccountSnap{AuthPubKey: r.AuthPubKey}
 			}
 		}
-		jerr = verifyReleaseAttestorQuorum(tx, snap, 1)
+		jerr = verifyReleaseAttestorQuorum(tx, snap, e.cfg.AttestorQuorumM)
 		return nil
 	})
 	if judged {
@@ -886,8 +1037,21 @@ func judgeAbsentOpening(tx *pb.Tx, acct [32]byte) error {
 	}
 	rb := tx.GetReceive()
 	class := rb.GetAccountClass()
+	// sig2 (forquinn item 1) is a SEND-release-only field: no RECEIVE — an opening included —
+	// can ever finalize with one (validate rejects it unconditionally), and it is txid-folded +
+	// third-party-attachable, so a stateless reject here keeps a sig2-ground variant out of the
+	// opening conflict slot. Pure function of the tx bytes.
+	if len(tx.GetSig2().GetV()) > 0 {
+		return errors.New("opening RECEIVE: sig2 is never valid on a RECEIVE")
+	}
 	switch class {
 	case pb.AccountClass_ACCOUNT_CLASS_TRANSFER, pb.AccountClass_ACCOUNT_CLASS_ESCROW:
+		// A TRANSFER chain gets U2 by DERIVED COPY at apply (forquinn D2) and an escrow is
+		// keyless — neither opening may CARRY a U2 registration block, so that shape can never
+		// finalize regardless of unsynced state: reject it statelessly.
+		if hasU2Registration(rb) {
+			return errors.New("opening RECEIVE: a TRANSFER/ESCROW opening never carries a u2 registration")
+		}
 		// The id derives from the funding receivable (rs.From / rs.FromSeq) and the key source's
 		// stored keys, which may not be synced here → defer (ambiguous). This residual (a junk opening
 		// relabelled TRANSFER/ESCROW still occupies the conflict slot) is closed downstream by the
@@ -916,6 +1080,19 @@ func judgeAbsentOpening(tx *pb.Tx, acct [32]byte) error {
 		}
 		if crypto.BaseAccountID(crypto.AccountTypeByteForClass(class), ap) != acct {
 			return errors.New("opening RECEIVE: account-id does not derive from the carried auth_pubkey")
+		}
+		// U2 registration shape (forquinn item 1) — still a pure function of the tx bytes: a
+		// GUARDED/VAULT opening REQUIRES a well-formed, PoP-verifying U2 block (the PoP binds
+		// acct + the pubkey, both on the tx, so it is fully checkable statelessly), and every
+		// other base/unknown class must not carry one. Either failure can never finalize
+		// (validate enforces the identical rule), so rejecting keeps a malformed-U2 variant out
+		// of the opening conflict slot.
+		if classRequiresU2(class) {
+			if _, err := verifyU2Registration(rb, acct, ap); err != nil {
+				return err
+			}
+		} else if hasU2Registration(rb) {
+			return errors.New("opening RECEIVE: u2 registration is only valid on a guarded/vault opening")
 		}
 		return nil
 	}
@@ -997,12 +1174,17 @@ func (e *Engine) admissionRejectLocked(tx *pb.Tx, txid [32]byte) string {
 }
 
 func (e *Engine) SubmitTx(raw []byte) error {
+	// Invariant halt (forquinn P4): a halted node accepts no new transactions — its frozen
+	// state is forensic evidence and it will never propose/commit them anyway. Reads stay up.
+	if halted, reason, _ := e.InvariantStats(); halted {
+		return fmt.Errorf("node halted on invariant violation [%s]: not accepting transactions", reason)
+	}
 	tx, err := ParseTx(raw)
 	if err != nil {
 		return err
 	}
-	if pub, ok := e.resolveAuthPubKeyDB(tx); ok {
-		if err := crypto.VerifyTxSignature(tx, pub); err != nil {
+	if pubs, ok := e.resolveAuthPubKeyDB(tx); ok {
+		if err := verifyTxSigAnyKey(tx, pubs); err != nil {
 			return err
 		}
 	} else if e.isFundSendTx(tx) {
@@ -1428,8 +1610,8 @@ func (e *Engine) receiveGossipedTx(raw []byte, solicited bool) error {
 	// close against the snapshot. We can verify immediately when the auth pubkey is
 	// resolvable (opening RECEIVE carries it; existing accounts cache it); otherwise
 	// we accept and defer (see resolveAuthPubKeyDB).
-	if pub, ok := e.resolveAuthPubKeyDB(tx); ok {
-		if err := crypto.VerifyTxSignature(tx, pub); err != nil {
+	if pubs, ok := e.resolveAuthPubKeyDB(tx); ok {
+		if err := verifyTxSigAnyKey(tx, pubs); err != nil {
 			return err
 		}
 	} else if e.isFundSendTx(tx) {
@@ -1796,6 +1978,24 @@ func (e *Engine) guardIteration(fn func() (stop bool)) (stop, panicked bool) {
 // context cancellation.
 func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop bool) {
 	{
+		// Invariant halt (forquinn P4): freeze finalization at the last-good epoch. No propose/
+		// vote/finalize/commit — and no resync (the state IS the evidence; triggerResync refuses
+		// too). Reads + /health keep serving from their own paths. Checked BEFORE the resync
+		// branch so a halt fired during a resync attempt also freezes the loop. Re-log ~1/min so
+		// the condition stays visible; idle in short ctx-aware sleeps.
+		if halted, reason, hEpoch := e.InvariantStats(); halted {
+			if time.Since(e.lastHaltRelog) >= haltRelogEvery {
+				e.lastHaltRelog = time.Now()
+				log.Printf("CRITICAL: node HALTED on invariant violation [%s] at epoch %d — finalization frozen; operator action required (reads + /health still serve)", reason, hEpoch)
+			}
+			select {
+			case <-ctx.Done():
+				return true
+			case <-time.After(250 * time.Millisecond):
+			}
+			return false
+		}
+
 		// If we're in resync mode, short-circuit normal epoch processing.
 		// This prevents continuing to apply epochs while we know we're divergent.
 		if e.resync.IsActive() {
@@ -2205,6 +2405,10 @@ func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop b
 					"finalized. quorum=%d/%d: (elapsed=%s) : broadcasted to %d : lists received=%d : Applied (winner_accounts=%d, candidate_txs=%d)",
 					qCount, qNeed, time.Since(start).Truncate(time.Millisecond), len(e.currentDialPeers()), len(peerLists), len(winners), len(validParsed))
 
+				// forquinn P4: poke the background invariant audit at the commit barrier (a
+				// channel send — never audit work on the loop's critical path).
+				e.kickAudit()
+
 			} else {
 				// MISMATCH: quorum agreed on something different.
 				// Instead of triggering a full resync, try to apply the quorum's winner
@@ -2268,6 +2472,8 @@ func (e *Engine) loopOnce(ctx context.Context, epochMs, genesisMs int64) (stop b
 							log.Printf("[epoch=%d] phase:cleanup-done txPool=%d wallMs=%d", epoch, len(e.txPool), time.Now().UnixMilli())
 
 							e.elog(epoch, "applied quorum set: %d winners", len(qWinners))
+							// forquinn P4: same commit-barrier audit poke as the match path.
+							e.kickAudit()
 						}
 					}
 				} else {
@@ -2585,6 +2791,8 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 		EscrowAttestationDelayEpochs: e.cfg.EscrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        e.cfg.BreakglassExtraEpochs,
 		Econ:                         e.cfg.Econ,
+		GenesisSupply:                e.cfg.GenesisSupply,
+		GuardedSendMinIntervalEpochs: e.cfg.GuardedSendMinIntervalEpochs,
 	}
 	err := e.cfg.DB.View(func(tx *bbolt.Tx) error {
 		ab := tx.Bucket(BAccounts)
@@ -2606,6 +2814,8 @@ func (e *Engine) buildSnapshot(epoch uint64) (*Snapshot, error) {
 							TransferReturnDepositTxid: r.TransferReturnDepositTxid,
 							AuthPubKey:                r.AuthPubKey,
 							BreakglassCommit:          r.BreakglassCommit,
+							U2PubKey:                  r.U2PubKey,
+							LastGuardedSendEpoch:      r.LastGuardedSendEpoch,
 							EscrowPartyLoPub:          r.EscrowPartyLoPub,
 							EscrowPartyLoBG:           r.EscrowPartyLoBG,
 							EscrowPartyHiPub:          r.EscrowPartyHiPub,
@@ -2952,6 +3162,12 @@ var errCommitAborted = errors.New("commitEpoch: aborted on failed winners")
 // fetching quorum txids either way). applied is non-empty only on full success; failed carries
 // the per-tx reasons for the caller's logging.
 func (e *Engine) commitEpoch(epoch uint64, winners map[[32]byte][32]byte, txBytesByID map[[32]byte][]byte, parsed map[[32]byte]*pb.Tx) (map[[32]byte]struct{}, map[[32]byte]error, error) {
+	// Invariant halt (forquinn P4): the loop's top-of-iteration check freezes the NEXT
+	// iteration; this closes the in-flight window so a halt fired mid-iteration (the audit
+	// goroutine) cannot be followed by one more commit on top of the frozen evidence.
+	if halted, reason, _ := e.InvariantStats(); halted {
+		return nil, nil, fmt.Errorf("commit refused: node halted on invariant violation [%s]", reason)
+	}
 	applied := make(map[[32]byte]struct{})
 	failed := make(map[[32]byte]error)
 
@@ -2978,7 +3194,7 @@ func (e *Engine) commitEpoch(epoch uint64, winners map[[32]byte][32]byte, txByte
 				continue
 			}
 
-			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
+			if aerr := ApplyTx(view, raw, p, id, e.cfg.FundAccount, e.cfg.Econ, epoch); aerr != nil {
 				failed[id] = aerr
 				continue
 			}

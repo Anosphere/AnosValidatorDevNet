@@ -1,7 +1,7 @@
 {
-  "version": 2,
-  "protocol_version": 1,
-  "network_id": "20bd2ec07a6eb9a6ca9314934f3b252767bce683150e4f3ec081f91578951ff2",
+  "version": 3,
+  "protocol_version": 2,
+  "network_id": "305bffb513e844b51e10d2a1b3592b5327fe86970c2901fe3576f549fb331d82",
   "kat_digest": "",
   "fund_account_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   "timing": {
@@ -14,7 +14,8 @@
     "vault_delay_epochs": 12,
     "attestor_quorum_m": 2,
     "escrow_attestation_delay_epochs": 6,
-    "breakglass_extra_epochs": 5
+    "breakglass_extra_epochs": 5,
+    "guarded_send_min_interval_epochs": 12
   },
   "economics": {
     "min_fee": 1000,

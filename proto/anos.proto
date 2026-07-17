@@ -145,6 +145,18 @@ message TxBodySend {
   // REDIRECT a stake": the quorum authorizes the Fund SEND, but only the real owner's key can name a
   // new beneficiary. A return to the staker's own account needs no owner_auth (existing behavior).
   StakeOwnerAuth owner_auth = 15;
+
+  // Attestor case commitment (forquinn item 2, spec-19 §6.1). Present ONLY on an attestor-gated
+  // TRANSFER release-to-dest (guarded/vault path (b) and the breakglass hop-2 release): both MUST be
+  // exactly 32 bytes there and MUST be absent on every other SEND shape (incl. the U1+U2 path (a) —
+  // the reject-everywhere-not-expected / anti-txid-grind discipline). Opaque to Anos: case_nonce is
+  // the moderation case's nonce and attestation_hash the hash of the moderator attestation document;
+  // the validator enforces presence/length only, never contents. Both are folded into SignBytesACTE
+  // UNCONDITIONALLY + length-framed (empty on every other SEND), so the user signature AND every
+  // attestor signature commit to them — an attestor signature with no attestation behind it is
+  // invalid by construction, and a swapped/stripped commitment changes the preimage → the txid.
+  bytes case_nonce       = 16; // 32 B, attestor-gated releases only (opaque to Anos)
+  bytes attestation_hash = 17; // 32 B, attestor-gated releases only (opaque to Anos)
 }
 
 // StakeOwnerAuth carries the current stake owner's signature over the recovery binding (P5.4):
@@ -158,6 +170,23 @@ message TxBodySend {
 message StakeOwnerAuth {
   HybridSig    sig                        = 1; // 4691 B; the owner's hybrid signature over m_owner
   HybridPubKey revealed_breakglass_pubkey = 2; // 2625 B; optional — set only for a breakglass-key owner_auth
+}
+
+// U2Registration registers a GUARDED/VAULT account's SECOND user key U2 on the account-opening
+// RECEIVE (forquinn item 1/4, modeled on StakeOwnerAuth). U2 is a co-equal user key: after opening,
+// a single user signature (hop-1 initiate, owner-cancel, release path (b)) verifies under U1 OR U2,
+// and the attestor-free release path (a) requires BOTH (Tx.sig under U1 AND Tx.sig2 under U2).
+// pop_sig is U2's proof-of-possession self-signature over
+//   m_u2 = SHA256("ANOSv2-U2Registration\0" ‖ account_id(32) ‖ u2_pubkey(2625)),
+// which forces cryptographic parseability of U2 and binds the registration to this exact account
+// (non-replayable; the standard anti-rogue-key form). U2 is NOT part of the account-id derivation —
+// it is bound via the signed opening preimage (both fields are folded into SignBytesACTE,
+// length-framed) + this PoP, verified in validate AND apply. Present ONLY on a GUARDED/VAULT opening
+// RECEIVE; rejected on every other tx shape. A TRANSFER chain never carries one — it inherits its
+// key source's stored U2 by DERIVED COPY at chain creation (ApplyTx), like srcClass/TransferSource.
+message U2Registration {
+  HybridPubKey pubkey  = 1; // 2625 B; the second user key U2
+  HybridSig    pop_sig = 2; // 4691 B; U2's self-signature over m_u2 (proof-of-possession)
 }
 
 message TxBodyReceive {
@@ -189,6 +218,14 @@ message TxBodyReceive {
   // folded into SignBytesACTE on the opening block so they cannot be tampered. Ignored for any other
   // class. spec-19 §6.3 governs the 2-of-2 outflow + the 1-of-2 → Fund attestation trigger.
   EscrowOpen escrow_open = 7;
+
+  // Second-user-key registration (forquinn item 1/4). REQUIRED on a GUARDED/VAULT account-opening
+  // RECEIVE (both halves length-checked, U2 parseable, != auth_pubkey, PoP verified in validate AND
+  // apply); REJECTED on every other RECEIVE (any other opening class, and every non-opening block) —
+  // the reject-everywhere-not-expected / anti-txid-grind discipline. Both halves are folded into
+  // SignBytesACTE UNCONDITIONALLY + length-framed (empty frames elsewhere), so they are bound to the
+  // opening signature and the txid and cannot be stripped/swapped in flight (the P1.2 lesson).
+  U2Registration u2 = 8;
 }
 
 // EscrowOpen carries the two-party material registered on an escrow's opening RECEIVE (spec-18
@@ -287,6 +324,19 @@ message Tx {
   // path, deleted with the attestor chain in P3.1 (spec-19 §2). `reserved` hard-blocks reuse so a
   // future field can never silently re-decode against an old field number on the consensus wire.
   reserved 12, 13, 22;
+
+  // Second user signature for the attestor-free release path (a) (forquinn item 1): on an
+  // attestor-gated TRANSFER release-to-dest, (U1 sig AND U2 sig) substitutes for the attestor
+  // quorum. Fixed roles: Tx.sig MUST verify under the chain's copied U1 and sig2 under its copied
+  // U2, both over the same digest m = SHA256(SignBytesACTE(tx)) — never the multisig slot (U2 has
+  // no account of its own to resolve by signer_id). sig2 is NOT in the signed preimage (a signature
+  // cannot sign itself); like Tx.sig it is bound via the txid — crypto.TxID folds it
+  // UNCONDITIONALLY + length-framed, so a stripped/attached/swapped sig2 is a different txid and no
+  // {sig, sig2, multisig} presence combination can alias another. Because a third party could
+  // attach one, sig2 is REJECTED on every tx shape except path (a) (multisig must be ABSENT there;
+  // a sig2 never combines with a breakglass reveal) — the same reject-everywhere-not-expected
+  // treatment as the multisig.
+  HybridSig sig2 = 24;
 }
 
 message Receivable {

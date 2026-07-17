@@ -48,6 +48,12 @@ type Account struct {
 	pub    *crypto.HybridPubKey
 	bgPriv *crypto.HybridPrivateKey // breakglass (set 2 / backup) key — exercised only by a breakglass move (P5.1)
 	bgPub  *crypto.HybridPubKey
+	// u2Priv/u2Pub are the OPTIONAL second user key U2 (forquinn item 1) — registered on a
+	// GUARDED/VAULT opening via BuildGuardedOpeningReceive and copied onto derived TRANSFER
+	// chains (the validator does the same by derived copy, D2). nil for every account that never
+	// attached one; every helper is nil-safe, so pre-U2 sims are untouched.
+	u2Priv *crypto.HybridPrivateKey
+	u2Pub  *crypto.HybridPubKey
 	ID     [32]byte
 	Commit []byte // 64-byte SHA-512 breakglass commitment (class-independent since P5.2)
 }
@@ -70,6 +76,36 @@ func RandomAccount(class pb.AccountClass) *Account {
 	return NewAccount(class, RandSeed(), RandSeed())
 }
 
+// AttachU2 derives the account's second user key U2 from a seed (forquinn item 1). Call it on a
+// GUARDED/VAULT account BEFORE BuildGuardedOpeningReceive — the opening registers U2 with a
+// proof-of-possession. Returns the account for chaining. The account-id is NOT affected (U2 is
+// deliberately outside the id derivation).
+func (a *Account) AttachU2(u2Seed [32]byte) *Account {
+	a.u2Priv, a.u2Pub = crypto.GenerateHybridKeyFromSeed(u2Seed)
+	return a
+}
+
+// HasU2 reports whether a U2 keypair is attached.
+func (a *Account) HasU2() bool { return a.u2Pub != nil }
+
+// U2PubKeyBytes returns the canonical 2625-byte U2 pubkey, or nil when no U2 is attached.
+func (a *Account) U2PubKeyBytes() []byte {
+	if a.u2Pub == nil {
+		return nil
+	}
+	return a.u2Pub.Encode()
+}
+
+// SignWithU2 signs tx's single signature slot (Tx.sig) with the account's U2 key — a
+// single-user-signature operation exercised as U2 (hop-1 initiate, owner-cancel, or the path-(b)
+// user half; the validator accepts U1 OR U2 there). Errors if no U2 is attached.
+func (a *Account) SignWithU2(tx *pb.Tx) error {
+	if a.u2Priv == nil {
+		return fmt.Errorf("account has no U2 key attached")
+	}
+	return crypto.SignTxHybrid(tx, a.u2Priv)
+}
+
 // DerivedTransferAccount builds the TRANSFER chain spawned when `source` sends to it
 // (P1.3, keys-spec §6.2). The chain is NOT a fresh account: it shares the source's
 // auth keypair (so the source's normal key controls it — return-to-source is the owner
@@ -87,6 +123,8 @@ func DerivedTransferAccount(source *Account, sourceSendSeq uint64) *Account {
 		pub:    source.pub,
 		bgPriv: source.bgPriv, // the chain copies the source's breakglass key (recovery flows through it)
 		bgPub:  source.bgPub,
+		u2Priv: source.u2Priv, // the chain inherits the source's U2 by derived copy (D2; nil-safe)
+		u2Pub:  source.u2Pub,
 		ID:     id,
 		Commit: append([]byte(nil), source.Commit...),
 	}
@@ -250,14 +288,18 @@ func SignFundSend(tx *pb.Tx, signers []*Account) error {
 	return nil
 }
 
-// SignAttestorRelease signs an attestor-gated TRANSFER release-to-dest (P3.2, spec-19 §6.1): the
-// chain's controlling key sets Tx.sig AND each Fund Attestor co-signs the SAME digest
-// m = SHA-256(SignBytesACTE(tx)) into Tx.MultiSig. Both halves sign m (the multisig is NOT part of
-// m), so order is irrelevant; the release needs BOTH the chain's Tx.sig and >= ATTESTOR_QUORUM_M
-// verifying attestor signatures. `chain` is the TRANSFER chain account (it shares the GUARDED/VAULT
-// source's copied key); `attestors` are the signing Attestor identities. The tx body must be final
+// SignAttestorRelease signs an attestor-gated TRANSFER release-to-dest (P3.2, spec-19 §6.1,
+// forquinn path (b)): it stamps the mandatory case commitment (forquinn item 2) onto the SEND
+// body, then the chain's controlling key sets Tx.sig AND each Fund Attestor co-signs the SAME
+// digest m = SHA-256(SignBytesACTE(tx)) into Tx.MultiSig. The case fields are set FIRST — they
+// are folded into the preimage, so m (and therefore every signature) commits to them. Both
+// halves sign m (the multisig is NOT part of m), so order is irrelevant; the release needs the
+// chain's Tx.sig, >= ATTESTOR_QUORUM_M verifying attestor signatures, AND both 32-byte case
+// fields. `chain` is the TRANSFER chain account (it shares the GUARDED/VAULT source's copied
+// key); `attestors` are the signing Attestor identities. The rest of the tx body must be final
 // before calling.
-func SignAttestorRelease(tx *pb.Tx, chain *Account, attestors []*Account) error {
+func SignAttestorRelease(tx *pb.Tx, chain *Account, attestors []*Account, caseNonce, attestationHash [32]byte) error {
+	SetCaseCommitment(tx, caseNonce, attestationHash)
 	if err := chain.Sign(tx); err != nil {
 		return err
 	}
@@ -346,6 +388,8 @@ func DerivedReturnChain(staker *Account, fundID [32]byte, fundSendSeq uint64) *A
 		pub:    staker.pub,
 		bgPriv: staker.bgPriv,
 		bgPub:  staker.bgPub,
+		u2Priv: staker.u2Priv, // derived copy of the key source's U2 (D2; nil-safe)
+		u2Pub:  staker.u2Pub,
 		ID:     id,
 		Commit: append([]byte(nil), staker.Commit...),
 	}
@@ -479,12 +523,16 @@ func SignEscrowOutflowWith(tx *pb.Tx, normal, breakglass []*Account) error {
 	return nil
 }
 
-// SignBreakglassRelease signs a breakglass TRANSFER-chain release-to-dest (P5.1, spec-19 §6.4): the
-// chain's REVEALED breakglass key sets Tx.sig + tx.revealed_breakglass_pubkey (the recoverer who lost
-// the auth key), AND each Fund Attestor co-signs the same digest into Tx.MultiSig (the release gate).
-// The reveal is folded into the preimage, so both Tx.sig and the attestor sigs are over a digest that
-// already includes it. `chain` shares the source's copied breakglass key. The tx body must be final.
-func SignBreakglassRelease(tx *pb.Tx, chain *Account, attestors []*Account) error {
+// SignBreakglassRelease signs a breakglass TRANSFER-chain release-to-dest (P5.1, spec-19 §6.4): it
+// stamps the mandatory case commitment (forquinn item 2 — the breakglass hop-2 flows through the
+// same attestor path (b) as a guarded/vault release), then the chain's REVEALED breakglass key sets
+// Tx.sig + tx.revealed_breakglass_pubkey (the recoverer who lost the auth key), AND each Fund
+// Attestor co-signs the same digest into Tx.MultiSig (the release gate). The case fields and the
+// reveal are both folded into the preimage, so Tx.sig and the attestor sigs are over a digest that
+// already commits to them. `chain` shares the source's copied breakglass key. The rest of the tx
+// body must be final before calling.
+func SignBreakglassRelease(tx *pb.Tx, chain *Account, attestors []*Account, caseNonce, attestationHash [32]byte) error {
+	SetCaseCommitment(tx, caseNonce, attestationHash)
 	if err := chain.SignBreakglass(tx); err != nil {
 		return err
 	}
@@ -512,6 +560,68 @@ func BuildOpeningReceive(acct *Account, rid [32]byte, transferDest *[32]byte, tr
 		Seq:     1,
 		Body:    &pb.Tx_Receive{Receive: body},
 	}
+}
+
+// BuildGuardedOpeningReceive builds the unsigned account-opening RECEIVE of a GUARDED or VAULT
+// account (forquinn item 1): an ordinary opening (auth pubkey + breakglass commitment) that
+// additionally registers the account's second user key via a U2Registration block — the U2 pubkey
+// plus U2's proof-of-possession signature over
+// m_u2 = crypto.U2RegistrationDigest(account_id, u2_pubkey) (D12). AttachU2 must have been called;
+// sign the result with the OWNER's U1 key (acct.Sign) — the opening is always U1-signed.
+func BuildGuardedOpeningReceive(acct *Account, rid [32]byte) (*pb.Tx, error) {
+	if acct.u2Priv == nil {
+		return nil, fmt.Errorf("guarded/vault opening needs a U2 key: call AttachU2 first")
+	}
+	u2pub := acct.u2Pub.Encode()
+	m, err := crypto.U2RegistrationDigest(acct.ID, u2pub)
+	if err != nil {
+		return nil, err
+	}
+	pop, err := acct.u2Priv.Sign(m)
+	if err != nil {
+		return nil, err
+	}
+	tx := BuildOpeningReceive(acct, rid, nil, 0)
+	tx.GetReceive().U2 = &pb.U2Registration{
+		Pubkey: &pb.HybridPubKey{V: u2pub},
+		PopSig: &pb.HybridSig{V: pop.Encode()},
+	}
+	return tx, nil
+}
+
+// SignPathARelease signs an attestor-FREE release-to-dest on a guarded/vault-spawned TRANSFER
+// chain (forquinn item 1, path (a)): both user keys instead of the attestor quorum. Fixed roles
+// (D5): Tx.sig is U1 (the chain's copied auth key) and Tx.sig2 is U2 (the chain's copied second
+// key), both over the same digest m = SHA-256(SignBytesACTE(tx)) — sig2 is not part of m, exactly
+// like Tx.sig. No multisig, no case fields on a path-(a) release. The tx body must be final.
+func SignPathARelease(tx *pb.Tx, chain *Account) error {
+	if chain.u2Priv == nil {
+		return fmt.Errorf("path (a) release needs the chain's U2 key: source had none attached")
+	}
+	if err := chain.Sign(tx); err != nil { // U1 → Tx.sig
+		return err
+	}
+	m, _, err := crypto.MsgHash(tx)
+	if err != nil {
+		return err
+	}
+	sig2, err := chain.u2Priv.Sign(m)
+	if err != nil {
+		return err
+	}
+	tx.Sig2 = &pb.HybridSig{V: sig2.Encode()}
+	return nil
+}
+
+// SetCaseCommitment sets the attestor case commitment (forquinn item 2) on a SEND body: the
+// moderation case_nonce and the attestation-document hash every attestor-gated release must carry.
+// Call it BEFORE signing — both fields are folded into the signed preimage, so the user signature
+// and every attestor signature commit to them. Only attestor-gated releases (path (b) and the
+// breakglass hop-2) may carry them; the validator rejects them anywhere else.
+func SetCaseCommitment(tx *pb.Tx, caseNonce, attestationHash [32]byte) {
+	s := tx.GetSend()
+	s.CaseNonce = append([]byte(nil), caseNonce[:]...)
+	s.AttestationHash = append([]byte(nil), attestationHash[:]...)
 }
 
 // BuildReceive builds an unsigned non-opening RECEIVE (claiming a further

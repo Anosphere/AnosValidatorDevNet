@@ -216,14 +216,15 @@ func main() {
 	fmt.Println("Guarded/Vault transfer delay (epochs):", guardedDelayEpochs, vaultDelayEpochs)
 
 	// ATTESTOR_QUORUM_M is the flat M-of-N Fund Attestor quorum threshold gating GUARDED/VAULT (and
-	// breakglass) releases (P3.2, spec-19 §6.1). CONSENSUS-CRITICAL manifest constant; MUST be >= 1
-	// (a zero would make the attestor gate a no-op). Local test .env files set a small value (e.g. 2).
+	// breakglass) releases (P3.2, spec-19 §6.1). CONSENSUS-CRITICAL manifest constant; MUST be >= 2
+	// (forquinn item 3 / D11 floor: 0 would disable the gate, 1 would let a single compromised
+	// attestor co-sign releases). Local test .env files set the floor value 2.
 	attestorQuorumM, err := strconv.ParseUint(mustEnv("ATTESTOR_QUORUM_M"), 10, 64)
 	if err != nil {
 		log.Fatal("ATTESTOR_QUORUM_M must be a uint64 (number of attestor signatures)")
 	}
-	if attestorQuorumM < 1 {
-		log.Fatal("ATTESTOR_QUORUM_M must be >= 1 (a zero would disable the attestor release gate)")
+	if attestorQuorumM < 2 {
+		log.Fatal("ATTESTOR_QUORUM_M must be >= 2 (the attestor quorum floor; a 1-of-N gate is a single point of compromise)")
 	}
 	fmt.Println("Attestor quorum (flat M):", attestorQuorumM)
 
@@ -250,6 +251,34 @@ func main() {
 		log.Fatal("BREAKGLASS_EXTRA_EPOCHS must be >= 1 (a zero would make a breakglass release immediate)")
 	}
 	fmt.Println("Breakglass extra delay (epochs):", breakglassExtraEpochs)
+
+	// GUARDED_SEND_MIN_INTERVAL_EPOCHS is the guarded/vault outbound rate limit (forquinn
+	// confirm-item 2: one NEW guarded send per 24h, epoch-denominated — 86_400_000/epoch_ms in a
+	// mainnet manifest; devnet 12). CONSENSUS-CRITICAL: byte-identical on every validator. Must be
+	// >= 1 (a zero would silently disable the limit — the manifest enforces > 0 too).
+	guardedSendMinIntervalEpochs, err := strconv.ParseUint(mustEnv("GUARDED_SEND_MIN_INTERVAL_EPOCHS"), 10, 64)
+	if err != nil {
+		log.Fatal("GUARDED_SEND_MIN_INTERVAL_EPOCHS must be a uint64 (number of epochs)")
+	}
+	if guardedSendMinIntervalEpochs < 1 {
+		log.Fatal("GUARDED_SEND_MIN_INTERVAL_EPOCHS must be >= 1 (a zero would disable the guarded send rate limit)")
+	}
+	fmt.Println("Guarded send min interval (epochs):", guardedSendMinIntervalEpochs)
+
+	// ANOS_FULL_AUDIT_EVERY_EPOCHS is the background invariant-audit cadence (forquinn P4,
+	// BUILD-PLAN §2.9): run the six-check full audit when at least this many epochs committed
+	// since the last clean pass. A LOCAL operational knob — NOT consensus-critical, NOT
+	// manifest-pinned (the audit only reads committed state; divergent cadences cannot fork).
+	// Optional; default 1 (devnet: audit every epoch).
+	fullAuditEveryEpochs := uint64(1)
+	if v := strings.TrimSpace(os.Getenv("ANOS_FULL_AUDIT_EVERY_EPOCHS")); v != "" {
+		n, perr := strconv.ParseUint(v, 10, 64)
+		if perr != nil || n < 1 {
+			log.Fatal("ANOS_FULL_AUDIT_EVERY_EPOCHS must be a uint64 >= 1 (audit cadence in epochs)")
+		}
+		fullAuditEveryEpochs = n
+	}
+	fmt.Println("Full invariant audit cadence (epochs):", fullAuditEveryEpochs)
 
 	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
@@ -297,6 +326,8 @@ func main() {
 		AttestorQuorumM:              attestorQuorumM,
 		EscrowAttestationDelayEpochs: escrowAttestationDelayEpochs,
 		BreakglassExtraEpochs:        breakglassExtraEpochs,
+		GuardedSendMinIntervalEpochs: guardedSendMinIntervalEpochs,
+		FullAuditEveryEpochs:         fullAuditEveryEpochs,
 		Econ:                         econ,
 		MaxCandidateScanPerSlot:      manifest.Consensus.MaxCandidateScanPerSlot,
 		NetworkID:                    manifest.NetworkID,
@@ -1125,15 +1156,24 @@ func main() {
 	// info leak; it lives in the node's loud CRITICAL logs where the operator looks.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		panicsTotal, _ := engine.PanicStats()
+		// forquinn P4 invariant watchdog fields: invariant_reason is the COARSE category only
+		// (e.g. "supply-total") — like the panic detail, the full violation detail stays in the
+		// node's CRITICAL logs, never on this ungated endpoint.
+		invHalted, invReason, invEpoch := engine.InvariantStats()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(struct {
-			Status      string `json:"status"`
-			NetworkID   string `json:"network_id"`
-			LatestEpoch uint64 `json:"latest_epoch"`
-			EpochNow    uint64 `json:"epoch_now"`
-			Resyncing   bool   `json:"resyncing"`
-			PanicsTotal uint64 `json:"panics_total"`
-		}{"ok", manifest.NetworkID, engine.LatestFinalizedEpoch(), engine.EpochNow(), engine.ResyncActive(), panicsTotal})
+			Status             string `json:"status"`
+			NetworkID          string `json:"network_id"`
+			LatestEpoch        uint64 `json:"latest_epoch"`
+			EpochNow           uint64 `json:"epoch_now"`
+			Resyncing          bool   `json:"resyncing"`
+			PanicsTotal        uint64 `json:"panics_total"`
+			InvariantHalted    bool   `json:"invariant_halted"`
+			InvariantReason    string `json:"invariant_reason"`
+			InvariantEpoch     uint64 `json:"invariant_epoch"`
+			LastFullAuditEpoch uint64 `json:"last_full_audit_epoch"`
+		}{"ok", manifest.NetworkID, engine.LatestFinalizedEpoch(), engine.EpochNow(), engine.ResyncActive(), panicsTotal,
+			invHalted, invReason, invEpoch, engine.LastFullAuditEpoch()})
 	})
 
 	// P7.3 edge middlewares, composed OUTSIDE the P7.2 network-id middleware (outer→inner):

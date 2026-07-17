@@ -11,7 +11,11 @@ import (
 // id shifts, peers on the old layout are rejected). Re-pin it ONLY when that is intended, and
 // bump SupportedProtocolVersion alongside. A surprise diff here means an accidental,
 // fork-inducing change to canonicalBytes().
-const wantCanonicalNetworkID = "2e728861ca1930a3a51487ec8299bcef80ccd07ef6cfcdecb8e4f3e42256e994"
+//
+// forquinn OFFICIAL pin (the v0.3.0 cutover): the timing block gained
+// guarded_send_min_interval_epochs (appended last) and the D10 bumps landed together —
+// SupportedProtocolVersion 1→2, schema 2→3, ANOS_MANIFEST_V2 domain.
+const wantCanonicalNetworkID = "a56db73ce62a3df039d2064f67dd15101ed857d0fbbb6495d68923e9b2862c48"
 
 func TestNetworkIDPinned(t *testing.T) {
 	m := validManifest()
@@ -108,8 +112,8 @@ func TestCanonicalPreimageHead(t *testing.T) {
 	}
 	var want bytes.Buffer
 	want.WriteString(networkIDDomain)
-	putU32(&want, uint32(SupportedVersion))         // version = 2
-	putU32(&want, uint32(SupportedProtocolVersion)) // protocol_version = 1
+	putU32(&want, uint32(SupportedVersion))         // version = 3
+	putU32(&want, uint32(SupportedProtocolVersion)) // protocol_version = 2
 	putU32(&want, 0)                                // kat_digest: 0-length frame
 	putU32(&want, 32)                               // fund_account: 32-byte frame length
 	for i := 0; i < 32; i++ {

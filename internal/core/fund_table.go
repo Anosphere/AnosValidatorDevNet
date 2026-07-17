@@ -49,14 +49,25 @@ const (
 	StakeStatusRecovered StakeStatus = 4 // P5.5: TERMINAL — a Reverted row paid out to a new owner via C2
 )
 
-// Anos-interpreted role tags. staked_for is otherwise an open namespace — these two are
+// Anos-interpreted role tags. staked_for is otherwise an open namespace — these three are
 // the ONLY values Anos interprets for its own validation (Banker → validator set in P4;
-// Attestor → GUARDED/VAULT/escrow release quorum in P3.2). Guardian and DAO-voting weight
-// are DERIVED from the lock tier and need no tag.
+// Attestor → GUARDED/VAULT/escrow release quorum in P3.2; Moderator → read ONLY by the
+// Guardian staff exclusion, forquinn item 5). Guardian and DAO-voting weight are DERIVED
+// from the lock tier and need no tag — but any ACTIVE staff-tagged stake zeroes its
+// holder's Guardian weight (see isStaffTag / GuardianWeight).
 const (
-	StakedForBanker   = "banker"
-	StakedForAttestor = "attestor"
+	StakedForBanker    = "banker"
+	StakedForAttestor  = "attestor"
+	StakedForModerator = "moderator" // interpreted ONLY for Guardian-weight exclusion
 )
+
+// isStaffTag reports whether `tag` marks a moderation-STAFF role for the Guardian exclusion
+// (forquinn item 5): staff must not hold Fund-spend power. Attestor and Moderator are staff;
+// Banker deliberately is NOT (bankers run consensus infrastructure, not moderation cases —
+// and they hold the devnet's Guardian weight, so excluding them would freeze the Fund).
+// Exact verbatim match, the same discipline as the role predicates ("Attestor" is not staff,
+// just as it is not the Attestor role tag).
+func isStaffTag(tag string) bool { return tag == StakedForAttestor || tag == StakedForModerator }
 
 // The Anos-side stake floors (banker 50k / attestor 5k), the Guardian derivation divisor
 // (2000), the Fund-SEND pass threshold (7000 bps = 70%), and the fund-send epoch slack (8) are
@@ -239,13 +250,27 @@ func (ec Economics) IsBanker(rows []StakeRow, id [32]byte) bool {
 
 // GuardianWeight returns floor(Σ id's ACTIVE 1-year stake / divisor) — the number of Guardian
 // signatures the identity contributes toward a Fund SEND (spec-19 §5, §6.2; divisor = 2000 anos
-// on the current net). Any stake locked for one year counts toward the sum regardless of its
-// staked_for tag; 1-month stakes confer none. ≥1 ⇒ the identity is a Guardian.
+// on the current net). Any NON-STAFF stake locked for one year counts toward the sum whatever
+// its staked_for tag (banker / unknown / untagged all count); 1-month stakes confer none.
+// ≥1 ⇒ the identity is a Guardian.
+//
+// Staff exclusion (forquinn item 5): an identity holding ANY active staff-tagged stake
+// (isStaffTag — any amount, any tier) has Guardian weight 0. The exclusion is PERSON-LEVEL:
+// it zeroes the identity's untagged year-locked stakes too, not just the staff-tagged row.
+// Both the Fund-SEND quorum numerator (verifyFundSendQuorum) and the active denominator
+// (ActiveGuardianWeight) flow through this one function, so the exclusion applies to both
+// automatically. Only the Fund-spend gate closes: IsAttestor/IsBanker and the validator set
+// are untouched — staff keep their roles.
 func (ec Economics) GuardianWeight(rows []StakeRow, id [32]byte) uint64 {
 	var sumUnits uint64
 	for _, s := range rows {
-		if s.Status == StakeStatusActive && s.StakerID == id &&
-			s.TimeDelay == pb.StakeTimeDelay_STAKE_TIME_DELAY_ONE_YEAR {
+		if s.Status != StakeStatusActive || s.StakerID != id {
+			continue
+		}
+		if isStaffTag(s.StakedFor) {
+			return 0 // person-level: one active staff row zeroes the identity's whole weight
+		}
+		if s.TimeDelay == pb.StakeTimeDelay_STAKE_TIME_DELAY_ONE_YEAR {
 			sumUnits += s.Amount
 		}
 	}
@@ -365,8 +390,10 @@ func isGuardianActive(lastActive, epoch, window uint64) bool {
 // ActiveGuardianWeight computes the quorum DENOMINATOR M (spec-19 §6.2): the summed CURRENT
 // GuardianWeight of every identity in `active` whose last-active epoch is within the trailing
 // `window` at `epoch`. Weight is recomputed from `rows` each call, so a Guardian whose 1-yr
-// stake later dropped below the floor (weight 0) stops contributing even while still "active".
-// Pure over its inputs → identical on every validator that built the same finalized snapshot.
+// stake later dropped below the floor (weight 0) stops contributing even while still "active" —
+// and likewise one who since took on an active staff-tagged stake (GuardianWeight's forquinn
+// item-5 exclusion). Pure over its inputs → identical on every validator that built the same
+// finalized snapshot.
 func (ec Economics) ActiveGuardianWeight(rows []StakeRow, active []GuardianActiveRow, epoch, window uint64) uint64 {
 	var sum uint64
 	for _, g := range active {

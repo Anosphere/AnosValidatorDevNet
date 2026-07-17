@@ -45,6 +45,7 @@ func loadManifest(path string) (*config.Manifest, error) {
 	setenv("ATTESTOR_QUORUM_M", strconv.FormatUint(m.Timing.AttestorQuorumM, 10))
 	setenv("ESCROW_ATTESTATION_DELAY_EPOCHS", strconv.FormatUint(m.Timing.EscrowAttestationDelayEpochs, 10))
 	setenv("BREAKGLASS_EXTRA_EPOCHS", strconv.FormatUint(m.Timing.BreakglassExtraEpochs, 10))
+	setenv("GUARDED_SEND_MIN_INTERVAL_EPOCHS", strconv.FormatUint(m.Timing.GuardedSendMinIntervalEpochs, 10))
 	setenv("GENESIS_HEX", strings.TrimSpace(m.Genesis.Hex))
 	setenv("GENESIS_AUTH_PUBKEY_HEX", strings.TrimSpace(m.Genesis.AuthPubkeyHex))
 	setenv("VALIDATOR_SET_PUBKEYS", m.ValidatorSetCSV())

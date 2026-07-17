@@ -21,7 +21,17 @@ var (
 	domainReceivable     = []byte("ANOSv2-Receivable\x00")
 	domainFeeReceivable  = []byte("ANOSv2-FeeReceivable\x00")
 	domainStakeOwnerAuth = []byte("ANOSv2-StakeOwnerAuth\x00")
+	domainU2Registration = []byte("ANOSv2-U2Registration\x00")
 )
+
+// BreakglassCommitmentSize is the byte length of a breakglass commitment: the full SHA-512
+// digest (keys-spec §7.2). Mirrored by core's account-record TLV length check.
+const BreakglassCommitmentSize = 64
+
+// CaseFieldSize is the exact byte length of TxBodySend.case_nonce and .attestation_hash when
+// present (the attestor case commitment, forquinn item 2). Opaque 32-byte values: a nonce and a
+// hash of the moderator attestation document; the validator enforces presence/length only.
+const CaseFieldSize = 32
 
 // StakeOwnerAuth op discriminants (P5.4): the current stake owner signs over the exact operation, so a
 // signature authorizing a return cannot be replayed as a re-attribution (or vice versa). The validator
@@ -45,6 +55,26 @@ func StakeOwnerAuthDigest(op byte, depositTxid, beneficiary [32]byte) [32]byte {
 	buf = append(buf, depositTxid[:]...)
 	buf = append(buf, beneficiary[:]...)
 	return sha256.Sum256(buf)
+}
+
+// U2RegistrationDigest returns the 32-byte digest the second user key U2 self-signs to register on
+// a GUARDED/VAULT account-opening RECEIVE (forquinn item 4, plan D12) — the proof-of-possession
+// carried in U2Registration.pop_sig. Binding the account id (itself derived from U1's key) makes
+// the PoP non-replayable across accounts; binding the pubkey inside the signed message is the
+// standard anti-rogue-key form. Verifying the PoP also forces U2's cryptographic parseability, so
+// an unparseable U2 can never be registered (which would deadlock the U1+U2 release path). Modeled
+// on StakeOwnerAuthDigest. Hard-errors on a wrong-length pubkey (fail-closed).
+//
+//	m_u2 = SHA256( domainU2Registration ‖ account_id(32) ‖ u2_pubkey(2625) )
+func U2RegistrationDigest(accountID [32]byte, u2Pub []byte) ([32]byte, error) {
+	if len(u2Pub) != HybridPubKeySize {
+		return [32]byte{}, ErrBadLength
+	}
+	buf := make([]byte, 0, len(domainU2Registration)+32+HybridPubKeySize)
+	buf = append(buf, domainU2Registration...)
+	buf = append(buf, accountID[:]...)
+	buf = append(buf, u2Pub...)
+	return sha256.Sum256(buf), nil
 }
 
 // Hash32 returns SHA256(b).
@@ -204,6 +234,21 @@ func SignBytesACTE(tx *pb.Tx) ([]byte, error) {
 		// folded separately in TxID), so it lives here with the other SEND-body fields.
 		out = appendStakeRecovery(out, sb.Send, u32)
 
+		// Attestor case commitment (forquinn item 2): case_nonce + attestation_hash, folded
+		// UNCONDITIONALLY + length-framed (empty frames on every non-attestor-gated SEND) so the
+		// user signature AND every attestor signature — all of which sign m = SHA256(this
+		// preimage) — commit to the moderation case: an attestor signature with no attestation
+		// behind it is invalid by construction, and a swapped/stripped commitment is a different
+		// preimage → a different txid. Hard-length {0, 32} each (the D8 rule): a raw carrying any
+		// other length has NO computable preimage — and therefore no txid — anywhere.
+		var err error
+		if out, err = appendFramedChecked(out, sb.Send.GetCaseNonce(), u32, CaseFieldSize); err != nil {
+			return nil, err
+		}
+		if out, err = appendFramedChecked(out, sb.Send.GetAttestationHash(), u32, CaseFieldSize); err != nil {
+			return nil, err
+		}
+
 		return out, nil
 
 	case pb.TxType_TX_TYPE_RECEIVE:
@@ -268,13 +313,36 @@ func SignBytesACTE(tx *pb.Tx) ([]byte, error) {
 		// swap it and leaving nodes with divergent commitments invisible to the heads-only
 		// frontier root. Appended only when present; verify_apply requires both on opening
 		// blocks and forbids them on non-opening blocks, mirroring the TRANSFER-fields pattern
-		// above. The preimage is only ever hashed (never parsed), so raw concatenation of the
-		// fixed-width fields is unambiguous.
-		if rb.Receive.AuthPubkey != nil && len(rb.Receive.AuthPubkey.V) > 0 {
-			out = append(out, rb.Receive.AuthPubkey.V...)
+		// above. Hard-length {0, 2625} / {0, 64} (the D8 rule): these two are appended RAW (a
+		// valid tx's bytes are unchanged), so without the exact-length requirement a crafted raw
+		// carrying e.g. a 2689-byte auth_pubkey equal to real_auth‖real_bg would produce a
+		// byte-identical preimage — the same txid as the victim's valid opening (a txid-squat).
+		// With it, an aliasing raw has NO computable preimage/txid anywhere.
+		if ap := rb.Receive.GetAuthPubkey().GetV(); len(ap) > 0 {
+			if len(ap) != HybridPubKeySize {
+				return nil, ErrBadLength
+			}
+			out = append(out, ap...)
 		}
-		if rb.Receive.BreakglassCommitment != nil && len(rb.Receive.BreakglassCommitment.V) > 0 {
-			out = append(out, rb.Receive.BreakglassCommitment.V...)
+		if bg := rb.Receive.GetBreakglassCommitment().GetV(); len(bg) > 0 {
+			if len(bg) != BreakglassCommitmentSize {
+				return nil, ErrBadLength
+			}
+			out = append(out, bg...)
+		}
+
+		// U2 second-user-key registration (forquinn item 1/4): the U2 pubkey + its
+		// proof-of-possession signature, folded UNCONDITIONALLY + length-framed (empty frames on
+		// every RECEIVE that carries no U2 block) so a GUARDED/VAULT opening's registered second
+		// key is bound to BOTH the opening signature and the txid — a stripped/swapped U2 changes
+		// the bytes U1 signed (the P1.2 fork-closure rule). Hard-length {0, 2625} / {0, 4691}
+		// (D8). Ordered BEFORE the revealed-breakglass fold (plan §2.2).
+		var err error
+		if out, err = appendFramedChecked(out, rb.Receive.GetU2().GetPubkey().GetV(), u32, HybridPubKeySize); err != nil {
+			return nil, err
+		}
+		if out, err = appendFramedChecked(out, rb.Receive.GetU2().GetPopSig().GetV(), u32, HybridSigSize); err != nil {
+			return nil, err
 		}
 
 		// Revealed breakglass pubkey (P5.1): a breakglass move's TRANSFER-chain OPENING RECEIVE is
@@ -305,6 +373,20 @@ func appendRevealedBreakglass(out []byte, tx *pb.Tx, u32 [4]byte) []byte {
 	out = append(out, u32[:]...)
 	out = append(out, rb...)
 	return out
+}
+
+// appendFramedChecked appends one uint32-LE-length-framed variable field to the signing preimage,
+// enforcing the D8 hard-length rule: the field must be absent (zero length) or exactly wantLen
+// bytes — anything else is ErrBadLength, so a raw carrying an off-size field has NO computable
+// preimage (and therefore no txid) anywhere in the system, instead of aliasing another tx's bytes.
+// Folding is UNCONDITIONAL (a zero-length frame when absent), matching the established pattern.
+func appendFramedChecked(out, field []byte, u32 [4]byte, wantLen int) ([]byte, error) {
+	if len(field) != 0 && len(field) != wantLen {
+		return nil, ErrBadLength
+	}
+	binary.LittleEndian.PutUint32(u32[:], uint32(len(field)))
+	out = append(out, u32[:]...)
+	return append(out, field...), nil
 }
 
 // appendStakeRecovery folds the P5.4 in-Fund-stake-recovery SEND fields into the signing preimage:
@@ -427,38 +509,61 @@ func SignTxHybrid(tx *pb.Tx, priv *HybridPrivateKey) error {
 // junk entries to vary the txid), the validate path rejects a multisig on any SEND that is neither
 // a Fund SEND nor an attestor-gated release, and the submit/gossip gate (bestEffortReleaseCheck)
 // keeps a junk-multisig variant out of the conflict pool.
+//
+// sig2 — the path-(a) second user signature (forquinn item 1) — is folded UNCONDITIONALLY as a
+// uint32-LE-framed field immediately after the (optional) Tx.sig in BOTH branches:
+//
+//	buf = sign_bytes ‖ [Tx.sig raw, if present] ‖ frame(sig2) ‖ [multisig digest, if the multisig branch]
+//
+// sig2 cannot live in the signed preimage (a signature cannot sign itself), so like Tx.sig it is
+// bound via the txid; because a third party could attach one, folding it means a stripped/attached/
+// swapped sig2 is a DIFFERENT txid (each variant independently verifiable, the conflict resolver
+// picks one winner — the P1.2 rule), and the frame keeps every {sig, sig2, multisig} presence
+// combination byte-distinct (a valid path-(a) release can never alias a junk variant). Off-size
+// sig2 is a hard error ({0, 4691}), so a junk-length raw has no computable txid at all. The
+// validate path rejects sig2 on every tx shape except a path-(a) release (reject-everywhere, like
+// the multisig).
 func TxID(tx *pb.Tx) ([32]byte, error) {
 	_, sb, err := MsgHash(tx)
 	if err != nil {
 		return [32]byte{}, err
 	}
+	sig2 := tx.GetSig2().GetV()
+	if len(sig2) != 0 && len(sig2) != HybridSigSize {
+		return [32]byte{}, ErrBadLength
+	}
+	var s2frame [4]byte
+	binary.LittleEndian.PutUint32(s2frame[:], uint32(len(sig2)))
 	hasMultiSig := tx.MultiSig != nil && len(tx.MultiSig.Entries) > 0
 	if tx.Type == pb.TxType_TX_TYPE_SEND && (tx.Sig == nil || hasMultiSig) {
 		ms, err := FundMultiSigDigest(tx.MultiSig)
 		if err != nil {
 			return [32]byte{}, err
 		}
-		buf := make([]byte, 0, len(sb)+HybridSigSize+len(ms))
+		buf := make([]byte, 0, len(sb)+HybridSigSize+4+len(sig2)+len(ms))
 		buf = append(buf, sb...)
-		// A keyless Fund SEND has no Tx.sig (nothing appended here — byte-identical to the
-		// pre-P3.2 txid). An attestor-gated release ALSO carries the chain's controlling-key
-		// Tx.sig, which is folded in (a single-sig txid binds Tx.sig) so the txid binds both
-		// the controlling signature and the attestor set.
+		// A keyless Fund SEND has no Tx.sig (nothing appended here). An attestor-gated release
+		// ALSO carries the chain's controlling-key Tx.sig, which is folded in (a single-sig txid
+		// binds Tx.sig) so the txid binds both the controlling signature and the attestor set.
 		if tx.Sig != nil {
 			if len(tx.Sig.V) != HybridSigSize {
 				return [32]byte{}, ErrBadLength
 			}
 			buf = append(buf, tx.Sig.V...)
 		}
+		buf = append(buf, s2frame[:]...)
+		buf = append(buf, sig2...)
 		buf = append(buf, ms...)
 		return sha256.Sum256(buf), nil
 	}
 	if tx.Sig == nil || len(tx.Sig.V) != HybridSigSize {
 		return [32]byte{}, ErrMissingField
 	}
-	buf := make([]byte, 0, len(sb)+HybridSigSize)
+	buf := make([]byte, 0, len(sb)+HybridSigSize+4+len(sig2))
 	buf = append(buf, sb...)
 	buf = append(buf, tx.Sig.V...)
+	buf = append(buf, s2frame[:]...)
+	buf = append(buf, sig2...)
 	return sha256.Sum256(buf), nil
 }
 

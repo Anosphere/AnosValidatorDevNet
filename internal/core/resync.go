@@ -53,6 +53,15 @@ func (rs ResyncState) IsActive() bool {
 func (e *Engine) triggerResync(mismatchEpoch uint64, wantAccepted [32]byte, wantRoot [32]byte) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// Invariant halt (forquinn P4): a resync WIPES local state, and the halted state is the
+	// forensic evidence of a supply/consistency break — refusing here is what keeps an
+	// invariant violation from ever routing through the recover()→resync path (a resync would
+	// deterministically replay the same corruption anyway; D7). Loud no-op, operator decides.
+	if e.invariantHalted {
+		log.Printf("CRITICAL: resync REFUSED — node is halted on invariant violation [%s] at epoch %d; a resync would wipe the forensic state (operator action required)",
+			e.invariantReason, e.invariantEpoch)
+		return
+	}
 	if e.resync.Mode != ResyncIdle {
 		return
 	}
@@ -137,6 +146,40 @@ func (e *Engine) runResync(ctx context.Context) error {
 		e.setResyncError(err)
 		e.elog(targetEp, "RESYNC failed (verifying walk): %v", err)
 		return err
+	}
+
+	// The per-epoch validator-set caches were derived from PRE-resync (possibly divergent)
+	// state; drop them BEFORE the invariant gate so invValidatorSet can never compare the
+	// rebuilt tables against a stale cache (the loop re-derives from the rebuilt state, and
+	// the pool-clear below re-clears harmlessly). PeerMemberForEpoch falls back to the
+	// manifest set in the gap, exactly as it does after the pool-clear.
+	e.mu.Lock()
+	e.epochSets = make(map[uint64]map[[33]byte]*ecdsa.PublicKey)
+	e.latestEpochSet = nil
+	e.latestEpochCached = 0
+	e.mu.Unlock()
+
+	// Post-resync invariant gate (forquinn P4, D7 layer 3): the walk PASSED, so the rebuilt
+	// heads match the network's quorum-signed tip — and balances are a deterministic function
+	// of those heads (same binary everywhere). If the full audit STILL fails, any peer would
+	// rebuild the IDENTICAL broken state: retrying cannot heal it, the break is network-wide
+	// and real. Halt immediately (no retry), preserving the rebuilt state for forensics. A
+	// walk FAILURE above stays the blacklist/backoff/retry path — that is where a lying peer
+	// is handled.
+	if aerr := e.runFullAudit(targetEp); aerr != nil {
+		e.haltInvariant(aerr, targetEp)
+		e.mu.Lock()
+		e.resync = ResyncState{
+			Mode:         ResyncIdle, // not retrying; the loop's halt branch owns the freeze
+			LastErr:      "invariant violation after verified rebuild",
+			LastPeer:     peer,
+			LastTargetEp: targetEp,
+		}
+		e.resyncNextAttempt = time.Time{}
+		e.resyncFailCount = 0
+		e.mu.Unlock()
+		e.elog(targetEp, "RESYNC rebuilt + walk-verified state that FAILS the invariant audit — HALTED (no retry): %v", aerr)
+		return aerr
 	}
 
 	// Clear volatile in-memory pools (we've rebuilt canonical, verified state).
@@ -523,7 +566,7 @@ func (e *Engine) verifyingWalk(ctx context.Context, targetEp uint64, txByID map[
 			applyIDs = pl.txids
 		}
 
-		if err := e.applyEpochTxids(applyIDs, txByID); err != nil {
+		if err := e.applyEpochTxids(ep, applyIDs, txByID); err != nil {
 			return fmt.Errorf("apply epoch %d: %w", ep, err)
 		}
 
@@ -703,7 +746,11 @@ func (e *Engine) anyFundRelevant(ids [][32]byte, txByID map[[32]byte][]byte) boo
 // committed live, so any ApplyTx failure here is a real inconsistency and aborts the resync (no
 // deferred-retry is needed — epoch order already satisfies all cross-epoch dependencies, unlike the
 // old whole-chain replay).
-func (e *Engine) applyEpochTxids(ids [][32]byte, txByID map[[32]byte][]byte) error {
+//
+// epoch is the finalization epoch these txids were accepted at (the walk's ep) — threaded into
+// ApplyTx so replay stamps the SAME LastGuardedSendEpoch the live commit did (committed data, byte-
+// deterministic; plan D3).
+func (e *Engine) applyEpochTxids(epoch uint64, ids [][32]byte, txByID map[[32]byte][]byte) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -731,7 +778,7 @@ func (e *Engine) applyEpochTxids(ids [][32]byte, txByID map[[32]byte][]byte) err
 			if cid != id {
 				return fmt.Errorf("accepted txid does not match its bytes: want %x have %x", id[:8], cid[:8])
 			}
-			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount, e.cfg.Econ); aerr != nil {
+			if aerr := ApplyTx(view, raw, ptx, id, e.cfg.FundAccount, e.cfg.Econ, epoch); aerr != nil {
 				return fmt.Errorf("apply accepted tx %x: %w", id[:8], aerr)
 			}
 		}

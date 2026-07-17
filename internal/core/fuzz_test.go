@@ -18,6 +18,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -80,12 +81,54 @@ func fuzzSeedAccounts() (sender, receiver *simkit.Account) {
 	return sender, receiver
 }
 
+// The forquinn guarded/U2 fuzz fixture constants: the chain-spawning SEND's seq (the derived
+// chain id folds it), the chain's balance (releases are exact-match full-balance drains), and
+// the unlock epoch (== the snapshot epoch, so release seeds are inside the allowed window).
+const (
+	fuzzChainFromSeq = uint64(5)
+	fuzzChainBalance = uint64(10_000)
+	fuzzChainUnlock  = uint64(10)
+)
+
+// fuzzGuardedFix carries the deterministic forquinn-surface accounts shared by the seed corpus,
+// the validate snapshot, and the apply DB: a GUARDED account mid-opening (U2 registration + PoP),
+// a live GUARDED account with a registered U2, its attestor-flagged TRANSFER chain (copied U1+U2,
+// the D2 derived copy), and two staked attestors for the path-(b) quorum (M=2).
+type fuzzGuardedFix struct {
+	guardedOpen *simkit.Account // does not exist yet; opens via ridG
+	guardedLive *simkit.Account // existing GUARDED account, U2 registered (the chain's key source)
+	chain       *simkit.Account // guardedLive's TRANSFER chain, release_requires_attestor set
+	att1, att2  *simkit.Account // staked Fund Attestors (quorum M=2)
+	ridG        [32]byte        // pending receivable feeding guardedOpen's opening RECEIVE
+	chainHead   [32]byte
+	dest        [32]byte // the chain's pinned release destination
+}
+
+func fuzzGuardedFixture() *fuzzGuardedFix {
+	f := &fuzzGuardedFix{
+		guardedOpen: simkit.NewAccount(pb.AccountClass_ACCOUNT_CLASS_GUARDED, [32]byte{0x53}, [32]byte{0x54}).AttachU2([32]byte{0x55}),
+		guardedLive: simkit.NewAccount(pb.AccountClass_ACCOUNT_CLASS_GUARDED, [32]byte{0x57}, [32]byte{0x58}).AttachU2([32]byte{0x59}),
+		att1:        simkit.NewAccount(pb.AccountClass_ACCOUNT_CLASS_SPENDING, [32]byte{0x63}, [32]byte{0x64}),
+		att2:        simkit.NewAccount(pb.AccountClass_ACCOUNT_CLASS_SPENDING, [32]byte{0x65}, [32]byte{0x66}),
+	}
+	f.chain = simkit.DerivedTransferAccount(f.guardedLive, fuzzChainFromSeq)
+	f.ridG[0], f.chainHead[0], f.dest[0] = 0x43, 0x81, 0x91
+	return f
+}
+
 // fuzzSnapshotFor builds the static validate snapshot embedding the seed accounts: the sender
 // exists (head/seq/balance/keys), the receiver does not yet exist but has a pending receivable
-// (so a signed opening RECEIVE seed validates end to end).
+// (so a signed opening RECEIVE seed validates end to end). The forquinn surface (phase 6): a
+// live GUARDED account with a registered U2, its attestor-flagged TRANSFER chain carrying both
+// copied keys (so the path-(a)/path-(b) release seeds verify end to end), two staked attestors
+// satisfying the M=2 quorum, a pending GUARDED-routed receivable for the U2-registration opening
+// seed, and the supply/rate-limit scalars every post-cutover snapshot carries.
 func fuzzSnapshotFor(sender, receiver *simkit.Account, rid [32]byte, senderHead [32]byte, senderSeq uint64) *Snapshot {
 	var fund [32]byte
 	fund[0] = 0xFD
+	fix := fuzzGuardedFixture()
+	var guardedHead [32]byte
+	guardedHead[0] = 0x75
 	return &Snapshot{
 		Econ: testEcon,
 		Accounts: map[[32]byte]AccountSnap{
@@ -97,6 +140,30 @@ func fuzzSnapshotFor(sender, receiver *simkit.Account, rid [32]byte, senderHead 
 				AuthPubKey:       sender.AuthPubKeyBytes(),
 				BreakglassCommit: sender.Commit,
 			},
+			fix.guardedLive.ID: {
+				Head:                 guardedHead,
+				Balance:              500_000,
+				Seq:                  fuzzChainFromSeq,
+				Class:                pb.AccountClass_ACCOUNT_CLASS_GUARDED,
+				AuthPubKey:           fix.guardedLive.AuthPubKeyBytes(),
+				BreakglassCommit:     fix.guardedLive.Commit,
+				U2PubKey:             fix.guardedLive.U2PubKeyBytes(),
+				LastGuardedSendEpoch: 2, // epoch 10 - 2 = 8 >= interval 6 → next hop-1 allowed
+			},
+			fix.chain.ID: {
+				Head:           fix.chainHead,
+				Balance:        fuzzChainBalance,
+				Seq:            1,
+				Class:          pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
+				TransferSource: fix.guardedLive.ID,
+				TransferDest:   fix.dest,
+				TransferUnlock: fuzzChainUnlock,
+				TransferFlags:  transferFlagReleaseRequiresAttestor,
+				AuthPubKey:     fix.guardedLive.AuthPubKeyBytes(),
+				U2PubKey:       fix.guardedLive.U2PubKeyBytes(),
+			},
+			fix.att1.ID: {Class: pb.AccountClass_ACCOUNT_CLASS_SPENDING, AuthPubKey: fix.att1.AuthPubKeyBytes()},
+			fix.att2.ID: {Class: pb.AccountClass_ACCOUNT_CLASS_SPENDING, AuthPubKey: fix.att2.AuthPubKeyBytes()},
 		},
 		Receivables: map[[32]byte]ReceivableSnap{
 			rid: {
@@ -106,16 +173,35 @@ func fuzzSnapshotFor(sender, receiver *simkit.Account, rid [32]byte, senderHead 
 				RequiredDestClass: pb.AccountClass_ACCOUNT_CLASS_SPENDING,
 				FromSeq:           senderSeq,
 			},
+			fix.ridG: {
+				From:              sender.ID,
+				To:                fix.guardedOpen.ID,
+				Amount:            20_000,
+				RequiredDestClass: pb.AccountClass_ACCOUNT_CLASS_GUARDED,
+				FromSeq:           senderSeq,
+			},
 		},
-		Epoch:                10,
-		DelayEpochs:          6,
-		FundAccount:          fund,
-		GuardianActiveWeight: 0,
-		StakeLock1moEpochs:   4,
-		StakeLock1yrEpochs:   48,
-		GuardedDelayEpochs:   8,
-		VaultDelayEpochs:     16,
-		AttestorQuorumM:      1,
+		FundStakeRows: []StakeRow{
+			{DepositTxid: [32]byte{0x01, 0xaa}, StakeRecord: StakeRecord{
+				StakerID: fix.att1.ID, Amount: anosUnits(5_000), TimeDelay: oneMonth,
+				Status: StakeStatusActive, StakedFor: StakedForAttestor,
+			}},
+			{DepositTxid: [32]byte{0x02, 0xaa}, StakeRecord: StakeRecord{
+				StakerID: fix.att2.ID, Amount: anosUnits(5_000), TimeDelay: oneMonth,
+				Status: StakeStatusActive, StakedFor: StakedForAttestor,
+			}},
+		},
+		Epoch:                        10,
+		DelayEpochs:                  6,
+		FundAccount:                  fund,
+		GuardianActiveWeight:         0,
+		StakeLock1moEpochs:           4,
+		StakeLock1yrEpochs:           48,
+		GuardedDelayEpochs:           8,
+		VaultDelayEpochs:             16,
+		AttestorQuorumM:              2, // the deployed floor (D11); 0 fail-closes, 1 is sub-floor
+		GenesisSupply:                1_000_000_000,
+		GuardedSendMinIntervalEpochs: 6,
 	}
 }
 
@@ -153,7 +239,74 @@ func fuzzSeedTxs(tb testing.TB) [][]byte {
 	add(simkit.BuildStakeSend(sender, senderHead, senderSeq+1, fund, 50_000, testEcon.RequiredFee(50_000), "banker", pb.StakeTimeDelay_STAKE_TIME_DELAY_ONE_YEAR, nil), sender)
 	// Keyless Fund SEND shape (guardian multisig envelope; unsigned — shape seed).
 	add(simkit.BuildFundSend(fund, senderHead, 2, receiver.ID, 77, 9), nil)
+	// §2.7 regression seed: the uint64-wrap mint shape — amt=2^64-1 with its exact (wrapped)
+	// manifest fee, signed. Validate/apply must REJECT it (overflow_supply_test.go pins the
+	// rejection); the fuzz targets pin that it and its mutations never panic the chain.
+	add(simkit.BuildSend(sender, senderHead, senderSeq+1, receiver.ID, math.MaxUint64, testEcon.RequiredFee(math.MaxUint64)), sender)
+
+	// forquinn seeds (phase 6): every new wire shape the cutover introduces, built against the
+	// same fixture fuzzSnapshotFor embeds so each validates end to end before mutation.
+	fix := fuzzGuardedFixture()
+	// GUARDED opening RECEIVE registering U2 (pubkey + proof-of-possession, D12).
+	gtx, err := simkit.BuildGuardedOpeningReceive(fix.guardedOpen, fix.ridG)
+	if err != nil {
+		tb.Fatalf("build guarded opening seed: %v", err)
+	}
+	add(gtx, fix.guardedOpen)
+	// Path (a) release: U1 in Tx.sig + U2 in Tx.sig2 (D5 fixed roles), no attestors, no case fields.
+	pa := simkit.BuildSend(fix.chain, fix.chainHead, 2, fix.dest, fuzzChainBalance, 0)
+	if err := simkit.SignPathARelease(pa, fix.chain); err != nil {
+		tb.Fatalf("sign path-(a) seed: %v", err)
+	}
+	add(pa, nil)
+	// Path (b) release: one user sig + M=2 attestor multisig + the 32-byte case commitment
+	// (case_nonce + attestation_hash folded into every signature's preimage).
+	pbRel := simkit.BuildSend(fix.chain, fix.chainHead, 2, fix.dest, fuzzChainBalance, 0)
+	if err := simkit.SignAttestorRelease(pbRel, fix.chain, []*simkit.Account{fix.att1, fix.att2}, [32]byte{0xCA}, [32]byte{0xA7}); err != nil {
+		tb.Fatalf("sign path-(b) seed: %v", err)
+	}
+	add(pbRel, nil)
 	return seeds
+}
+
+// TestForquinnFuzzSeedsValidate pins the corpus DEPTH of the phase-6 forquinn seeds: each of
+// the three new wire shapes must validate CLEANLY against the shared fuzz snapshot (not merely
+// not-panic), so their mutations start from inside the deepest U2/PoP/release branches. A
+// fixture drift that silently turned them into early rejects would gut the fuzz coverage
+// without failing any target — this test is the tripwire.
+func TestForquinnFuzzSeedsValidate(t *testing.T) {
+	sender, receiver := fuzzSeedAccounts()
+	var senderHead, rid [32]byte
+	senderHead[0], rid[0] = 0x71, 0x42
+	snap := fuzzSnapshotFor(sender, receiver, rid, senderHead, 3)
+	fix := fuzzGuardedFixture()
+
+	gtx, err := simkit.BuildGuardedOpeningReceive(fix.guardedOpen, fix.ridG)
+	if err != nil {
+		t.Fatalf("build guarded opening: %v", err)
+	}
+	if err := fix.guardedOpen.Sign(gtx); err != nil {
+		t.Fatalf("sign guarded opening: %v", err)
+	}
+	if _, err := ValidateTxAgainstSnapshot(gtx, snap); err != nil {
+		t.Errorf("guarded U2 opening seed does not validate: %v", err)
+	}
+
+	pa := simkit.BuildSend(fix.chain, fix.chainHead, 2, fix.dest, fuzzChainBalance, 0)
+	if err := simkit.SignPathARelease(pa, fix.chain); err != nil {
+		t.Fatalf("sign path (a): %v", err)
+	}
+	if _, err := ValidateTxAgainstSnapshot(pa, snap); err != nil {
+		t.Errorf("path-(a) release seed does not validate: %v", err)
+	}
+
+	pbRel := simkit.BuildSend(fix.chain, fix.chainHead, 2, fix.dest, fuzzChainBalance, 0)
+	if err := simkit.SignAttestorRelease(pbRel, fix.chain, []*simkit.Account{fix.att1, fix.att2}, [32]byte{0xCA}, [32]byte{0xA7}); err != nil {
+		t.Fatalf("sign path (b): %v", err)
+	}
+	if _, err := ValidateTxAgainstSnapshot(pbRel, snap); err != nil {
+		t.Errorf("path-(b) release seed does not validate: %v", err)
+	}
 }
 
 // --- ParseTx / CanonicalTxBytes: parse-canonicalize fixed point + txid stability ---
@@ -250,7 +403,44 @@ func FuzzApplyTx(f *testing.F) {
 		if err != nil {
 			return err
 		}
-		return putReceivableRaw(btx, rid, recRaw)
+		if err := putReceivableRaw(btx, rid, recRaw); err != nil {
+			return err
+		}
+		// forquinn surface (phase 6): a live GUARDED account with U2, its attestor-flagged
+		// TRANSFER chain (both copied keys), and a GUARDED-routed pending receivable — so the
+		// guarded-opening seed reaches apply's U2/PoP re-verification and the release seeds
+		// reach the release apply logic (resync replays apply WITHOUT validate).
+		fix := fuzzGuardedFixture()
+		var guardedHead [32]byte
+		guardedHead[0] = 0x75
+		if err := putAccountRecord(btx, fix.guardedLive.ID, AccountRecord{
+			Head: guardedHead, Balance: 500_000, Seq: fuzzChainFromSeq,
+			Class: pb.AccountClass_ACCOUNT_CLASS_GUARDED, AuthPubKey: fix.guardedLive.AuthPubKeyBytes(),
+			BreakglassCommit: fix.guardedLive.Commit, U2PubKey: fix.guardedLive.U2PubKeyBytes(),
+		}); err != nil {
+			return err
+		}
+		if err := putAccountRecord(btx, fix.chain.ID, AccountRecord{
+			Head: fix.chainHead, Balance: fuzzChainBalance, Seq: 1,
+			Class:          pb.AccountClass_ACCOUNT_CLASS_TRANSFER,
+			TransferSource: fix.guardedLive.ID, TransferDest: fix.dest,
+			TransferUnlock: fuzzChainUnlock, TransferFlags: transferFlagReleaseRequiresAttestor,
+			AuthPubKey: fix.guardedLive.AuthPubKeyBytes(), U2PubKey: fix.guardedLive.U2PubKeyBytes(),
+		}); err != nil {
+			return err
+		}
+		recRawG, err := proto.Marshal(&pb.Receivable{
+			Id:                &pb.Hash32{V: fix.ridG[:]},
+			From:              &pb.AccountId{V: sender.ID[:]},
+			To:                &pb.AccountId{V: fix.guardedOpen.ID[:]},
+			Amount:            20_000,
+			RequiredDestClass: pb.AccountClass_ACCOUNT_CLASS_GUARDED,
+			FromSeq:           3,
+		})
+		if err != nil {
+			return err
+		}
+		return putReceivableRaw(btx, fix.ridG, recRawG)
 	}); err != nil {
 		f.Fatalf("seed apply DB: %v", err)
 	}
@@ -270,7 +460,7 @@ func FuzzApplyTx(f *testing.F) {
 			if err := ensureBuckets(btx); err != nil {
 				return err
 			}
-			_ = ApplyTx(&bboltTxView{tx: btx}, data, tx, txid, e.cfg.FundAccount, e.cfg.Econ)
+			_ = ApplyTx(&bboltTxView{tx: btx}, data, tx, txid, e.cfg.FundAccount, e.cfg.Econ, 0)
 			return rollback() // never persist — every exec sees the same seeded state
 		})
 	})

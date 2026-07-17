@@ -23,6 +23,7 @@ func validManifest() Manifest {
 			AttestorQuorumM:              2,
 			EscrowAttestationDelayEpochs: 6,
 			BreakglassExtraEpochs:        5,
+			GuardedSendMinIntervalEpochs: 6,
 		},
 		Economics: Economics{
 			MinFee:                           1_000,
@@ -65,16 +66,17 @@ func TestValidateAcceptsComplete(t *testing.T) {
 // future field can't quietly escape the check.
 func TestValidateRejectsZeroTimingField(t *testing.T) {
 	cases := map[string]func(*Timing){
-		"epoch_ms":                        func(t *Timing) { t.EpochMs = 0 },
-		"timelocked_delay_epochs":         func(t *Timing) { t.TimelockedDelayEpochs = 0 },
-		"guardian_active_window_epochs":   func(t *Timing) { t.GuardianActiveWindowEpochs = 0 },
-		"stake_lock_1mo_epochs":           func(t *Timing) { t.StakeLock1moEpochs = 0 },
-		"stake_lock_1yr_epochs":           func(t *Timing) { t.StakeLock1yrEpochs = 0 },
-		"guarded_delay_epochs":            func(t *Timing) { t.GuardedDelayEpochs = 0 },
-		"vault_delay_epochs":              func(t *Timing) { t.VaultDelayEpochs = 0 },
-		"attestor_quorum_m":               func(t *Timing) { t.AttestorQuorumM = 0 },
-		"escrow_attestation_delay_epochs": func(t *Timing) { t.EscrowAttestationDelayEpochs = 0 },
-		"breakglass_extra_epochs":         func(t *Timing) { t.BreakglassExtraEpochs = 0 },
+		"epoch_ms":                         func(t *Timing) { t.EpochMs = 0 },
+		"timelocked_delay_epochs":          func(t *Timing) { t.TimelockedDelayEpochs = 0 },
+		"guardian_active_window_epochs":    func(t *Timing) { t.GuardianActiveWindowEpochs = 0 },
+		"stake_lock_1mo_epochs":            func(t *Timing) { t.StakeLock1moEpochs = 0 },
+		"stake_lock_1yr_epochs":            func(t *Timing) { t.StakeLock1yrEpochs = 0 },
+		"guarded_delay_epochs":             func(t *Timing) { t.GuardedDelayEpochs = 0 },
+		"vault_delay_epochs":               func(t *Timing) { t.VaultDelayEpochs = 0 },
+		"attestor_quorum_m":                func(t *Timing) { t.AttestorQuorumM = 0 },
+		"escrow_attestation_delay_epochs":  func(t *Timing) { t.EscrowAttestationDelayEpochs = 0 },
+		"breakglass_extra_epochs":          func(t *Timing) { t.BreakglassExtraEpochs = 0 },
+		"guarded_send_min_interval_epochs": func(t *Timing) { t.GuardedSendMinIntervalEpochs = 0 },
 	}
 	for name, zero := range cases {
 		m := validManifest()
@@ -82,6 +84,16 @@ func TestValidateRejectsZeroTimingField(t *testing.T) {
 		if err := m.Validate(); err == nil {
 			t.Errorf("Validate accepted a manifest with %s=0 (must reject)", name)
 		}
+	}
+}
+
+// D11 attestor floor: attestor_quorum_m == 1 is structurally valid JSON but below the floor —
+// a 1-of-N attestor gate is a single point of compromise, so Validate rejects anything < 2.
+func TestValidateRejectsAttestorQuorumBelowFloor(t *testing.T) {
+	m := validManifest()
+	m.Timing.AttestorQuorumM = 1
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate accepted attestor_quorum_m=1 (the floor is 2)")
 	}
 }
 
@@ -238,5 +250,21 @@ func TestValidateRejectsUnsupportedProtocolVersion(t *testing.T) {
 	m.ProtocolVersion = SupportedProtocolVersion + 1
 	if err := m.Validate(); err == nil {
 		t.Error("Validate accepted an unsupported protocol_version")
+	}
+}
+
+// The v0.3.0 cutover's mutual exclusion (D10): a pre-forquinn manifest (schema 2,
+// protocol_version 1) must refuse to boot on this binary — the counterpart of old binaries
+// refusing v3 manifests. Guards against a stale testnet.json silently rejoining the old net.
+func TestValidateRejectsPreForquinnManifest(t *testing.T) {
+	m := validManifest()
+	m.Version = 2
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted a schema-v2 (pre-forquinn) manifest")
+	}
+	m = validManifest()
+	m.ProtocolVersion = 1
+	if err := m.Validate(); err == nil {
+		t.Error("Validate accepted a protocol_version-1 (pre-forquinn) manifest")
 	}
 }

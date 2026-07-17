@@ -55,8 +55,8 @@ silently forking.
 
 | Section | Field | Meaning |
 |---|---|---|
-| root | `version` | manifest **schema** version (`2`); a node refuses to boot on any other |
-| root | `protocol_version` | consensus **ruleset** version (`1`); a node refuses to boot/peer unless it matches |
+| root | `version` | manifest **schema** version (`3`); a node refuses to boot on any other |
+| root | `protocol_version` | consensus **ruleset** version (`2`); a node refuses to boot/peer unless it matches |
 | root | `network_id` | SHA‑256 over the manifest; recomputed on boot and refused if the file's value disagrees |
 | root | `fund_account_hex` | the reserved keyless Fund account id (`ff…ff`) |
 | `timing` | `epoch_ms`, `*_epochs`, `attestor_quorum_m` | **consensus‑critical** — the manifest guarantees they're byte‑identical everywhere |
